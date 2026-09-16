@@ -11,8 +11,9 @@ on-chain approval. Full product requirements live in [docs/PRD.md](docs/PRD.md).
 2. **Multi-Sig Anti-Tamper Audit Trail** - 2-of-3 signatures + IPFS evidence
 3. **Faculty Workload Ledger** - session verification, substitute credit, on-chain workload
 
-> **Status:** full-stack scaffold. Contracts, API, and UI run end to end; the
-> three modules above are implemented on this structure in the next steps.
+> **Status:** full-stack scaffold with the Module 2 contract
+> (`RecordAuditTrail`) deployed on the local chain. Contracts, API, and UI run
+> end to end; the module logic is wired up incrementally.
 
 ## Repository layout
 
@@ -47,14 +48,20 @@ npm run node          # JSON-RPC at http://127.0.0.1:8545 (chain id 31337)
 Deploy and seed demo roles (terminal B):
 
 ```bash
-npm run deploy:local   # deploys contracts -> scripts/deployments/localhost.json
-npm run seed:local     # grants demo roles to Hardhat test accounts
-npm run seed:accounts  # exports the 5 labeled local accounts -> contracts/deployed/accounts.json
+npm run deploy:local        # deploys EduLedgerRoles -> scripts/deployments/localhost.json
+npm run seed:local          # grants demo roles to Hardhat test accounts
+npm run seed:accounts       # exports the 5 labeled local accounts -> contracts/deployed/accounts.json
+npm run deploy:audit-trail  # deploys RecordAuditTrail (Module 2) + role grants -> contracts/deployed/RecordAuditTrail.json
 ```
 
 `deploy:local` prints the env values to paste into `backend/.env` in the next
 step (the address is deterministic on a fresh local chain:
 `0x5FbDB2315678afecb367f032d93F642f64180aa3`).
+
+`deploy:audit-trail` deploys the Module 2 `RecordAuditTrail` contract, grants
+`INSTRUCTOR_ROLE` / `HOD_ROLE` / `EXAM_CONTROLLER_ROLE` to the addresses from
+`deployed/accounts.json`, and exports the address + ABI to
+`contracts/deployed/RecordAuditTrail.json` for the backend.
 
 ## 2. Backend (`backend/`)
 
@@ -179,8 +186,9 @@ Copied from [`backend/.env.example`](backend/.env.example):
 
 ## Roadmap
 
-1. Deploy the MVP module contracts (attendance, audit trail, workload ledger)
-   on the existing Hardhat setup and extend `scripts/deploy.js`.
+1. Deploy the remaining MVP module contracts (attendance engine, workload
+   ledger) following the `RecordAuditTrail` pattern (own script +
+   `deployed/*.json` export).
 2. Wire JWT auth + database models in the Flask app (blueprints per module).
 3. Build the module UIs behind the existing role routes.
 4. See `docs/PRD.md` section 8 for the documented Future Scope modules.
