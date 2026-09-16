@@ -1,0 +1,5 @@
+# EduLedger backend - Python 3.11+
+# Keep this list minimal; add dependencies as the MVP modules are built.
+Flask>=3.0,<4.0
+flask-cors>=4.0,<7.0
+python-dotenv>=1.0,<2.0

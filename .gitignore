@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Builds and generated output
+dist/
+build/
+contracts/artifacts/
+contracts/cache/
+contracts/typechain-types/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local secrets and env files (keep the .example templates committed)
+.env
+.env.*
+!.env.example
+
+# Local data
+*.db
+*.sqlite3
+backend/instance/
+
+# Generated deployment records (re-created by npm run deploy:local)
+scripts/deployments/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
