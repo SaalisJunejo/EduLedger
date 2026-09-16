@@ -63,6 +63,21 @@ step (the address is deterministic on a fresh local chain:
 `deployed/accounts.json`, and exports the address + ABI to
 `contracts/deployed/RecordAuditTrail.json` for the backend.
 
+### Contract tests
+
+`test/RecordAuditTrail.test.js` (Mocha/Chai) runs against the in-process
+Hardhat network - no local node or deployment required:
+
+```bash
+cd contracts
+npm test
+```
+
+The 14 tests cover role assignment at deployment, the propose -> approve ->
+auto-execute happy path (including the `RecordUpdated` event payload),
+access control on `proposeChange` / `approve`, duplicate and late approvals,
+input validation, and `getProposal` state before and after execution.
+
 ## 2. Backend (`backend/`)
 
 ```bash

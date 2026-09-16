@@ -1,4 +1,7 @@
 require("@nomicfoundation/hardhat-ethers");
+// Adds `expect(...).to.emit(...)` / `revertedWithCustomError` support to Chai
+// for the Mocha suite in test/.
+require("@nomicfoundation/hardhat-chai-matchers");
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
