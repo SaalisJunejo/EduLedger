@@ -11,9 +11,10 @@ on-chain approval. Full product requirements live in [docs/PRD.md](docs/PRD.md).
 2. **Multi-Sig Anti-Tamper Audit Trail** - 2-of-3 signatures + IPFS evidence
 3. **Faculty Workload Ledger** - session verification, substitute credit, on-chain workload
 
-> **Status:** full-stack scaffold with the Module 2 contract
-> (`RecordAuditTrail`) deployed on the local chain. Contracts, API, and UI run
-> end to end; the module logic is wired up incrementally.
+> **Status:** full-stack scaffold with the Module 1 (`AttendanceLedger`) and
+> Module 2 (`RecordAuditTrail`) contracts deployed on the local chain.
+> Contracts, API, and UI run end to end; the module logic is wired up
+> incrementally.
 
 ## Repository layout
 
@@ -52,6 +53,7 @@ npm run deploy:local        # deploys EduLedgerRoles -> scripts/deployments/loca
 npm run seed:local          # grants demo roles to Hardhat test accounts
 npm run seed:accounts       # exports the 5 labeled local accounts -> contracts/deployed/accounts.json
 npm run deploy:audit-trail  # deploys RecordAuditTrail (Module 2) + role grants -> contracts/deployed/RecordAuditTrail.json
+npm run deploy:attendance  # deploys AttendanceLedger (Module 1) + BACKEND_ROLE grant -> contracts/deployed/AttendanceLedger.json
 ```
 
 `deploy:local` prints the env values to paste into `backend/.env` in the next
@@ -62,6 +64,15 @@ step (the address is deterministic on a fresh local chain:
 `INSTRUCTOR_ROLE` / `HOD_ROLE` / `EXAM_CONTROLLER_ROLE` to the addresses from
 `deployed/accounts.json`, and exports the address + ABI to
 `contracts/deployed/RecordAuditTrail.json` for the backend.
+
+`deploy:attendance` deploys the Module 1 `AttendanceLedger` contract and
+grants `BACKEND_ROLE` to the deployer account, which acts as the trusted
+backend signer during local development (the admin can later grant the role
+to the real backend signing address). The address + ABI are exported to
+`contracts/deployed/AttendanceLedger.json`. The contract anchors one
+immutable PRESENT record per student+session pair; a second
+`lockAttendance()` call for the same pair reverts with
+`AttendanceAlreadyLocked` (the on-chain "no resubmission" rule).
 
 ### Contract tests
 
@@ -201,9 +212,8 @@ Copied from [`backend/.env.example`](backend/.env.example):
 
 ## Roadmap
 
-1. Deploy the remaining MVP module contracts (attendance engine, workload
-   ledger) following the `RecordAuditTrail` pattern (own script +
-   `deployed/*.json` export).
+1. Deploy the remaining MVP module contract (workload ledger) following the
+   `RecordAuditTrail` pattern (own script + `deployed/*.json` export).
 2. Wire JWT auth + database models in the Flask app (blueprints per module).
 3. Build the module UIs behind the existing role routes.
 4. See `docs/PRD.md` section 8 for the documented Future Scope modules.
