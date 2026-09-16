@@ -47,8 +47,9 @@ npm run node          # JSON-RPC at http://127.0.0.1:8545 (chain id 31337)
 Deploy and seed demo roles (terminal B):
 
 ```bash
-npm run deploy:local  # deploys contracts -> scripts/deployments/localhost.json
-npm run seed:local    # grants demo roles to Hardhat test accounts
+npm run deploy:local   # deploys contracts -> scripts/deployments/localhost.json
+npm run seed:local     # grants demo roles to Hardhat test accounts
+npm run seed:accounts  # exports the 5 labeled local accounts -> contracts/deployed/accounts.json
 ```
 
 `deploy:local` prints the env values to paste into `backend/.env` in the next
@@ -130,6 +131,10 @@ Routes: `/login`, `/student`, `/instructor`, `/hod`, `/admin`
 
 Roles are seeded by `npm run seed:local`. These are the well-known public
 Hardhat development keys - **never use them for anything but local dev**.
+
+`npm run seed:accounts` (in `contracts/`) prints each account's address and
+private key to the console and refreshes `contracts/deployed/accounts.json`
+with the labeled addresses (never the private keys) for the backend to read.
 
 | # | Role | Address |
 |---|---|---|
