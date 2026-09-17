@@ -16,6 +16,7 @@ from flask import Flask
 from flask_cors import CORS
 
 from .config import CONFIG_BY_NAME
+from .extensions import db
 
 __version__ = "0.1.0"
 
@@ -36,9 +37,27 @@ def create_app(config_name: str | None = None) -> Flask:
 
     CORS(app, origins=app.config["CORS_ORIGINS"])
 
-    # Imported here (not at module level) to avoid circular imports.
+    # -- Database (SQLAlchemy) --------------------------------------------
+    app.config["SQLALCHEMY_DATABASE_URI"] = app.config["DB_URL"]
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    db.init_app(app)
+
+    # Imported here (not at module level) to avoid circular imports;
+    # importing registers the models so `create_all` sees them.
+    from . import models  # noqa: F401
+
+    with app.app_context():
+        db.create_all()
+
+    # -- REST API -----------------------------------------------------------
     from .api import api_v1
 
     app.register_blueprint(api_v1)
+
+    # -- Background jobs ----------------------------------------------------
+    # Rotates attendance QR nonces for active sessions (see app/scheduler.py).
+    from .scheduler import init_scheduler
+
+    init_scheduler(app)
 
     return app

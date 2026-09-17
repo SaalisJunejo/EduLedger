@@ -29,6 +29,12 @@ class BaseConfig:
     # -- Database ----------------------------------------------------------
     DB_URL = os.getenv("DB_URL", "sqlite:///eduledger.db")
 
+    # -- Attendance sessions -------------------------------------------------
+    # How often the background job rotates the QR nonce of active sessions.
+    NONCE_ROTATION_SECONDS = int(os.getenv("NONCE_ROTATION_SECONDS", "5"))
+    # Set to false to skip starting the background scheduler (tests, scripts).
+    SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+
     # -- Blockchain (local Hardhat network) --------------------------------
     HARDHAT_RPC_URL = os.getenv("HARDHAT_RPC_URL", "http://127.0.0.1:8545")
     CHAIN_ID = int(os.getenv("CHAIN_ID", "31337"))
@@ -57,6 +63,8 @@ class DevelopmentConfig(BaseConfig):
 
 class TestingConfig(BaseConfig):
     TESTING = True
+    SCHEDULER_ENABLED = False
+    DB_URL = "sqlite:///:memory:"
 
 
 class ProductionConfig(BaseConfig):

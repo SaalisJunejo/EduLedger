@@ -1,7 +1,7 @@
 {
-  "network": "hardhat",
+  "network": "localhost",
   "chainId": 31337,
-  "generatedAt": "2026-09-16T22:13:17.064Z",
+  "generatedAt": "2026-09-17T00:23:19.841Z",
   "source": "scripts/seed-accounts.js",
   "note": "Local test accounts only. Private keys are intentionally not stored here; they are printed to the console by the script.",
   "accounts": {

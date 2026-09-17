@@ -13,4 +13,7 @@ from app import create_app
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    # use_reloader=False keeps a single process (and thus a single background
+    # nonce-rotation scheduler). The debug reloader would run a second one in
+    # the parent process.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), use_reloader=False)

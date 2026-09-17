@@ -11,10 +11,10 @@ on-chain approval. Full product requirements live in [docs/PRD.md](docs/PRD.md).
 2. **Multi-Sig Anti-Tamper Audit Trail** - 2-of-3 signatures + IPFS evidence
 3. **Faculty Workload Ledger** - session verification, substitute credit, on-chain workload
 
-> **Status:** full-stack scaffold with the Module 1 (`AttendanceLedger`) and
-> Module 2 (`RecordAuditTrail`) contracts deployed on the local chain.
-> Contracts, API, and UI run end to end; the module logic is wired up
-> incrementally.
+> **Status:** Module 1 and 2 contracts (`AttendanceLedger`,
+> `RecordAuditTrail`) deployed on the local chain, and the backend
+> attendance session flow (rotating QR nonces) is live. Contracts, API, and
+> UI run end to end; the module logic is wired up incrementally.
 
 ## Repository layout
 
@@ -139,6 +139,38 @@ curl http://127.0.0.1:5000/api/v1/health
 (`contracts_configured` flips to `true` for the module contracts once they
 are deployed and their addresses are added to `.env`.)
 
+### Attendance sessions (Module 1)
+
+Instructor-driven QR attendance backed by a rotating nonce:
+
+```bash
+# instructor starts a session for a class (one live session per class -
+# starting a new one closes the previous)
+curl -X POST http://127.0.0.1:5000/api/v1/session/start \
+  -H "Content-Type: application/json" -d '{"class_id": "BSCS-401"}'
+
+# projector-facing endpoint: poll every 1-2 seconds
+curl http://127.0.0.1:5000/api/v1/session/1/qr
+```
+
+`POST /session/start` returns the session (`id`, `current_nonce`,
+`nonce_expires_at`) plus the `qr_poll_url` to display. `GET /session/<id>/qr`
+always reflects the latest nonce and returns `qr_image` (a base64 PNG data
+URI encoding `{"session_id": <id>, "nonce": "<current nonce>"}`) alongside
+`nonce_expires_at`, `server_time`, and `rotation_seconds`, so a projector page
+can poll every 1-2 seconds, swap its `<img src>` to `qr_image`, and re-render
+before the QR changes. Responses are sent with `Cache-Control: no-store`.
+
+A background APScheduler job (`app/scheduler.py`) rotates the nonce of every
+active session every `NONCE_ROTATION_SECONDS` (default 5 s). Each nonce is a
+hex timestamp plus a 24-byte random token, so a photographed QR cannot be
+replayed after it rotates; if the scheduler ever lags, the QR endpoint
+rotates an expired nonce lazily on read. Unknown sessions return `404`, and
+sessions replaced by a newer `start` return `409` (the projector should stop
+polling). `python run.py` starts the scheduler automatically (and disables
+the debug reloader to keep a single scheduler instance); instructor
+authentication on `/session/start` arrives with the JWT layer (roadmap).
+
 ## 3. Frontend (`frontend/`)
 
 ```bash
@@ -214,6 +246,7 @@ Copied from [`backend/.env.example`](backend/.env.example):
 
 1. Deploy the remaining MVP module contract (workload ledger) following the
    `RecordAuditTrail` pattern (own script + `deployed/*.json` export).
-2. Wire JWT auth + database models in the Flask app (blueprints per module).
+2. Wire JWT auth + the remaining database models in the Flask app
+   (student check-in against the rotating nonce, audit-trail proposals).
 3. Build the module UIs behind the existing role routes.
 4. See `docs/PRD.md` section 8 for the documented Future Scope modules.
