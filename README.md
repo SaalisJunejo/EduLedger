@@ -13,8 +13,9 @@ on-chain approval. Full product requirements live in [docs/PRD.md](docs/PRD.md).
 
 > **Status:** Module 1 and 2 contracts (`AttendanceLedger`,
 > `RecordAuditTrail`) deployed on the local chain, and the backend
-> attendance session flow (rotating QR nonces) is live. Contracts, API, and
-> UI run end to end; the module logic is wired up incrementally.
+> attendance flow is live end to end: rotating QR nonces, student identity
+> verification (face / WebAuthn stub), and check-in scans that lock
+> attendance on-chain. The module logic is wired up incrementally.
 
 ## Repository layout
 
@@ -171,6 +172,77 @@ polling). `python run.py` starts the scheduler automatically (and disables
 the debug reloader to keep a single scheduler instance); instructor
 authentication on `/session/start` arrives with the JWT layer (roadmap).
 
+### Identity verification & check-in scan (Module 1)
+
+Student check-in in four steps - enroll once, bind one device, then per
+class: verify identity and scan the rotating QR:
+
+```bash
+# 1. (demo) enroll a student's face - real enrollments happen at admission
+curl -X POST http://127.0.0.1:5000/api/v1/student/enroll-face \
+  -H "Content-Type: application/json" \
+  -d '{"student_id": 2024001, "name": "Ayesha Khan", "face_image": "<base64>"}'
+
+# 2. bind the client-generated deviceId (Keychain/Keystore) - first binding only
+curl -X POST http://127.0.0.1:5000/api/v1/student/register-device \
+  -H "Content-Type: application/json" \
+  -d '{"student_id": 2024001, "device_id": "<device uuid>"}'
+
+# 3. verify identity -> 30-second verification token
+curl -X POST http://127.0.0.1:5000/api/v1/attendance/verify-identity \
+  -H "Content-Type: application/json" \
+  -d '{"student_id": 2024001, "face_image": "<base64 capture>"}'
+
+# 4. check in: verification token + device + scanned QR nonce -> on-chain lock
+curl -X POST http://127.0.0.1:5000/api/v1/attendance/scan \
+  -H "Content-Type: application/json" \
+  -d '{"verification_token": "<jwt>", "device_id": "<device uuid>",
+       "session_id": 1, "nonce": "<nonce scanned from the QR>"}'
+```
+
+`verify-identity` also accepts `{"student_id", "device_id",
+"webauthn_assertion": {...}}` for the fingerprint path - a simplified stub
+where the on-device biometric prompt is the real gate (the full WebAuthn
+ceremony is on the roadmap). Face matching runs through a pluggable
+embedding provider: `FACE_EMBEDDING_PROVIDER=auto` picks the
+`face_recognition` library (dlib 128-d encodings) when installed, and falls
+back to a built-in demo embedder (mean-centered 32x32 grayscale, cosine
+similarity) so the flow works on any Python version. Stored and submitted
+embeddings must come from the same provider - otherwise the student is told
+to re-enroll (`embedding_provider_mismatch`). The default
+`FACE_MATCH_THRESHOLD` (0.85) suits the demo embedder; use ~0.6 with
+face_recognition encodings.
+
+`/attendance/scan` validates in a fixed order, and every failure response
+carries `check` + `error` codes naming exactly which gate rejected the scan
+(for demo debugging, not for end users):
+
+| Order | Check (`check`) | Rejection codes (`error`) |
+|---|---|---|
+| a | `verification_token` | `verification_token_invalid`, `verification_token_expired`, `verification_token_wrong_purpose` |
+| b | `session_nonce` | `session_not_found`, `session_inactive`, `nonce_mismatch`, `nonce_expired` |
+| c | `device_match` | `device_not_bound`, `device_mismatch` |
+| d | `onchain_lock` | `attendance_already_locked`, `blockchain_unavailable`, `blockchain_not_configured`, `blockchain_error` |
+
+When all four checks pass, the backend signs
+`AttendanceLedger.lockAttendance()` with its signer account
+(`BACKEND_SIGNER_PRIVATE_KEY`, which must hold `BACKEND_ROLE`; local dev
+defaults to Hardhat account #0) and returns the transaction hash, block
+number, and lock timestamp. A second scan for the same student+session
+fails check (d) with `attendance_already_locked` - the on-chain "no
+resubmission" rule.
+
+A device binds to a student exactly once: `register-device` rejects a
+different device with `device_already_bound` (409) and points to the admin
+override, `POST /api/v1/admin/rebind-device`, which force-replaces the
+binding for lost or replaced phones (stub - no admin auth until the JWT
+role layer lands).
+
+**Demo caveats (placeholder rails by design):** the demo embedder is
+deterministic image comparison, not biometric-grade recognition; the
+WebAuthn path is a stub; `rebind-device` is unauthenticated; and the
+default signer key is the public Hardhat test key.
+
 ## 3. Frontend (`frontend/`)
 
 ```bash
@@ -219,16 +291,23 @@ Copied from [`backend/.env.example`](backend/.env.example):
 | `SECRET_KEY` | Flask session signing key | `change-me` |
 | `PORT` | Backend port for `python run.py` | `5000` |
 | `DB_URL` | Database URL (SQLite default, PostgreSQL later) | `sqlite:///eduledger.db` |
+| `NONCE_ROTATION_SECONDS` | QR nonce rotation interval for live sessions | `5` |
+| `SCHEDULER_ENABLED` | Run the background nonce-rotation job | `true` |
 | `HARDHAT_RPC_URL` | Local chain JSON-RPC endpoint | `http://127.0.0.1:8545` |
 | `CHAIN_ID` | Expected chain id | `31337` |
 | `ROLE_REGISTRY_CONTRACT_ADDRESS` | Deployed `EduLedgerRoles` address | printed by `deploy:local` |
-| `ATTENDANCE_ENGINE_CONTRACT_ADDRESS` | Module 1 contract (not deployed yet) | - |
-| `AUDIT_TRAIL_CONTRACT_ADDRESS` | Module 2 contract (not deployed yet) | - |
-| `WORKLOAD_LEDGER_CONTRACT_ADDRESS` | Module 3 contract (not deployed yet) | - |
+| `ATTENDANCE_ENGINE_CONTRACT_ADDRESS` | Module 1 `AttendanceLedger` address | printed by `deploy:attendance` |
+| `AUDIT_TRAIL_CONTRACT_ADDRESS` | Module 2 `RecordAuditTrail` address | printed by `deploy:audit-trail` |
+| `WORKLOAD_LEDGER_CONTRACT_ADDRESS` | Module 3 contract (not built yet) | - |
+| `FACE_MATCH_THRESHOLD` | Cosine similarity threshold for a face match | `0.85` |
+| `VERIFICATION_TOKEN_SECONDS` | Verification token lifetime (seconds) | `30` |
+| `FACE_EMBEDDING_PROVIDER` | Face embedding backend: `auto` / `demo` / `face_recognition` | `auto` |
+| `BACKEND_SIGNER_PRIVATE_KEY` | Transaction signer for `lockAttendance()` (needs `BACKEND_ROLE`) | Hardhat #0 (local only) |
+| `ATTENDANCE_LEDGER_ARTIFACT` | Optional explicit path to `deployed/AttendanceLedger.json` | repo default |
 | `IPFS_API_URL` | Local IPFS node API | `http://127.0.0.1:5001` |
 | `IPFS_GATEWAY_URL` | Gateway for viewing pinned evidence | `http://127.0.0.1:8080` |
-| `JWT_SECRET` | Signing key for API tokens | `change-me` |
-| `JWT_EXPIRES_HOURS` | Token lifetime | `12` |
+| `JWT_SECRET` | Signing key for API tokens (>= 32 bytes) | dev default - change it |
+| `JWT_EXPIRES_HOURS` | Login token lifetime (auth layer, roadmap) | `12` |
 | `CORS_ORIGINS` | Comma-separated allowed browser origins | `http://localhost:5173` |
 
 ## Troubleshooting
@@ -246,7 +325,8 @@ Copied from [`backend/.env.example`](backend/.env.example):
 
 1. Deploy the remaining MVP module contract (workload ledger) following the
    `RecordAuditTrail` pattern (own script + `deployed/*.json` export).
-2. Wire JWT auth + the remaining database models in the Flask app
-   (student check-in against the rotating nonce, audit-trail proposals).
+2. Wire JWT auth + the remaining database models in the Flask app (login,
+   role enforcement on `/session/start` and the admin rebind stub,
+   audit-trail proposals).
 3. Build the module UIs behind the existing role routes.
 4. See `docs/PRD.md` section 8 for the documented Future Scope modules.

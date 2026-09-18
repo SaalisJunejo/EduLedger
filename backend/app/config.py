@@ -25,6 +25,8 @@ class BaseConfig:
 
     # -- Flask ------------------------------------------------------------
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+    # >= 32 bytes so HS256 JWTs meet the RFC 7518 recommendation.
+    JWT_SECRET_DEFAULT = "dev-jwt-secret-please-change-me-32-chars-min"
 
     # -- Database ----------------------------------------------------------
     DB_URL = os.getenv("DB_URL", "sqlite:///eduledger.db")
@@ -34,6 +36,28 @@ class BaseConfig:
     NONCE_ROTATION_SECONDS = int(os.getenv("NONCE_ROTATION_SECONDS", "5"))
     # Set to false to skip starting the background scheduler (tests, scripts).
     SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+
+    # -- Identity verification & attendance scan (Module 1) -----------------
+    # Cosine similarity above which a face match is accepted. 0.85 suits the
+    # built-in demo embedder; use ~0.6 with face_recognition 128-d encodings.
+    FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.85"))
+    # Lifetime of the short-lived verification token issued by verify-identity.
+    VERIFICATION_TOKEN_SECONDS = int(os.getenv("VERIFICATION_TOKEN_SECONDS", "30"))
+    # Face embedding provider: "auto" (face_recognition when installed, else
+    # the built-in demo embedder), "demo", or "face_recognition".
+    FACE_EMBEDDING_PROVIDER = os.getenv("FACE_EMBEDDING_PROVIDER", "auto")
+
+    # -- Blockchain signer ----------------------------------------------------
+    # Signs AttendanceLedger transactions; must hold BACKEND_ROLE. Defaults to
+    # Hardhat account #0 (the contract deployer) - its key is PUBLIC test
+    # material, fine for the local demo, never for anything real.
+    BACKEND_SIGNER_PRIVATE_KEY = os.getenv(
+        "BACKEND_SIGNER_PRIVATE_KEY",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+    )
+    # Optional explicit path to contracts/deployed/AttendanceLedger.json
+    # (default: <repo>/contracts/deployed/AttendanceLedger.json).
+    ATTENDANCE_LEDGER_ARTIFACT = os.getenv("ATTENDANCE_LEDGER_ARTIFACT", "")
 
     # -- Blockchain (local Hardhat network) --------------------------------
     HARDHAT_RPC_URL = os.getenv("HARDHAT_RPC_URL", "http://127.0.0.1:8545")
@@ -50,7 +74,7 @@ class BaseConfig:
     IPFS_GATEWAY_URL = os.getenv("IPFS_GATEWAY_URL", "http://127.0.0.1:8080")
 
     # -- Auth -----------------------------------------------------------------
-    JWT_SECRET = os.getenv("JWT_SECRET", "dev-jwt-change-me")
+    JWT_SECRET = os.getenv("JWT_SECRET", JWT_SECRET_DEFAULT)
     JWT_EXPIRES = timedelta(hours=int(os.getenv("JWT_EXPIRES_HOURS", "12")))
 
     # -- HTTP -----------------------------------------------------------------

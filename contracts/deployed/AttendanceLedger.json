@@ -2,9 +2,9 @@
   "contractName": "AttendanceLedger",
   "network": "localhost",
   "chainId": 31337,
-  "address": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+  "address": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "deployedAt": "2026-09-16T23:39:30.902Z",
+  "deployedAt": "2026-09-18T21:13:53.725Z",
   "roles": {
     "BACKEND_ROLE": {
       "label": "Backend (deployer acts as the trusted backend signer)",

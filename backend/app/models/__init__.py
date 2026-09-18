@@ -5,5 +5,6 @@ Importing this package registers the models with SQLAlchemy so that
 """
 
 from .session import AttendanceSession, generate_nonce
+from .student import Student
 
-__all__ = ["AttendanceSession", "generate_nonce"]
+__all__ = ["AttendanceSession", "Student", "generate_nonce"]

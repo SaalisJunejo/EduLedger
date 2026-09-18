@@ -26,9 +26,6 @@ const DEMO_ACTORS = [
   { index: 1, label: "Instructor", role: "INSTRUCTOR_ROLE" },
   { index: 2, label: "HOD", role: "HOD_ROLE" },
   { index: 3, label: "Exam Controller", role: "EXAM_CONTROLLER_ROLE" },
-  { index: 4, label: "Student 1", role: "STUDENT_ROLE" },
-  { index: 5, label: "Student 2", role: "STUDENT_ROLE" },
-  { index: 6, label: "Student 3", role: "STUDENT_ROLE" },
 ];
 
 async function main() {

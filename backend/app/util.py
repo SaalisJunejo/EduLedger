@@ -5,7 +5,15 @@ support), while JSON responses present them with an explicit `+00:00`
 offset so JavaScript clients parse them unambiguously.
 """
 
+import secrets
 from datetime import datetime, timezone
+
+
+def generate_nonce():
+    """Generates a random unpredictable nonce string combined with a timestamp."""
+    random_str = secrets.token_hex(16)
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    return f"{random_str}_{timestamp}"
 
 
 def utcnow() -> datetime:
