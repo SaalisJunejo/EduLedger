@@ -9,3 +9,9 @@ qrcode[pil]>=8.0,<9.0
 # Identity verification + on-chain attendance locking (Module 1)
 PyJWT>=2.8,<3.0
 web3>=7.0,<8.0
+# PostgreSQL driver for DB_URL
+psycopg2-binary>=2.9,<3.0
+# Image decoding for face embeddings (also pulled in by qrcode[pil])
+Pillow>=12.0,<13.0
+# HTTP client used by the backend test scripts (also a web3 dependency)
+requests>=2.31,<3.0
