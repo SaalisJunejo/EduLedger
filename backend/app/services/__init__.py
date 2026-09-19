@@ -5,4 +5,6 @@ Modules:
 - `verification_token` - short-lived attendance verification JWTs
 - `webauthn`           - simplified fingerprint assertion check (stub)
 - `blockchain`         - AttendanceLedger on-chain client (web3)
+- `audit_trail`        - RecordAuditTrail on-chain client (web3, role signers)
+- `ipfs`               - evidence upload to IPFS (local daemon + Web3.Storage)
 """

@@ -69,6 +69,29 @@ class BaseConfig:
         "workload_ledger": os.getenv("WORKLOAD_LEDGER_CONTRACT_ADDRESS", ""),
     }
 
+    # -- Audit trail signers (Module 2 - RecordAuditTrail) ------------------
+    # Three role signers matching the labeled accounts in
+    # contracts/deployed/accounts.json (instructor #1, HOD #2, exam
+    # controller #3). Proposals are sent from the instructor signer and
+    # approvals from the HOD / Exam Controller signer, so transactions are
+    # attributable to a role. Defaults are the PUBLIC Hardhat test keys -
+    # LOCAL TESTING ONLY, exactly like BACKEND_SIGNER_PRIVATE_KEY above.
+    INSTRUCTOR_SIGNER_PRIVATE_KEY = os.getenv(
+        "INSTRUCTOR_SIGNER_PRIVATE_KEY",
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+    )
+    HOD_SIGNER_PRIVATE_KEY = os.getenv(
+        "HOD_SIGNER_PRIVATE_KEY",
+        "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+    )
+    EXAM_CONTROLLER_SIGNER_PRIVATE_KEY = os.getenv(
+        "EXAM_CONTROLLER_SIGNER_PRIVATE_KEY",
+        "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+    )
+    # Optional explicit path to contracts/deployed/RecordAuditTrail.json
+    # (default: <repo>/contracts/deployed/RecordAuditTrail.json).
+    AUDIT_TRAIL_ARTIFACT = os.getenv("AUDIT_TRAIL_ARTIFACT", "")
+
     # -- IPFS ----------------------------------------------------------------
     IPFS_API_URL = os.getenv("IPFS_API_URL", "http://127.0.0.1:5001")
     IPFS_GATEWAY_URL = os.getenv("IPFS_GATEWAY_URL", "http://127.0.0.1:8080")

@@ -4,7 +4,7 @@
   "chainId": 31337,
   "address": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "deployedAt": "2026-09-19T00:26:07.671Z",
+  "deployedAt": "2026-09-19T05:27:10.842Z",
   "roles": {
     "BACKEND_ROLE": {
       "label": "Backend (deployer acts as the trusted backend signer)",
