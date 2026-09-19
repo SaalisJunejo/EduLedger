@@ -13,5 +13,5 @@ web3>=7.0,<8.0
 psycopg2-binary>=2.9,<3.0
 # Image decoding for face embeddings (also pulled in by qrcode[pil])
 Pillow>=12.0,<13.0
-# HTTP client used by the backend test scripts (also a web3 dependency)
+# HTTP client used by the IPFS service and the backend test scripts (web3 dep)
 requests>=2.31,<3.0

@@ -10,4 +10,4 @@ from flask import Blueprint
 
 api_v1 = Blueprint("api_v1", __name__, url_prefix="/api/v1")
 
-from . import admin, attendance, health, sessions, students  # noqa: E402,F401  (importing registers the routes)
+from . import admin, attendance, health, ipfs, sessions, students  # noqa: E402,F401  (importing registers the routes)

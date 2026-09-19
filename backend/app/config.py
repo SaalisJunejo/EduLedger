@@ -72,6 +72,9 @@ class BaseConfig:
     # -- IPFS ----------------------------------------------------------------
     IPFS_API_URL = os.getenv("IPFS_API_URL", "http://127.0.0.1:5001")
     IPFS_GATEWAY_URL = os.getenv("IPFS_GATEWAY_URL", "http://127.0.0.1:8080")
+    # Free-tier pinning fallback when the local daemon is unreachable
+    # (upload API bearer token from https://web3.storage).
+    WEB3_STORAGE_TOKEN = os.getenv("WEB3_STORAGE_TOKEN", "")
 
     # -- Auth -----------------------------------------------------------------
     JWT_SECRET = os.getenv("JWT_SECRET", JWT_SECRET_DEFAULT)
