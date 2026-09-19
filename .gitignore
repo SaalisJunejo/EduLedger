@@ -34,3 +34,5 @@ scripts/deployments/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+.e2e*

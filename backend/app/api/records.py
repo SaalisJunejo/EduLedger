@@ -10,7 +10,12 @@
   (the HOD / Exam Controller dashboard feed)
 
 The Proposal table only mirrors on-chain state for fast queries; anything
-stateful is read back from RecordAuditTrail. Every failure response carries
+stateful is read back from RecordAuditTrail. Because contracts are redeployed
+frequently during development (and a fresh chain numbers proposals 1, 2, ...
+again), the mirror is upserted by on-chain id: propose refreshes a leftover
+row from a previous chain state instead of failing with a duplicate-key
+error, and backend/reset_local_state.py clears the mirror for a clean slate
+after a redeploy. Every failure response carries
 {error, check, message} naming the failed stage, exactly like the Module 1
 endpoints: "request" (input validation), "role" (role / signer gate),
 "proposal" (proposal-state gate: not found, not pending, already signed),
@@ -24,6 +29,7 @@ from ..extensions import db
 from ..models import Proposal
 from ..models.proposal import STATUS_PENDING
 from ..services import audit_trail
+from ..util import utcnow
 from . import api_v1
 from .errors import api_error
 
@@ -55,9 +61,13 @@ def propose():
 
     The on-chain proposeChange() runs first (from the instructor signer) so a
     failed transaction never leaves a local row; only then is the local
-    Proposal mirror inserted. Instructor authentication is not enforced yet -
-    the signer is fixed to the configured instructor account, wired up with
-    the JWT layer later (see roadmap).
+    Proposal mirror written. The mirror is upserted by on-chain id: when a
+    leftover row from a previous chain deployment already occupies that id
+    (contracts are redeployed often in development), it is refreshed to the
+    new on-chain state instead of failing with a duplicate-key error.
+    Instructor authentication is not enforced yet - the signer is fixed to
+    the configured instructor account, wired up with the JWT layer later
+    (see roadmap).
     """
     body = request.get_json(silent=True) or {}
     student_id = body.get("studentId")
@@ -88,16 +98,32 @@ def propose():
     except audit_trail.AuditTrailError as exc:
         return _audit_error(exc)
 
-    proposal = Proposal(
-        student_id=student_id,
-        field=field,
-        old_value=old_value,
-        new_value=new_value,
-        ipfs_cid=ipfs_cid,
-        onchain_proposal_id=result["proposal_id"],
-        status=result["status"],
-    )
-    db.session.add(proposal)
+    # Upsert the mirror keyed by the on-chain proposal id. A redeployed
+    # contract numbers proposals 1, 2, ... again, so a leftover local row
+    # from the previous chain state can already occupy this id. The chain is
+    # the source of truth: refresh that row rather than fail the request.
+    proposal = Proposal.query.filter_by(onchain_proposal_id=result["proposal_id"]).first()
+    if proposal is None:
+        proposal = Proposal(
+            student_id=student_id,
+            field=field,
+            old_value=old_value,
+            new_value=new_value,
+            ipfs_cid=ipfs_cid,
+            onchain_proposal_id=result["proposal_id"],
+            status=result["status"],
+        )
+        db.session.add(proposal)
+        mirror_action = "created"
+    else:
+        proposal.student_id = student_id
+        proposal.field = field
+        proposal.old_value = old_value
+        proposal.new_value = new_value
+        proposal.ipfs_cid = ipfs_cid
+        proposal.status = result["status"]
+        proposal.created_at = utcnow()  # the row now mirrors a NEW proposal
+        mirror_action = "updated"
     try:
         db.session.commit()
     except SQLAlchemyError as exc:
@@ -118,6 +144,7 @@ def propose():
                 "status": proposal.status,
                 "proposal": proposal.to_dict(),
                 "onchain_proposal_id": proposal.onchain_proposal_id,
+                "mirror_action": mirror_action,
                 "transaction_hash": result["transaction_hash"],
                 "block_number": result["block_number"],
                 "signer": result["signer"],

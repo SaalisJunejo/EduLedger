@@ -4,6 +4,7 @@ import Button from "../components/ui/Button.jsx";
 import Card from "../components/ui/Card.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import LiveSessionCard from "../components/instructor/LiveSessionCard.jsx";
+import ProposeChangeCard from "../components/instructor/ProposeChangeCard.jsx";
 import { api } from "../lib/api.js";
 import { describeApiError } from "../lib/attendanceMessages.js";
 
@@ -45,7 +46,7 @@ export default function InstructorPage() {
     <PageLayout
       role="Instructor"
       title="Instructor Dashboard"
-      description="Start a class session and project the rotating QR code — students verify their identity, scan, and attendance locks on-chain."
+      description="Start a class session and project the rotating QR code — students verify their identity, scan, and attendance locks on-chain. Below: propose record changes with IPFS evidence, executed once the HOD or Exam Controller co-signs."
     >
       {endedNote ? (
         <StatusBanner tone={endedNote.reason === "closed" ? "warning" : "info"} title="Session ended">
@@ -93,6 +94,17 @@ export default function InstructorPage() {
           ) : null}
         </Card>
       )}
+
+      {/* Module 2 — record-change proposals, clearly separated below the
+          attendance flow (which keeps working exactly as before). */}
+      <div className="border-t border-line pt-5">
+        <h2 className="text-xs font-bold uppercase tracking-wide text-ink-muted">
+          Record changes — multi-signature audit trail
+        </h2>
+        <div className="mt-3">
+          <ProposeChangeCard />
+        </div>
+      </div>
     </PageLayout>
   );
 }
