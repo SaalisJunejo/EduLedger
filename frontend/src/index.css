@@ -1,3 +1,51 @@
+@import "tailwindcss";
+
+/*
+ * EduLedger design foundation.
+ *
+ * The @theme tokens below generate the shared Tailwind utilities (bg-primary,
+ * text-ink-muted, border-line, bg-success-soft, ...) used by the Card, Button
+ * and StatusBanner components. Every module UI follows this palette:
+ * attendance (now), proposals/approvals and workload (Phase 3/4).
+ */
+@theme {
+  /* Brand / primary action */
+  --color-primary: #2563eb; /* matches the legacy --accent */
+  --color-primary-strong: #1d4ed8;
+  --color-primary-soft: #dbeafe;
+  /* Semantic */
+  --color-success: #15803d;
+  --color-success-soft: #dcfce7;
+  --color-danger: #dc2626;
+  --color-danger-strong: #b91c1c;
+  --color-danger-soft: #fee2e2;
+  --color-warning: #b45309;
+  --color-warning-soft: #fef3c7;
+  /* Neutrals */
+  --color-ink: #0f172a;
+  --color-ink-muted: #64748b;
+  --color-line: #e2e8f0;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f8fafc;
+
+  /* QR scanner view: the scan line sweeping over the camera preview */
+  --animate-scan: scan 2.4s ease-in-out infinite;
+
+  @keyframes scan {
+    0%,
+    100% {
+      top: 10%;
+    }
+    50% {
+      top: 86%;
+    }
+  }
+}
+
+/* ── Legacy scaffold styles (LoginPage + the PageLayout placeholder card) ──
+ * Kept unchanged so the login and not-yet-built role pages look exactly as
+ * before; new components style themselves with the Tailwind tokens above. */
+
 :root {
   color-scheme: light;
   --bg: #f4f6fb;
@@ -65,10 +113,6 @@ body {
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
 }
 
-.card h1 {
-  margin-top: 0;
-}
-
 .login-card {
   width: 100%;
   max-width: 420px;
@@ -132,4 +176,28 @@ body {
 .role-button span {
   color: var(--muted);
   font-size: 13px;
+}
+
+/*
+ * Tailwind's preflight resets element defaults that the legacy rules above
+ * silently relied on (heading size/weight, paragraph margins, list bullets).
+ * Restore them, scoped to the legacy classes only — components built on the
+ * Tailwind tokens set their own spacing explicitly and never use `.card`.
+ */
+.card h1 {
+  margin: 0 0 0.67em;
+  font-size: 2em;
+  font-weight: 700;
+}
+
+.card p {
+  margin: 1em 0;
+}
+
+.section-title {
+  font-weight: 700;
+}
+
+.feature-list {
+  list-style: disc;
 }
