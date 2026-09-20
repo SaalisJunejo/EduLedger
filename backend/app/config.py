@@ -37,6 +37,18 @@ class BaseConfig:
     # Set to false to skip starting the background scheduler (tests, scripts).
     SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 
+    # -- Faculty workload ledger (Module 3) ----------------------------------
+    # Minutes after a ScheduledClass's startTime with no SessionLog before the
+    # background job auto-flags the class UNCONDUCTED on-chain. The default
+    # follows the PRD's 15-minute grace period; tests set it to 1 (or pass an
+    # in-process override) so the auto-flag can be exercised without waiting.
+    UNCONDUCTED_THRESHOLD_MINUTES = int(os.getenv("UNCONDUCTED_THRESHOLD_MINUTES", "15"))
+    # Lifetime of substitute authorization tokens, in minutes.
+    SUBSTITUTE_TOKEN_MINUTES = int(os.getenv("SUBSTITUTE_TOKEN_MINUTES", "30"))
+    # Optional explicit path to contracts/deployed/WorkloadLedger.json
+    # (default: <repo>/contracts/deployed/WorkloadLedger.json).
+    WORKLOAD_LEDGER_ARTIFACT = os.getenv("WORKLOAD_LEDGER_ARTIFACT", "")
+
     # -- Identity verification & attendance scan (Module 1) -----------------
     # Cosine similarity above which a face match is accepted. 0.85 suits the
     # built-in demo embedder; use ~0.6 with face_recognition 128-d encodings.

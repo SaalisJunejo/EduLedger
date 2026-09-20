@@ -1,10 +1,10 @@
 {
-  "contractName": "AttendanceLedger",
+  "contractName": "WorkloadLedger",
   "network": "localhost",
   "chainId": 31337,
-  "address": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+  "address": "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "deployedAt": "2026-09-20T22:01:51.507Z",
+  "deployedAt": "2026-09-20T22:01:56.853Z",
   "roles": {
     "BACKEND_ROLE": {
       "label": "Backend (deployer acts as the trusted backend signer)",
@@ -48,42 +48,12 @@
       "inputs": [
         {
           "internalType": "uint256",
-          "name": "studentId",
-          "type": "uint256"
-        },
-        {
-          "internalType": "uint256",
-          "name": "sessionId",
+          "name": "classId",
           "type": "uint256"
         }
       ],
-      "name": "AttendanceAlreadyLocked",
+      "name": "WorkloadAlreadyLogged",
       "type": "error"
-    },
-    {
-      "anonymous": false,
-      "inputs": [
-        {
-          "indexed": true,
-          "internalType": "uint256",
-          "name": "studentId",
-          "type": "uint256"
-        },
-        {
-          "indexed": true,
-          "internalType": "uint256",
-          "name": "sessionId",
-          "type": "uint256"
-        },
-        {
-          "indexed": false,
-          "internalType": "uint256",
-          "name": "timestamp",
-          "type": "uint256"
-        }
-      ],
-      "name": "AttendanceLocked",
-      "type": "event"
     },
     {
       "anonymous": false,
@@ -161,6 +131,37 @@
       "type": "event"
     },
     {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "classId",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "professorId",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "enum WorkloadLedger.WorkloadStatus",
+          "name": "status",
+          "type": "uint8"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "timestamp",
+          "type": "uint256"
+        }
+      ],
+      "name": "WorkloadLogged",
+      "type": "event"
+    },
+    {
       "inputs": [],
       "name": "BACKEND_ROLE",
       "outputs": [
@@ -200,6 +201,40 @@
           "internalType": "bytes32",
           "name": "",
           "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "classId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getWorkloadLog",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "logged",
+          "type": "bool"
+        },
+        {
+          "internalType": "enum WorkloadLedger.WorkloadStatus",
+          "name": "status",
+          "type": "uint8"
+        },
+        {
+          "internalType": "uint256",
+          "name": "professorId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "timestamp",
+          "type": "uint256"
         }
       ],
       "stateMutability": "view",
@@ -251,40 +286,21 @@
       "inputs": [
         {
           "internalType": "uint256",
-          "name": "studentId",
+          "name": "classId",
           "type": "uint256"
         },
         {
           "internalType": "uint256",
-          "name": "sessionId",
-          "type": "uint256"
-        }
-      ],
-      "name": "isLocked",
-      "outputs": [
-        {
-          "internalType": "bool",
-          "name": "locked",
-          "type": "bool"
-        }
-      ],
-      "stateMutability": "view",
-      "type": "function"
-    },
-    {
-      "inputs": [
-        {
-          "internalType": "uint256",
-          "name": "studentId",
+          "name": "professorId",
           "type": "uint256"
         },
         {
-          "internalType": "uint256",
-          "name": "sessionId",
-          "type": "uint256"
+          "internalType": "enum WorkloadLedger.WorkloadStatus",
+          "name": "status",
+          "type": "uint8"
         }
       ],
-      "name": "lockAttendance",
+      "name": "logWorkload",
       "outputs": [],
       "stateMutability": "nonpayable",
       "type": "function"
