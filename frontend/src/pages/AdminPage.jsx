@@ -1,19 +1,20 @@
 import PageLayout from "../components/PageLayout.jsx";
+import WorkloadAuditLogCard from "../components/admin/WorkloadAuditLogCard.jsx";
 
-const FEATURES = [
-  "Manage timetables, rooms, and department accounts",
-  "Approve student device re-binding requests",
-  "Monitor system health: Hardhat node, IPFS daemon, background jobs",
-  "Review on-chain events across attendance, record changes, and workload",
-];
-
+/**
+ * Admin dashboard (Module 3): the system-wide workload audit log — every
+ * class outcome anchored on the faculty ledger, with its credited conductor
+ * and on-chain transaction. Further admin surfaces (timetables, accounts,
+ * system health) land with their modules, per docs/PRD.md.
+ */
 export default function AdminPage() {
   return (
     <PageLayout
       role="Admin"
       title="Admin Dashboard"
-      description="Keep the platform running: schedules, accounts, and system-wide status."
-      features={FEATURES}
-    />
+      description="The system-wide record of every class outcome anchored on the faculty workload ledger — student scans, zero-attendance declarations, substitute coverage and automatic un-conducted flags, each tied to its on-chain transaction."
+    >
+      <WorkloadAuditLogCard />
+    </PageLayout>
   );
 }
