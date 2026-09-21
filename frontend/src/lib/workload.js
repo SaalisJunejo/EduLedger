@@ -31,9 +31,9 @@ export function professorLabel(id) {
 // the ScheduledClass rows in the database; see seed_workload_demo.py, which
 // prints the start times these labels mirror).
 export const MOCK_CLASSES = [
-  { id: 1, courseId: "BSCS-401", title: "Distributed Systems", room: "A-101", start: "02:11", professorId: 101 },
-  { id: 2, courseId: "BSCS-402", title: "Blockchain Engineering", room: "B-204", start: "05:11", professorId: 101 },
-  { id: 3, courseId: "BSCS-501", title: "Information Security", room: "C-301", start: "08:11", professorId: 101 },
+  { id: 1, courseId: "BSCS-401", title: "Distributed Systems", room: "A-101", start: "02:52", professorId: 101 },
+  { id: 2, courseId: "BSCS-402", title: "Blockchain Engineering", room: "B-204", start: "05:52", professorId: 101 },
+  { id: 3, courseId: "BSCS-501", title: "Information Security", room: "C-301", start: "08:52", professorId: 101 },
 ];
 
 // SessionLog.status -> badge label + chip classes (the design foundation's
