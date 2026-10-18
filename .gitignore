@@ -36,3 +36,5 @@ scripts/deployments/
 Thumbs.db
 
 .e2e*
+PROJECT_CONTEXT.md
+docs/
