@@ -114,6 +114,7 @@ class BaseConfig:
     # -- Auth -----------------------------------------------------------------
     JWT_SECRET = os.getenv("JWT_SECRET", JWT_SECRET_DEFAULT)
     JWT_EXPIRES = timedelta(hours=int(os.getenv("JWT_EXPIRES_HOURS", "12")))
+    INSTITUTION_EMAIL_DOMAIN = os.getenv("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk")
 
     # -- HTTP -----------------------------------------------------------------
     CORS_ORIGINS = _env_list("CORS_ORIGINS", "http://localhost:5173")

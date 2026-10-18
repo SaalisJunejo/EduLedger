@@ -15,3 +15,5 @@ psycopg2-binary>=2.9,<3.0
 Pillow>=12.0,<13.0
 # HTTP client used by the IPFS service and the backend test scripts (web3 dep)
 requests>=2.31,<3.0
+# Password hashing (Argon2id)
+argon2-cffi>=23.1.0
