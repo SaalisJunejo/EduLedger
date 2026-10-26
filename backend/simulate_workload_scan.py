@@ -26,24 +26,29 @@ Development only.
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 # One-off script: no Flask server, so no background jobs either. Must be
 # set before `app` is imported (the config reads it at import time).
-os.environ.setdefault("SCHEDULER_ENABLED", "false")
+os.environ["SCHEDULER_ENABLED"] = "false"
 
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
-from app.models import AttendanceSession  # noqa: E402
+from app.models import AttendanceSession, Student, User, UserRole  # noqa: E402
+from seed_workload_demo import DEMO_FACULTY_PASSWORD, ensure_demo_faculty  # noqa: E402
 
 BASE_URL = "http://localhost:5000/api/v1"
 
 
-def _post(path: str, payload: dict) -> tuple[int, dict]:
+def _post(path: str, payload: dict, token: str | None = None) -> tuple[int, dict]:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -53,9 +58,47 @@ def _post(path: str, payload: dict) -> tuple[int, dict]:
         return error.code, json.loads(error.read().decode("utf-8"))
 
 
-def _get(path: str) -> dict:
-    with urllib.request.urlopen(f"{BASE_URL}{path}", timeout=10) as response:
+def _get(path: str, token: str) -> dict:
+    request = urllib.request.Request(
+        f"{BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _login(email: str, password: str, role: str) -> tuple[str, dict]:
+    """Obtain a real login token; never mint auth tokens inside the simulator."""
+    status, body = _post("/auth/login", {"email": email, "password": password})
+    if status != 200 or not body.get("token"):
+        raise SystemExit(f"login failed for {email}: HTTP {status} - {body}")
+    user = body.get("user") or {}
+    if user.get("role") != role:
+        raise SystemExit(f"{email} must be {role}, got {user.get('role')}")
+    return body["token"], user
+
+
+def _student_identity(app) -> tuple[str, int]:
+    """Register/reuse a demo student by email and ensure Student.id == User.id."""
+    domain = app.config.get("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk").strip().lower()
+    email = f"student.workload.demo@{domain}"
+    password = "WorkloadDemoStudent123!"
+    user = User.query.filter_by(email=email).first()
+    if user is None:
+        status, body = _post("/auth/register/student", {
+            "email": email, "password": password, "full_name": "Demo Workload Student",
+            "department": "Computer Science", "roll_number": "WORKLOAD-DEMO-STUDENT",
+            "batch": "2022-2026",
+        })
+        if status != 201:
+            raise SystemExit(f"student registration failed: HTTP {status} - {body}")
+    elif user.role != UserRole.STUDENT:
+        raise SystemExit(f"demo account {email} exists but is not STUDENT")
+    token, identity = _login(email, password, "STUDENT")
+    student_id = identity["id"]
+    if db.session.get(Student, student_id) is None:
+        db.session.add(Student(id=student_id, name=identity["fullName"]))
+        db.session.commit()
+    return token, student_id
 
 
 def _newest_workload_session_id() -> int:
@@ -80,16 +123,25 @@ def main() -> int:
     app = create_app()
     with app.app_context():
         session_id = int(sys.argv[1]) if len(sys.argv) > 1 else _newest_workload_session_id()
-        print(f"Simulating a student scan of workload session #{session_id}")
+        faculty = ensure_demo_faculty()["professor"]
+        faculty_token, professor = _login(faculty.email, DEMO_FACULTY_PASSWORD, "FACULTY")
+        if professor["id"] != faculty.id:
+            raise SystemExit("faculty login id does not match the demo faculty User.id")
+        student_token, student_id = _student_identity(app)
+        print(
+            f"Simulating student #{student_id} scanning workload session #{session_id} "
+            f"(projector auth: faculty #{professor['id']})"
+        )
 
         # The nonce rotates every NONCE_ROTATION_SECONDS (5s); read and
         # submit immediately, retrying a couple of times if it rotates
         # in between (the real QR would simply be rescanned).
         for attempt in range(1, 4):
-            qr = _get(f"/session/{session_id}/qr")
+            qr = _get(f"/session/{session_id}/qr", faculty_token)
             status, body = _post(
                 "/faculty/session/scan",
                 {"session_id": session_id, "nonce": qr["current_nonce"]},
+                token=student_token,
             )
             if status in (200, 201):
                 print(f"[OK] HTTP {status} - {body.get('status')}")

@@ -10,11 +10,13 @@ from flask import jsonify, request
 
 from ..extensions import db
 from ..models import Student
+from ..services.auth import require_auth
 from .errors import api_error
 from . import api_v1
 
 
 @api_v1.post("/admin/rebind-device")
+@require_auth(roles=["HOD", "ADMIN"])
 def rebind_device():
     """Force-bind a device to a student (lost/replaced phone, admin override).
 

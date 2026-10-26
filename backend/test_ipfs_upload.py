@@ -28,6 +28,7 @@ Web3.Storage returns CIDv1 (bafy..., base32). Both shapes are accepted.
 import io
 import re
 import sys
+from uuid import uuid4
 
 import requests
 from PIL import Image
@@ -46,16 +47,22 @@ EVIDENCE_LIMIT_BYTES = 10 * 1024 * 1024
 CID_PATTERN = re.compile(r"^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z2-7]{30,})$")
 
 # Shared state between steps (filled in as the run progresses).
-STATE = {"gateway_url": None}
+STATE = {"gateway_url": None, "token": None}
+RUN_ID = uuid4().hex
 
 
 # --------------------------------------------------------------------------
 # API helpers
 # --------------------------------------------------------------------------
 def api(method: str, path: str, **kwargs) -> tuple[int, dict]:
-    """Call the API; returns (status, decoded JSON body). Never raises on HTTP errors."""
+    """Call the API with a login token, except during public auth bootstrap."""
+    if not path.startswith("/auth/"):
+        assert STATE["token"], f"no login token available for {method} {path}"
+    headers = kwargs.pop("headers", {})
+    if STATE["token"]:
+        headers["Authorization"] = f"Bearer {STATE['token']}"
     kwargs.setdefault("timeout", 90)
-    response = requests.request(method, f"{BASE_URL}{path}", **kwargs)
+    response = requests.request(method, f"{BASE_URL}{path}", headers=headers, **kwargs)
     try:
         payload = response.json()
     except ValueError:
@@ -75,7 +82,25 @@ def _test_png() -> io.BytesIO:
 # Steps
 # --------------------------------------------------------------------------
 def step_preflight():
-    """Backend reachable and IPFS configured."""
+    """Register/log in inline, then check backend reachability and IPFS config."""
+    # Upload allows any authenticated user; a FACULTY registration needs no whitelist.
+    email = f"ipfs.faculty.{RUN_ID}@gcu.edu.pk"
+    password = "IpfsTestPassword123!"
+    status, payload = api(
+        "POST", "/auth/register/faculty",
+        json={
+            "employee_id": f"IPFS-{RUN_ID}", "email": email, "password": password,
+            "full_name": "IPFS Test Faculty", "department": "Computer Science",
+        },
+    )
+    assert status == 201, f"faculty registration failed ({status}): {payload}"
+    assert payload["user"]["role"] == "FACULTY", f"wrong registration role: {payload}"
+    status, payload = api("POST", "/auth/login", json={"email": email, "password": password})
+    assert status == 200, f"faculty login failed ({status}): {payload}"
+    assert payload.get("token"), f"login returned no token: {payload}"
+    assert payload["user"]["role"] == "FACULTY", f"wrong login role: {payload}"
+    STATE["token"] = payload["token"]
+    print(f"   authenticated faculty_id={payload['user']['id']}")
     status, payload = api("GET", "/health")
     assert status == 200, f"/health returned {status}: {payload}"
     assert payload.get("status") == "ok", f"health status is not 'ok': {payload}"
@@ -167,7 +192,7 @@ def step_oversized_rejected():
 # Runner
 # --------------------------------------------------------------------------
 STEPS = [
-    ("Preflight: backend /health + IPFS configured", step_preflight),
+    ("Preflight: register/login + backend /health + IPFS configured", step_preflight),
     ("Upload small PNG -> CID + gateway URL", step_upload_evidence),
     ("Gateway URL is reachable", step_gateway_reachable),
     ("Missing file field -> blocked", step_missing_file_rejected),

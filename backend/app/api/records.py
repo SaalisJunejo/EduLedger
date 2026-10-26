@@ -22,13 +22,14 @@ endpoints: "request" (input validation), "role" (role / signer gate),
 "audit_trail" (chain unreachable or unconfigured), "database" (mirror sync).
 """
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..extensions import db
 from ..models import Proposal
 from ..models.proposal import STATUS_PENDING
 from ..services import audit_trail
+from ..services.auth import require_auth
 from ..util import utcnow
 from . import api_v1
 from .errors import api_error
@@ -53,6 +54,7 @@ def _audit_error(exc: audit_trail.AuditTrailError):
 
 
 @api_v1.post("/records/propose")
+@require_auth(roles=["FACULTY"])
 def propose():
     """Propose a record change; anchor it on-chain and mirror it locally.
 
@@ -65,10 +67,12 @@ def propose():
     leftover row from a previous chain deployment already occupies that id
     (contracts are redeployed often in development), it is refreshed to the
     new on-chain state instead of failing with a duplicate-key error.
-    Instructor authentication is not enforced yet - the signer is fixed to
-    the configured instructor account, wired up with the JWT layer later
-    (see roadmap).
+    The logical proposer is the authenticated faculty user (g.user_id);
+    any proposer id supplied in the body is ignored. The chain still uses
+    the configured instructor signer. The current mirror has no user-proposer
+    column, so proposer_id is returned here but is not persisted.
     """
+    proposer_id = g.user_id
     body = request.get_json(silent=True) or {}
     student_id = body.get("studentId")
     field = body.get("field")
@@ -142,6 +146,7 @@ def propose():
         jsonify(
             {
                 "status": proposal.status,
+                "proposer_id": proposer_id,
                 "proposal": proposal.to_dict(),
                 "onchain_proposal_id": proposal.onchain_proposal_id,
                 "mirror_action": mirror_action,
@@ -156,27 +161,19 @@ def propose():
 
 
 @api_v1.post("/records/<int:proposal_id>/approve")
+@require_auth(roles=["HOD", "ADMIN"])
 def approve(proposal_id: int):
-    """Co-sign a proposal as the HOD or the Exam Controller.
+    """Co-sign using the authenticated HOD or ADMIN user's signer.
 
-    Body: ``{"role": "hod" | "exam_controller"}``. The approval transaction is
-    sent from that role's signer; when it brings the signature count to 2 the
+    The body is ignored: HOD maps to "hod" and ADMIN temporarily maps to
+    "exam_controller". When the signature count reaches 2, the unchanged
     contract auto-executes the change and emits RecordUpdated. The local
     Proposal mirror's status is synced to the on-chain result.
 
     Note the URL carries the ON-CHAIN proposal id (getProposal's id), not the
     local Proposal.id primary key.
     """
-    body = request.get_json(silent=True) or {}
-    role = body.get("role")
-
-    if role not in audit_trail.APPROVER_ROLES:
-        return api_error(
-            "role",
-            "invalid_role",
-            f"role must be one of: {', '.join(sorted(audit_trail.APPROVER_ROLES))} "
-            f"(got {role!r})",
-        )
+    role = {"HOD": "hod", "ADMIN": "exam_controller"}[g.role]
 
     try:
         result = audit_trail.approve_proposal(proposal_id, role)
@@ -220,6 +217,7 @@ def approve(proposal_id: int):
 
 
 @api_v1.get("/records/<int:proposal_id>")
+@require_auth()
 def get_record(proposal_id: int):
     """Current proposal details, read from the contract (source of truth).
 
@@ -235,6 +233,7 @@ def get_record(proposal_id: int):
 
 
 @api_v1.get("/records/pending")
+@require_auth(roles=["FACULTY", "HOD", "ADMIN"])
 def pending_records():
     """Locally mirrored proposals still Pending, for the approver dashboard.
 

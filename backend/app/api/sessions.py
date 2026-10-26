@@ -17,6 +17,7 @@ from flask import current_app, jsonify, request
 
 from ..extensions import db
 from ..models import AttendanceSession
+from ..services.auth import require_auth
 from ..util import iso_z, utcnow
 from . import api_v1
 
@@ -44,6 +45,7 @@ def _refresh_if_stale(session: AttendanceSession) -> None:
 
 
 @api_v1.post("/session/start")
+@require_auth(roles=["FACULTY"])
 def start_session():
     """Start a new attendance session for a class.
 
@@ -85,6 +87,7 @@ def start_session():
 
 
 @api_v1.get("/session/<int:session_id>/qr")
+@require_auth(roles=["FACULTY"])
 def session_qr(session_id):
     """Current QR code for a session, as a base64 PNG data URI.
 

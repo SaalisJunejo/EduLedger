@@ -1,35 +1,69 @@
+import sys
 import time
 import requests
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 BASE_URL = "http://localhost:5000/api/v1"
 
+
+def setup_auth() -> str:
+    faculty_email = "faculty.qr.test@gcu.edu.pk"
+    faculty_pass = "FacultyPass123!"
+    requests.post(
+        f"{BASE_URL}/auth/register/faculty",
+        json={
+            "employee_id": "EMP-QR-TEST",
+            "full_name": "Dr. QR Faculty",
+            "department": "Computer Science",
+            "email": faculty_email,
+            "password": faculty_pass,
+        },
+    )
+    res = requests.post(
+        f"{BASE_URL}/auth/login",
+        json={"email": faculty_email, "password": faculty_pass},
+    ).json()
+    token = res.get("token")
+    assert token, f"Faculty login failed: {res}"
+    return token
+
+
 def test_qr_rotation():
+    faculty_token = setup_auth()
+    headers = {"Authorization": f"Bearer {faculty_token}"}
+
     print("--- 1. Starting Session ---")
-    res = requests.post(f"{BASE_URL}/session/start", json={"class_id": "1", "duration_minutes": 10})
+    res = requests.post(
+        f"{BASE_URL}/session/start",
+        headers=headers,
+        json={"class_id": "1", "duration_minutes": 10},
+    )
     assert res.status_code in (200, 201), f"Failed to start session: {res.text}"
-    
+
     session_data = res.json()
     print(f"Backend Response: {session_data}")
-    
+
     # Extract session ID from top-level or nested 'session' object
     session_info = session_data.get("session", {})
     session_id = (
-        session_data.get("sessionId") 
-        or session_data.get("id") 
+        session_data.get("sessionId")
+        or session_data.get("id")
         or session_info.get("id")
     )
-    
+
     assert session_id is not None, "No session ID returned in response!"
     print(f"Active session ID created: {session_id}")
 
     def get_qr():
-        response = requests.get(f"{BASE_URL}/session/{session_id}/qr")
+        response = requests.get(f"{BASE_URL}/session/{session_id}/qr", headers=headers)
         assert response.status_code == 200, f"Failed GET /qr: {response.text}"
         return response.json()
 
     print("\n--- 2. Fetching Initial Nonce ---")
     qr_initial = get_qr()
-    
+
     print("Waiting 1 second to align with window start...")
     time.sleep(1)
 
@@ -59,6 +93,7 @@ def test_qr_rotation():
 
     assert nonce1 != nonce3, "❌ FAILED: Nonce did NOT rotate after 5+ seconds!"
     print("✅ PASSED: Nonce successfully rotated across windows.")
+
 
 if __name__ == "__main__":
     test_qr_rotation()

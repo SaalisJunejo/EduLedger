@@ -11,6 +11,7 @@ import os
 
 from flask import jsonify, request
 
+from ..services.auth import require_auth
 from ..services.ipfs import IPFSUploadError, upload_to_ipfs
 from .errors import api_error
 from . import api_v1
@@ -26,6 +27,7 @@ ALLOWED_TYPES = {
 
 
 @api_v1.post("/ipfs/upload")
+@require_auth()
 def upload():
     """Pin an evidence document on IPFS and return its CID + gateway URL.
 

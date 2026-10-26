@@ -20,7 +20,7 @@ import enum
 from ..extensions import db
 from ..util import iso_z, utcnow
 
-ROLE_VC = "VC"
+ROLE_ADMIN = "ADMIN"
 ROLE_HOD = "HOD"
 ROLE_FACULTY = "FACULTY"
 ROLE_STUDENT = "STUDENT"
@@ -29,7 +29,7 @@ ROLE_STUDENT = "STUDENT"
 class UserRole(str, enum.Enum):
     """Institutional roles for system users."""
 
-    VC = "VC"
+    ADMIN = "ADMIN"
     HOD = "HOD"
     FACULTY = "FACULTY"
     STUDENT = "STUDENT"

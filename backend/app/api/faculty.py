@@ -32,18 +32,22 @@ session / nonce gates, same names as /attendance/scan), "session"
 
 from datetime import datetime, timezone
 
-from flask import current_app, jsonify, request
+from flask import current_app, g, jsonify, request
 
 from ..extensions import db
 from ..models import (
     AttendanceSession,
     ScheduledClass,
     SessionLog,
+    Student,
     SubstituteToken,
+    User,
+    UserRole,
     WorkloadSession,
 )
 from ..models.workload import STATUS_CONDUCTED, STATUS_CONDUCTED_ZERO_STUDENTS
 from ..services import workload
+from ..services.auth import require_auth
 from ..services.substitute_token import (
     SubstituteTokenError,
     mint as mint_substitute_token,
@@ -134,23 +138,22 @@ def _anchor_session_log(scheduled_class: ScheduledClass, conductor_id: int, stat
 
 
 @api_v1.post("/faculty/session/start")
+@require_auth(roles=["FACULTY"])
 def faculty_start_session():
     """Start the live session for one of the professor's scheduled classes.
 
-    Body: ``{"professor_id": 101, "class_id": 7}``. The rotating QR for the
+    Body: ``{"class_id": 7}``. The rotating QR for the
     classroom projector is served by the existing Module 1 endpoint at
     ``qr_poll_url`` (poll every 1-2 seconds). Only the scheduled professor
     may start the class, and a class whose workload was already logged
     cannot be started again (the contract allows one entry per class).
-    Professor authentication is not enforced yet - the body carries the id,
-    wired up with the JWT layer later (see roadmap).
+    The professor is g.user_id from the FACULTY login token; any professor_id
+    in the body is ignored.
     """
     body = request.get_json(silent=True) or {}
-    professor_id = body.get("professor_id")
+    professor_id = g.user_id
     class_id = body.get("class_id")
 
-    if not isinstance(professor_id, int) or professor_id <= 0:
-        return api_error("request", "missing_fields", "professor_id (positive int) is required")
     if not isinstance(class_id, int) or class_id <= 0:
         return api_error("request", "missing_fields", "class_id (positive int) is required")
 
@@ -194,12 +197,14 @@ def faculty_start_session():
 
 
 @api_v1.post("/faculty/session/scan")
+@require_auth(roles=["STUDENT"])
 def faculty_scan():
     """A student scan of the live QR: the class is CONDUCTED, anchored on-chain.
 
-    Body: ``{"session_id": 12, "nonce": "<scanned from the QR>"}`` (an
-    optional ``student_id`` is accepted but not required - any single scan
-    is enough to prove the session is live).
+    Body: ``{"session_id": 12, "nonce": "<scanned from the QR>"}``.
+    The student is g.user_id from the STUDENT login token, matching Student.id
+    by convention. Body student ids are ignored; any single scan is enough
+    to prove the session is live.
 
     Validation order (each failure response names its check, mirroring
     /attendance/scan): (a) session exists, (b) session still active,
@@ -210,6 +215,11 @@ def faculty_scan():
     conductor. A scan for an already-logged class is an idempotent no-op
     (200) - only the first scan needs to succeed.
     """
+    student_id = g.user_id
+    student = db.session.get(Student, student_id)
+    if student is None:
+        return api_error("student", "student_not_found", f"student {student_id} does not exist", 404)
+
     body = request.get_json(silent=True) or {}
     session_id = body.get("session_id")
     nonce = body.get("nonce")
@@ -272,7 +282,10 @@ def faculty_scan():
     # Idempotent per class: only the first successful scan anchors CONDUCTED.
     existing = SessionLog.query.filter_by(class_id=scheduled_class.id).first()
     if existing is not None:
-        return jsonify({"status": "already_logged", "session_log": existing.to_dict()})
+        return jsonify({
+            "status": "already_logged", "student_id": student.id,
+            "session_log": existing.to_dict(),
+        })
 
     try:
         session_log, result = _anchor_session_log(
@@ -286,6 +299,7 @@ def faculty_scan():
         jsonify(
             {
                 "status": "conducted",
+                "student_id": student.id,
                 "session_log": session_log.to_dict(),
                 "transaction_hash": result["transaction_hash"],
                 "block_number": result["block_number"],
@@ -298,21 +312,21 @@ def faculty_scan():
 
 
 @api_v1.post("/faculty/session/zero-attendance")
+@require_auth(roles=["FACULTY"])
 def zero_attendance():
     """Professor declares the class was held with zero students.
 
-    Body: ``{"professor_id": 101, "class_id": 7}``. Only allowed when a
-    session was properly started for the class (the professor - or a
+    Body: ``{"class_id": 7}``. The caller is g.user_id, ignoring body
+    professor ids. Only allowed when a session was properly started for the
+    class (the professor - or a
     substitute covering it - is its live conductor); the class is then
     anchored on-chain as CONDUCTED_ZERO_STUDENTS, still crediting the
     conductor's workload.
     """
     body = request.get_json(silent=True) or {}
-    professor_id = body.get("professor_id")
+    professor_id = g.user_id
     class_id = body.get("class_id")
 
-    if not isinstance(professor_id, int) or professor_id <= 0:
-        return api_error("request", "missing_fields", "professor_id (positive int) is required")
     if not isinstance(class_id, int) or class_id <= 0:
         return api_error("request", "missing_fields", "class_id (positive int) is required")
 
@@ -381,21 +395,22 @@ def zero_attendance():
 
 
 @api_v1.post("/faculty/substitute/issue")
+@require_auth(roles=["FACULTY"])
 def issue_substitute():
     """Mint a short-lived signed token authorizing a substitute for one class.
 
-    Body: ``{"professor_id": 101, "class_id": 7, "substitute_id": 102}``.
+    Body: ``{"class_id": 7, "substitute_id": <faculty user id>}``.
+    The issuer is g.user_id; any body professor_id is ignored. The named
+    substitute must exist as a FACULTY user.
     The token is an HS256 JWT valid for SUBSTITUTE_TOKEN_MINUTES
     (default 30 minutes) that only the named substitute can redeem, for
     this one class only. The SubstituteToken row tracks its redemption.
     """
     body = request.get_json(silent=True) or {}
-    professor_id = body.get("professor_id")
+    professor_id = g.user_id
     class_id = body.get("class_id")
     substitute_id = body.get("substitute_id")
 
-    if not isinstance(professor_id, int) or professor_id <= 0:
-        return api_error("request", "missing_fields", "professor_id (positive int) is required")
     if not isinstance(class_id, int) or class_id <= 0:
         return api_error("request", "missing_fields", "class_id (positive int) is required")
     if not isinstance(substitute_id, int) or substitute_id <= 0:
@@ -420,6 +435,12 @@ def issue_substitute():
             "invalid_substitute",
             "substitute_id must differ from the issuing professor",
         )
+
+    substitute = db.session.get(User, substitute_id)
+    if substitute is None:
+        return api_error("substitute", "substitute_not_found", f"user {substitute_id} does not exist", 404)
+    if substitute.role != UserRole.FACULTY:
+        return api_error("substitute", "substitute_not_faculty", "substitute must be a FACULTY user", 403)
 
     token, expires_at_unix = mint_substitute_token(professor_id, substitute_id, class_id)
     # JWT exp is a unix timestamp; store it as the same naive-UTC datetime
@@ -451,11 +472,13 @@ def issue_substitute():
 
 
 @api_v1.post("/faculty/substitute/redeem")
+@require_auth(roles=["FACULTY"])
 def redeem_substitute():
     """Redeem a substitute token and start the class session as the substitute.
 
-    Body: ``{"token": "<jwt>", "substitute_id": 102}``. The token must be
-    valid, unexpired, issued for this substitute, and not redeemed before;
+    Body: ``{"token": "<substitute jwt>"}``. The substitute is g.user_id,
+    ignoring body substitute ids. The token must be valid, unexpired, issued
+    for this substitute, and not redeemed before;
     the class must not be concluded yet. On success the live session starts
     with the substitute as conductor - so the workload (SessionLog's
     conductedBy) is later credited to the substitute, not the scheduled
@@ -463,12 +486,10 @@ def redeem_substitute():
     """
     body = request.get_json(silent=True) or {}
     token = body.get("token")
-    substitute_id = body.get("substitute_id")
+    substitute_id = g.user_id
 
-    if not token or not isinstance(substitute_id, int) or substitute_id <= 0:
-        return api_error(
-            "request", "missing_fields", "token (string) and substitute_id (positive int) are required"
-        )
+    if not isinstance(token, str) or not token.strip():
+        return api_error("request", "missing_fields", "token (non-empty string) is required")
 
     try:
         claims = verify_substitute_token(str(token))
@@ -538,6 +559,7 @@ def redeem_substitute():
 
 
 @api_v1.get("/faculty/logs")
+@require_auth(roles=["HOD", "ADMIN"])
 def list_logs():
     """Every SessionLog entry, newest first, for the admin / history view.
 

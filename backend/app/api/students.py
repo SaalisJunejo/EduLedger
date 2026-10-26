@@ -7,34 +7,35 @@ Device rebinding (lost/changed phone) is an admin operation:
 POST /api/v1/admin/rebind-device (see app/api/admin.py).
 """
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 
 from ..extensions import db
 from ..models import Student
+from ..services.auth import require_auth
 from ..services.face_embedding import FaceImageError, embed_face_image
 from .errors import api_error
 from . import api_v1
 
 
 @api_v1.post("/student/enroll-face")
+@require_auth(roles=["STUDENT"])
 def enroll_face():
     """Demo enrollment: create (or update) a student and store a face embedding.
 
-    Body: ``{"student_id": 2024001, "name": "Ayesha Khan",
-    "face_image": "<base64 image>"}``. In the real system students are
-    enrolled at admission; this endpoint exists so the demo flow is
-    self-contained. Re-enrolling overwrites the stored embedding.
+    Body: ``{"face_image": "<base64 image>"}`` (optional: ``name``).
+    Identity is derived from the authenticated student token (g.user_id).
+    Any student_id in the body is ignored.
     """
     body = request.get_json(silent=True) or {}
-    student_id = body.get("student_id")
+    student_id = g.user_id
     name = str(body.get("name") or "").strip()
     face_image = body.get("face_image")
 
-    if not isinstance(student_id, int) or not name or not face_image:
+    if not face_image:
         return api_error(
             "enrollment",
             "missing_fields",
-            "student_id (int), name and face_image (base64) are required",
+            "face_image (base64) is required",
         )
 
     try:
@@ -45,7 +46,13 @@ def enroll_face():
     student = db.session.get(Student, student_id)
     created = student is None
     if created:
+        if not name:
+            from ..models import User
+            user = db.session.get(User, student_id)
+            name = user.full_name if user and user.full_name else f"Student {student_id}"
         student = Student(id=student_id, name=name)
+    elif name:
+        student.name = name
 
     student.face_embedding = embedding
     db.session.add(student)
@@ -64,10 +71,12 @@ def enroll_face():
 
 
 @api_v1.post("/student/register-device")
+@require_auth(roles=["STUDENT"])
 def register_device():
-    """Bind a client-generated deviceId to a student account.
+    """Bind a client-generated deviceId to an authenticated student account.
 
-    Body: ``{"student_id": 2024001, "device_id": "<keychain/keystore uuid>"}``.
+    Body: ``{"device_id": "<keychain/keystore uuid>"}``.
+    Identity is derived from the authenticated student token (g.user_id).
     The device id is generated and stored on the client (iOS Keychain /
     Android Keystore). Only the FIRST binding is allowed here: if a different
     device is already bound the request is rejected with `device_already_bound`
@@ -75,12 +84,12 @@ def register_device():
     Binding the already-bound device again is idempotent.
     """
     body = request.get_json(silent=True) or {}
-    student_id = body.get("student_id")
+    student_id = g.user_id
     device_id = str(body.get("device_id") or "").strip()
 
-    if not isinstance(student_id, int) or not device_id:
+    if not device_id:
         return api_error(
-            "device_binding", "missing_fields", "student_id (int) and device_id are required"
+            "device_binding", "missing_fields", "device_id is required"
         )
 
     student = db.session.get(Student, student_id)

@@ -33,7 +33,8 @@ What it does
 - empties the Module 3 workload tables (`session_logs`,
   `substitute_tokens`, `workload_sessions`, `scheduled_classes`) together,
   in FK-safe order, resetting their sequences
-- touches nothing else: students and attendance sessions are left alone,
+- empties the `students` table (Module 1)
+- touches nothing else: attendance sessions are left alone,
   and on-chain state is reset by redeploying the contracts, not by this
   script
 
@@ -55,6 +56,7 @@ from app.models import (  # noqa: E402
     Proposal,
     ScheduledClass,
     SessionLog,
+    Student,
     SubstituteToken,
     WorkloadSession,
 )
@@ -68,6 +70,7 @@ _TABLES = [
     (SubstituteToken.__tablename__, SubstituteToken),
     (WorkloadSession.__tablename__, WorkloadSession),
     (ScheduledClass.__tablename__, ScheduledClass),
+    (Student.__tablename__, Student),
 ]
 
 
@@ -103,7 +106,7 @@ def main() -> int:
             assert remaining == 0, f"{table} was not cleared"
 
         print("  identity sequences  : restarted (next local id = 1)")
-        print("[OK] proposals + workload tables cleared - safe to test against the fresh deploy")
+        print("[OK] proposals + workload tables + students cleared - safe to test against the fresh deploy")
     return 0
 
 

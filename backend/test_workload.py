@@ -62,23 +62,28 @@ Design notes:
       the test's 1-minute threshold, but still inside the live server's
       15-minute default, so only the manual job call can flag it during the
       run (no race with the real scheduler).
-    - professorId is an opaque integer (no professor table exists yet),
-      exactly like studentId in the Module 2 tests.
+    - professorId/conductorId are real FACULTY User ids. Preflight registers
+      and logs in unique-email professor, substitute, stranger, student and
+      HOD accounts. It seeds the matching Student.id == User.id row.
+    - API checks carry real login tokens; public registration/login bootstrap
+      requests are the only exception. Users are retained with their student
+      row and workload logs; this script never resets users in isolation.
 """
 
 import os
 import sys
 from datetime import timedelta
+from uuid import uuid4
 
 # Must be set before `app` is imported (the config reads it at import time):
 # this process is a one-off test client, never a second scheduler host.
-os.environ.setdefault("SCHEDULER_ENABLED", "false")
+os.environ["SCHEDULER_ENABLED"] = "false"
 
 import requests  # noqa: E402 (imported after the env tweak, like reset_local_state.py)
 
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
-from app.models import ScheduledClass  # noqa: E402
+from app.models import InstitutionWhitelist, ScheduledClass, Student  # noqa: E402
 from app.scheduler import flag_unconducted_classes  # noqa: E402
 from app.services import substitute_token, workload  # noqa: E402
 from app.util import utcnow  # noqa: E402
@@ -90,18 +95,19 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 
 BASE_URL = "http://127.0.0.1:5000/api/v1"
 
-# Scenario personas: professor 101 owns the classes, 102 substitutes, 999 is
-# a stranger with no rights anywhere.
-PROFESSOR_ID = 101
-SUBSTITUTE_ID = 102
-STRANGER_ID = 999
+# Filled with real User ids and login tokens by inline auth setup.
+PROFESSOR_ID = None
+SUBSTITUTE_ID = None
+STRANGER_ID = None
+AUTH = {"faculty_tokens": {}}
+RUN_ID = uuid4().hex
 
 # A short threshold for the auto-flag step (minutes). The live server keeps
 # its own (default 15); this only affects the manual in-process job call.
 TEST_THRESHOLD_MINUTES = 1
 
 # In-process app against the same Postgres DB the live server uses.
-APP = create_app()
+APP = None  # initialized inside preflight, not as an import side effect
 
 # Shared state between steps (filled in as the run progresses).
 STATE = {
@@ -120,9 +126,15 @@ STATE = {
 # --------------------------------------------------------------------------
 # API helpers
 # --------------------------------------------------------------------------
-def api(method: str, path: str, **kwargs) -> tuple[int, dict]:
-    """Call the API; returns (status, decoded JSON body). Never raises on HTTP errors."""
-    response = requests.request(method, f"{BASE_URL}{path}", timeout=15, **kwargs)
+def api(method: str, path: str, token: str | None = None, **kwargs) -> tuple[int, dict]:
+    """Call the API with a login token, except during public auth bootstrap."""
+    token = token or AUTH.get("professor_token")
+    if not path.startswith("/auth/"):
+        assert token, f"no login token available for {method} {path}"
+    headers = kwargs.pop("headers", {})
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.request(method, f"{BASE_URL}{path}", headers=headers, timeout=15, **kwargs)
     try:
         payload = response.json()
     except ValueError:
@@ -130,9 +142,12 @@ def api(method: str, path: str, **kwargs) -> tuple[int, dict]:
     return response.status_code, payload
 
 
-def start_session(professor_id: int, class_id: int) -> tuple[int, dict]:
-    """POST /faculty/session/start."""
-    return api("POST", "/faculty/session/start", json={"professor_id": professor_id, "class_id": class_id})
+def start_session(professor_id: int, class_id: int, body_professor_id: int | None = None) -> tuple[int, dict]:
+    """Start as the token owner; a body professor id is only a spoofing probe."""
+    body = {"class_id": class_id}
+    if body_professor_id is not None:
+        body["professor_id"] = body_professor_id
+    return api("POST", "/faculty/session/start", token=AUTH["faculty_tokens"][professor_id], json=body)
 
 
 def scan(session_id: int, nonce: str, student_id: int | None = None) -> tuple[int, dict]:
@@ -140,7 +155,7 @@ def scan(session_id: int, nonce: str, student_id: int | None = None) -> tuple[in
     body = {"session_id": session_id, "nonce": nonce}
     if student_id is not None:
         body["student_id"] = student_id
-    return api("POST", "/faculty/session/scan", json=body)
+    return api("POST", "/faculty/session/scan", token=AUTH["student_token"], json=body)
 
 
 def current_nonce(session_id: int) -> str:
@@ -153,24 +168,31 @@ def current_nonce(session_id: int) -> str:
 
 
 def zero_attendance(professor_id: int, class_id: int) -> tuple[int, dict]:
-    """POST /faculty/session/zero-attendance."""
+    """Declare as the token owner; a body id cannot grant conductor rights."""
     return api(
-        "POST", "/faculty/session/zero-attendance", json={"professor_id": professor_id, "class_id": class_id}
+        "POST", "/faculty/session/zero-attendance",
+        token=AUTH["faculty_tokens"][professor_id],
+        json={"professor_id": PROFESSOR_ID, "class_id": class_id},
     )
 
 
 def issue_token(professor_id: int, class_id: int, substitute_id: int) -> tuple[int, dict]:
-    """POST /faculty/substitute/issue."""
+    """Issue as the token owner, deliberately sending another professor's body id."""
+    body_professor_id = STRANGER_ID if professor_id == PROFESSOR_ID else PROFESSOR_ID
     return api(
-        "POST",
-        "/faculty/substitute/issue",
-        json={"professor_id": professor_id, "class_id": class_id, "substitute_id": substitute_id},
+        "POST", "/faculty/substitute/issue",
+        token=AUTH["faculty_tokens"][professor_id],
+        json={"professor_id": body_professor_id, "class_id": class_id, "substitute_id": substitute_id},
     )
 
 
 def redeem_token(token: str, substitute_id: int) -> tuple[int, dict]:
-    """POST /faculty/substitute/redeem."""
-    return api("POST", "/faculty/substitute/redeem", json={"token": token, "substitute_id": substitute_id})
+    """Redeem as the login-token owner, not the deliberately spoofed body id."""
+    body_substitute_id = STRANGER_ID if substitute_id == SUBSTITUTE_ID else SUBSTITUTE_ID
+    return api(
+        "POST", "/faculty/substitute/redeem", token=AUTH["faculty_tokens"][substitute_id],
+        json={"token": token, "substitute_id": body_substitute_id},
+    )
 
 
 def onchain_log(class_id: int) -> dict:
@@ -181,7 +203,7 @@ def onchain_log(class_id: int) -> dict:
 
 def log_for(class_id: int) -> dict | None:
     """The SessionLog entry for a class from GET /faculty/logs (or None)."""
-    status, payload = api("GET", "/faculty/logs")
+    status, payload = api("GET", "/faculty/logs", token=AUTH["hod_token"])
     assert status == 200, f"GET /faculty/logs returned {status}: {payload}"
     for entry in payload.get("logs") or []:
         if entry.get("classId") == class_id:
@@ -192,8 +214,64 @@ def log_for(class_id: int) -> dict | None:
 # --------------------------------------------------------------------------
 # Steps
 # --------------------------------------------------------------------------
+def setup_auth():
+    """Register/login real users inline, using unique emails and profile ids."""
+    global APP, PROFESSOR_ID, SUBSTITUTE_ID, STRANGER_ID
+    APP = create_app()
+    domain = APP.config.get("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk").strip().lower()
+    password = "WorkloadTestPassword123!"
+    accounts = {}
+    for persona in ("professor", "substitute", "stranger", "student", "hod"):
+        account = {
+            "email": f"workload.{persona}.{RUN_ID}@{domain}", "password": password,
+            "full_name": f"Workload Test {persona.title()}", "department": "Computer Science",
+        }
+        if persona == "student":
+            account.update(roll_number=f"WL-STUDENT-{RUN_ID}", batch="2022-2026")
+        else:
+            account["employee_id"] = f"WL-{persona.upper()}-{RUN_ID}"
+        accounts[persona] = account
+    with APP.app_context():
+        hod = accounts["hod"]
+        db.session.add(InstitutionWhitelist(
+            employee_id=hod["employee_id"], email=hod["email"],
+            name=hod["full_name"], department=hod["department"],
+        ))
+        db.session.commit()
+    for persona, account in accounts.items():
+        role = persona if persona in ("student", "hod") else "faculty"
+        status, payload = api("POST", f"/auth/register/{role}", json=account)
+        assert status == 201, f"{persona} registration failed ({status}): {payload}"
+        assert payload["user"]["role"] == role.upper(), f"wrong registration role: {payload}"
+        status, payload = api(
+            "POST", "/auth/login", json={"email": account["email"], "password": password},
+        )
+        assert status == 200, f"{persona} login failed ({status}): {payload}"
+        assert payload["user"]["role"] == role.upper(), f"wrong login role: {payload}"
+        assert payload.get("token"), f"{persona} login returned no token: {payload}"
+        AUTH[f"{persona}_token"] = payload["token"]
+        AUTH[f"{persona}_id"] = payload["user"]["id"]
+        if role == "faculty":
+            AUTH["faculty_tokens"][payload["user"]["id"]] = payload["token"]
+    PROFESSOR_ID = AUTH["professor_id"]
+    SUBSTITUTE_ID = AUTH["substitute_id"]
+    STRANGER_ID = AUTH["stranger_id"]
+    with APP.app_context():
+        student_id = AUTH["student_id"]
+        assert db.session.get(Student, student_id) is None, (
+            f"student id {student_id} already exists; do not overwrite unrelated attendance data"
+        )
+        db.session.add(Student(id=student_id, name=accounts["student"]["full_name"]))
+        db.session.commit()
+    print(
+        f"   authenticated professor={PROFESSOR_ID} substitute={SUBSTITUTE_ID} "
+        f"stranger={STRANGER_ID} student={AUTH['student_id']} hod={AUTH['hod_id']}"
+    )
+
+
 def step_preflight():
-    """Backend reachable and configured (DB + blockchain RPC + workload ledger)."""
+    """Authenticate inline, then check DB + blockchain RPC + workload ledger."""
+    setup_auth()
     status, payload = api("GET", "/health")
     assert status == 200, f"/health returned {status}: {payload}"
     assert payload.get("status") == "ok", f"health status is not 'ok': {payload}"
@@ -241,8 +319,8 @@ def step_seed_classes():
 
 
 def step_start_missing_fields():
-    """A start without professor_id never creates a session."""
-    status, payload = api("POST", "/faculty/session/start", json={"class_id": STATE["happy_class_id"]})
+    """A start without class_id never creates a session."""
+    status, payload = api("POST", "/faculty/session/start", json={})
     assert status == 400, f"missing-field start must be rejected with 400, got {status}: {payload}"
     assert payload.get("error") == "missing_fields", f"unexpected error: {payload}"
     assert payload.get("check") == "request", f"unexpected check: {payload}"
@@ -251,7 +329,7 @@ def step_start_missing_fields():
 
 def step_start_wrong_professor():
     """Only the scheduled professor may start the class."""
-    status, payload = start_session(STRANGER_ID, STATE["happy_class_id"])
+    status, payload = start_session(STRANGER_ID, STATE["happy_class_id"], body_professor_id=PROFESSOR_ID)
     assert status == 403, f"wrong-professor start must be rejected with 403, got {status}: {payload}"
     assert payload.get("error") == "not_class_professor", f"unexpected error: {payload}"
     assert payload.get("check") == "professor", f"unexpected check: {payload}"
@@ -260,7 +338,7 @@ def step_start_wrong_professor():
 
 def step_start_happy():
     """The happy start: a live rotating-QR session owned by the professor."""
-    status, payload = start_session(PROFESSOR_ID, STATE["happy_class_id"])
+    status, payload = start_session(PROFESSOR_ID, STATE["happy_class_id"], body_professor_id=STRANGER_ID)
     assert status == 201, f"start returned {status}: {payload}"
 
     session = payload.get("session") or {}
@@ -288,7 +366,13 @@ def step_start_happy():
 
 
 def step_scan_wrong_nonce():
-    """A stale/guessed nonce is rejected - the rotating-QR gate is reused."""
+    """Only STUDENT tokens can scan; a stale nonce still fails its original gate."""
+    status, payload = api(
+        "POST", "/faculty/session/scan", token=AUTH["professor_token"],
+        json={"session_id": STATE["session_id"], "nonce": current_nonce(STATE["session_id"])},
+    )
+    assert status == 403 and payload.get("error") == "insufficient_role", f"FACULTY scan allowed: {payload}"
+    assert payload.get("check") == "auth", f"wrong FACULTY scan gate: {payload}"
     status, payload = scan(STATE["session_id"], "not-the-current-nonce")
     assert status == 400, f"wrong-nonce scan must be rejected with 400, got {status}: {payload}"
     assert payload.get("error") == "nonce_mismatch", f"unexpected error: {payload}"
@@ -305,9 +389,10 @@ def step_projector_qr():
 
 def step_scan_happy():
     """The happy scan: CONDUCTED anchored on-chain with a real tx hash."""
-    status, payload = scan(STATE["session_id"], current_nonce(STATE["session_id"]), student_id=2024001)
+    status, payload = scan(STATE["session_id"], current_nonce(STATE["session_id"]), student_id=STRANGER_ID)
     assert status == 201, f"scan returned {status}: {payload}"
     assert payload.get("status") == "conducted", f"unexpected scan status: {payload}"
+    assert payload.get("student_id") == AUTH["student_id"], f"scanner came from body id: {payload}"
 
     session_log = payload.get("session_log") or {}
     assert session_log.get("status") == "CONDUCTED", f"session_log status wrong: {session_log}"
@@ -333,6 +418,7 @@ def step_scan_duplicate():
     status, payload = scan(STATE["session_id"], current_nonce(STATE["session_id"]))
     assert status == 200, f"duplicate scan must return 200 already_logged, got {status}: {payload}"
     assert payload.get("status") == "already_logged", f"unexpected status: {payload}"
+    assert payload.get("student_id") == AUTH["student_id"], f"wrong authenticated scanner: {payload}"
     session_log = payload.get("session_log") or {}
     assert session_log.get("id") == STATE["conducted_log"].get("id"), (
         f"already_logged returned a different entry: {session_log}"
@@ -354,6 +440,10 @@ def step_zero_happy():
     status, payload = start_session(PROFESSOR_ID, STATE["zero_class_id"])
     assert status == 201, f"start returned {status}: {payload}"
 
+    status, payload = zero_attendance(STRANGER_ID, STATE["zero_class_id"])
+    assert status == 403, f"non-conductor zero declaration allowed: {payload}"
+    assert payload.get("error") == "not_session_conductor", f"wrong conductor gate: {payload}"
+    assert payload.get("check") == "professor", f"wrong conductor check: {payload}"
     status, payload = zero_attendance(PROFESSOR_ID, STATE["zero_class_id"])
     assert status == 201, f"zero-attendance returned {status}: {payload}"
     assert payload.get("status") == "conducted_zero_students", f"unexpected status: {payload}"
@@ -390,13 +480,20 @@ def step_issue_wrong_professor():
 
 
 def step_issue_happy():
-    """The happy issue: a 30-minute signed JWT for one named substitute."""
+    """Only an existing FACULTY substitute can receive the 30-minute token."""
+    status, payload = issue_token(PROFESSOR_ID, STATE["sub_class_id"], 999_999_999)
+    assert status == 404, f"unknown substitute must be rejected: {payload}"
+    assert payload.get("error") == "substitute_not_found", f"wrong missing substitute gate: {payload}"
+    status, payload = issue_token(PROFESSOR_ID, STATE["sub_class_id"], AUTH["student_id"])
+    assert status == 403, f"non-FACULTY substitute must be rejected: {payload}"
+    assert payload.get("error") == "substitute_not_faculty", f"wrong substitute role gate: {payload}"
     status, payload = issue_token(PROFESSOR_ID, STATE["sub_class_id"], SUBSTITUTE_ID)
     assert status == 201, f"issue returned {status}: {payload}"
 
     token = payload.get("substitute_token")
     assert token and token.count(".") == 2, f"token is not a JWT: {payload}"
     assert payload.get("substitute_id") == SUBSTITUTE_ID, f"wrong substitute_id: {payload}"
+    assert payload.get("issued_by") == PROFESSOR_ID, f"issuer came from body id: {payload}"
     assert payload.get("class_id") == STATE["sub_class_id"], f"wrong class_id: {payload}"
     assert payload.get("expires_at"), f"no expires_at: {payload}"
     assert payload.get("expires_in_minutes") == 30, f"token lifetime is not 30 minutes: {payload}"
@@ -429,6 +526,10 @@ def step_redeem_happy():
     )
 
     STATE["sub_session_id"] = session.get("id")
+    status, denied = zero_attendance(PROFESSOR_ID, STATE["sub_class_id"])
+    assert status == 403 and denied.get("error") == "not_session_conductor", (
+        f"scheduled professor must not declare zero after substitute takes over: {denied}"
+    )
     print(
         f"   session {STATE['sub_session_id']} started by substitute {SUBSTITUTE_ID} "
         f"(qr at {payload.get('qr_poll_url')})"
@@ -523,8 +624,11 @@ def step_autoflag():
 
 
 def step_logs_listing():
-    """/faculty/logs lists every outcome with class details and tx hashes."""
-    status, payload = api("GET", "/faculty/logs")
+    """HOD can audit every outcome; FACULTY cannot access the audit log."""
+    status, denied = api("GET", "/faculty/logs", token=AUTH["professor_token"])
+    assert status == 403 and denied.get("error") == "insufficient_role", f"FACULTY logs allowed: {denied}"
+    assert denied.get("check") == "auth", f"wrong logs auth gate: {denied}"
+    status, payload = api("GET", "/faculty/logs", token=AUTH["hod_token"])
     assert status == 200, f"GET /faculty/logs returned {status}: {payload}"
 
     logs = payload.get("logs") or []
@@ -565,9 +669,9 @@ def step_logs_listing():
 # Runner
 # --------------------------------------------------------------------------
 STEPS = [
-    ("Preflight: backend /health", step_preflight),
+    ("Preflight: register/login real users + backend /health", step_preflight),
     ("Seed scheduled classes", step_seed_classes),
-    ("Start session without professor_id -> blocked", step_start_missing_fields),
+    ("Start session without class_id -> blocked", step_start_missing_fields),
     ("Start session by the wrong professor -> blocked", step_start_wrong_professor),
     ("Start session (professor) -> live rotating-QR session", step_start_happy),
     ("Scan with a wrong nonce -> blocked (QR rotation gate)", step_scan_wrong_nonce),
@@ -578,7 +682,7 @@ STEPS = [
     ("Zero attendance declaration -> CONDUCTED_ZERO_STUDENTS on-chain", step_zero_happy),
     ("Zero attendance on a concluded class -> blocked", step_zero_already_concluded),
     ("Substitute token issued by the wrong professor -> blocked", step_issue_wrong_professor),
-    ("Issue substitute token -> 30-min signed JWT", step_issue_happy),
+    ("Validate FACULTY substitute + issue 30-min signed JWT", step_issue_happy),
     ("Redeem by the wrong substitute -> blocked", step_redeem_wrong_substitute),
     ("Redeem token -> substitute starts the session", step_redeem_happy),
     ("Scan the substitute's session -> credit to the SUBSTITUTE", step_scan_substitute_session),

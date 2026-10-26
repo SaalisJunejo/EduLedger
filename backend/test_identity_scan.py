@@ -1,40 +1,28 @@
-"""End-to-end test of the Module 1 identity verification + scan flow.
+"""End-to-end test of the Module 1 identity verification + scan flow with real auth.
 
 Run it against a live stack (from backend/):
 
-    .venv\\Scripts\\python.exe test_identity_scan.py
+    .\\venv\\Scripts\\python.exe test_identity_scan.py
 
 Prerequisites:
     - Hardhat node running        (contracts/: npm run node)
     - AttendanceLedger deployed   (contracts/: npm run deploy:attendance)
     - Flask backend running       (backend/: python run.py)
 
-Steps (each prints a clear PASS/FAIL line; the first failure stops the run
-with the failing response, and the script exits non-zero - no uncaught
-exceptions):
-
+Steps:
      0. preflight          - GET /health (backend reachable, DB + RPC configured)
-     1. enroll-face        - demo enrollment: upserts student 1 + face embedding
-     2. register-device    - binds VALID_DEVICE (falls back to admin rebind)
-     3. verify-identity    - face match -> 30-second verification token (JWT)
-     4. session/start + qr - live session with a rotating nonce
-     5. scan (valid)       - checks (a)-(d) pass -> lockAttendance() on-chain
-     6. scan (re-scan)     - rejected 409 attendance_already_locked  [check d]
-     7. scan (fake nonce)  - rejected 400 nonce_mismatch             [check b]
-     8. scan (aged nonce)  - a once-valid nonce replayed after its
-                            rotation window: rejected 400 (nonce_mismatch
-                            or nonce_expired)                        [check b]
-     9. scan (bad device)  - rejected 403 device_mismatch            [check c]
-    10. verify-identity    - stranger's face rejected 401 identity_verification_failed
-
-API contract notes (aligned with the backend implementation in app/api/):
-    - Student.id is an INTEGER primary key (numeric id 1 - not "STU1001").
-    - /attendance/scan takes "nonce" (not "scanned_nonce") and does NOT take
-      student_id: the student comes from the verification token's "sub" claim.
-    - A successful scan returns "transaction_hash" (not "tx_hash").
-    - There is no auth-header middleware yet (no X-Device-ID header): the
-      device identity travels in the JSON body. If an auth layer lands later,
-      the status assertions below will flag it immediately.
+     1. auth setup         - register + log in real test faculty and student accounts
+     2. enroll-face        - demo enrollment: upserts student + face embedding
+     3. register-device    - binds VALID_DEVICE via JWT auth (falls back to admin rebind)
+     4. verify-identity    - face match -> 30-second verification token (JWT)
+     5. session/start + qr - faculty opens live session with a rotating nonce
+     6. scan (valid)       - student checks (a)-(d) pass -> lockAttendance() on-chain
+     7. scan (re-scan)     - rejected 409 attendance_already_locked  [check d]
+     8. scan (fake nonce)  - rejected 400 nonce_mismatch             [check b]
+     9. scan (aged nonce)  - a once-valid nonce replayed after its
+                            rotation window: rejected 400            [check b]
+    10. scan (bad device)  - rejected 403 device_mismatch            [check c]
+    11. verify-identity    - stranger's face rejected 401 identity_verification_failed
 """
 
 import base64
@@ -52,14 +40,18 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 
 BASE_URL = "http://127.0.0.1:5000/api/v1"
 
-# Standard test inputs. Student.id is an Integer PK: numeric 1, not "STU1001".
-STUDENT_ID = 1
 STUDENT_NAME = "Ayesha Khan"
 VALID_DEVICE = "device_keychain_uuid_12345"
 INVALID_DEVICE = "hacker_phone_uuid_99999"
 TEST_CLASS_ID = "TEST-IDENTITY-SCAN"
 
-# Shared state between steps (filled in as the run progresses).
+# Dynamic state filled in as the run progresses.
+STUDENT_ID = None
+AUTH = {
+    "hod_token": None,
+    "faculty_token": None,
+    "student_token": None,
+}
 STATE = {"session_id": None, "token": None}
 
 
@@ -104,9 +96,12 @@ STRANGER_IMAGE = _png_data_uri(_noise_image())
 # --------------------------------------------------------------------------
 # API helpers
 # --------------------------------------------------------------------------
-def api(method: str, path: str, **kwargs) -> tuple[int, dict]:
+def api(method: str, path: str, token: str | None = None, **kwargs) -> tuple[int, dict]:
     """Call the API; returns (status, decoded JSON body). Never raises on HTTP errors."""
-    response = requests.request(method, f"{BASE_URL}{path}", timeout=15, **kwargs)
+    headers = kwargs.pop("headers", {})
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.request(method, f"{BASE_URL}{path}", headers=headers, timeout=15, **kwargs)
     try:
         payload = response.json()
     except ValueError:
@@ -117,18 +112,19 @@ def api(method: str, path: str, **kwargs) -> tuple[int, dict]:
 def fresh_nonce() -> str:
     """The session's current live nonce (the QR endpoint lazily rotates expired
     nonces, so this always returns one that /attendance/scan will accept)."""
-    status, payload = api("GET", f"/session/{STATE['session_id']}/qr")
+    status, payload = api("GET", f"/session/{STATE['session_id']}/qr", token=AUTH["faculty_token"])
     assert status == 200, f"GET /session/{STATE['session_id']}/qr returned {status}: {payload}"
     assert payload["qr_image"].startswith("data:image/png;base64,"), "QR image is not a PNG data URI"
     return payload["current_nonce"]
 
 
 def verify_identity(face_image: str) -> tuple[int, dict]:
-    """POST /attendance/verify-identity with the given face image."""
+    """POST /attendance/verify-identity with the authenticated student token."""
     return api(
         "POST",
         "/attendance/verify-identity",
-        json={"student_id": STUDENT_ID, "face_image": face_image},
+        token=AUTH["student_token"],
+        json={"face_image": face_image},
     )
 
 
@@ -142,11 +138,11 @@ def verification_token() -> str:
 
 
 def scan(token: str, device_id: str, nonce: str) -> tuple[int, dict]:
-    """POST /attendance/scan - field names per the API contract:
-    'nonce' (not 'scanned_nonce'), no student_id (token-derived)."""
+    """POST /attendance/scan with the authenticated student token."""
     return api(
         "POST",
         "/attendance/scan",
+        token=AUTH["student_token"],
         json={
             "verification_token": token,
             "device_id": device_id,
@@ -158,8 +154,7 @@ def scan(token: str, device_id: str, nonce: str) -> tuple[int, dict]:
 
 def scan_with_live_nonce(token: str, device_id: str) -> tuple[int, dict]:
     """Scan with a nonce fetched immediately before, retrying once if the 5 s
-    rotation window flipped between fetch and scan (rare race; the retry keeps
-    steps that test OTHER checks from failing on nonce timing)."""
+    rotation window flipped between fetch and scan."""
     status, payload = scan(token, device_id, fresh_nonce())
     if payload.get("check") == "session_nonce":
         print("   note: nonce rotated mid-flight - retrying with a fresh nonce")
@@ -185,14 +180,74 @@ def step_preflight():
     )
 
 
+def step_auth_setup():
+    """Register and log in test hod, faculty, and student accounts to acquire JWTs."""
+    hod_email = "ayesha.ee@gcu.edu.pk"
+    hod_pass = "HodPassword123!"
+    api(
+        "POST",
+        "/auth/register/hod",
+        json={
+            "employee_id": "EMP-HOD-EE-01",
+            "full_name": "Dr. Ayesha Khan",
+            "department": "Electrical Engineering",
+            "email": hod_email,
+            "password": hod_pass,
+        },
+    )
+    status, h_res = api("POST", "/auth/login", json={"email": hod_email, "password": hod_pass})
+    assert status == 200, f"HOD login failed ({status}): {h_res}"
+    AUTH["hod_token"] = h_res["token"]
+
+    faculty_email = "faculty.scan.test@gcu.edu.pk"
+    faculty_pass = "FacultyPass123!"
+    api(
+        "POST",
+        "/auth/register/faculty",
+        json={
+            "employee_id": "EMP-SCAN-TEST",
+            "full_name": "Dr. Attendance Faculty",
+            "department": "Computer Science",
+            "email": faculty_email,
+            "password": faculty_pass,
+        },
+    )
+    status, f_res = api("POST", "/auth/login", json={"email": faculty_email, "password": faculty_pass})
+    assert status == 200, f"Faculty login failed ({status}): {f_res}"
+    AUTH["faculty_token"] = f_res["token"]
+
+    student_email = "student.scan.test@gcu.edu.pk"
+    student_pass = "StudentPass123!"
+    api(
+        "POST",
+        "/auth/register/student",
+        json={
+            "full_name": STUDENT_NAME,
+            "roll_number": "ROLL-SCAN-TEST",
+            "batch": "2022-2026",
+            "department": "Computer Science",
+            "email": student_email,
+            "password": student_pass,
+        },
+    )
+    status, s_res = api("POST", "/auth/login", json={"email": student_email, "password": student_pass})
+    assert status == 200, f"Student login failed ({status}): {s_res}"
+    AUTH["student_token"] = s_res["token"]
+    global STUDENT_ID, VALID_DEVICE
+    STUDENT_ID = s_res["user"]["id"]
+    VALID_DEVICE = f"device_keychain_uuid_{STUDENT_ID}"
+    print(f"   authenticated hod_id={h_res['user']['id']} faculty_id={f_res['user']['id']} student_id={STUDENT_ID}")
+
+
 def step_enroll_face():
-    """Demo enrollment: create (or update) student 1 and store the face embedding.
+    """Demo enrollment: create (or update) student and store the face embedding.
     Required before verify-identity - without it the backend answers 409
     face_not_enrolled."""
     status, payload = api(
         "POST",
         "/student/enroll-face",
-        json={"student_id": STUDENT_ID, "name": STUDENT_NAME, "face_image": ENROLL_IMAGE},
+        token=AUTH["student_token"],
+        json={"name": STUDENT_NAME, "face_image": ENROLL_IMAGE},
     )
     assert status == 201, f"enroll-face returned {status}: {payload}"
     student = payload["student"]
@@ -206,19 +261,19 @@ def step_enroll_face():
 
 
 def step_register_device():
-    """Bind the student's device. First binding only: if a previous run left a
-    DIFFERENT device bound, the endpoint answers 409 device_already_bound and
-    the admin rebind stub is the designed recovery path."""
+    """Bind the student's device via authenticated request."""
     status, payload = api(
         "POST",
         "/student/register-device",
-        json={"student_id": STUDENT_ID, "device_id": VALID_DEVICE},
+        token=AUTH["student_token"],
+        json={"device_id": VALID_DEVICE},
     )
     if status == 409 and payload.get("error") == "device_already_bound":
-        print(f"   note: another device is bound - rebinding via the admin stub")
+        print("   note: another device is bound - rebinding via the admin stub")
         status, payload = api(
             "POST",
             "/admin/rebind-device",
+            token=AUTH["hod_token"],
             json={"student_id": STUDENT_ID, "device_id": VALID_DEVICE},
         )
     assert status == 200, f"register-device returned {status}: {payload}"
@@ -243,8 +298,13 @@ def step_verify_identity():
 
 
 def step_start_session():
-    """Open a live attendance session for the test class."""
-    status, payload = api("POST", "/session/start", json={"class_id": TEST_CLASS_ID})
+    """Faculty opens a live attendance session for the test class."""
+    status, payload = api(
+        "POST",
+        "/session/start",
+        token=AUTH["faculty_token"],
+        json={"class_id": TEST_CLASS_ID},
+    )
     assert status == 201, f"session/start returned {status}: {payload}"
     session = payload["session"]
     assert session["is_active"] is True, f"new session is not active: {session}"
@@ -269,8 +329,7 @@ def step_valid_scan():
 
 
 def step_rescan_blocked():
-    """Re-scan of the same student+session: check (d) rejects it on-chain.
-    Uses a fresh token + fresh nonce so the scan reliably REACHES check (d)."""
+    """Re-scan of the same student+session: check (d) rejects it on-chain."""
     status, payload = scan_with_live_nonce(verification_token(), VALID_DEVICE)
     assert status == 409, f"re-scan must be rejected with 409, got {status}: {payload}"
     assert payload.get("error") == "attendance_already_locked", f"unexpected error: {payload}"
@@ -288,14 +347,11 @@ def step_bad_nonce_blocked():
 
 
 def step_aged_nonce_blocked():
-    """A nonce that WAS valid when captured, scanned after its rotation window:
-    the photographed-QR replay. Rejection is check (b) with nonce_mismatch
-    (already rotated) or nonce_expired (expired but the scheduler has not
-    rotated it yet) - both are correct 'old nonce' rejections."""
+    """A nonce that WAS valid when captured, scanned after its rotation window."""
     token = verification_token()
     aged = fresh_nonce()
     print(f"   captured nonce {aged[:22]}... - waiting out the rotation window")
-    time.sleep(6)  # NONCE_ROTATION_SECONDS is 5: the captured nonce is now stale
+    time.sleep(6)  # NONCE_ROTATION_SECONDS is 5
     status, payload = scan(token, VALID_DEVICE, aged)
     assert status == 400, f"aged nonce must be rejected with 400, got {status}: {payload}"
     assert payload.get("check") == "session_nonce", f"unexpected check: {payload}"
@@ -308,8 +364,7 @@ def step_aged_nonce_blocked():
 
 
 def step_bad_device_blocked():
-    """A different phone scanning the same QR: check (c) rejects the device.
-    Uses a fresh nonce so the scan passes check (b) and reaches check (c)."""
+    """A different phone scanning the same QR: check (c) rejects the device."""
     status, payload = scan_with_live_nonce(verification_token(), INVALID_DEVICE)
     assert status == 403, f"bad device must be rejected with 403, got {status}: {payload}"
     assert payload.get("error") == "device_mismatch", f"unexpected error: {payload}"
@@ -337,10 +392,11 @@ def step_stranger_face_blocked():
 # --------------------------------------------------------------------------
 STEPS = [
     ("Preflight: backend /health", step_preflight),
+    ("Auth setup: register + login faculty and student", step_auth_setup),
     ("Enroll student face (demo enrollment)", step_enroll_face),
-    ("Register device (bind deviceId to student)", step_register_device),
+    ("Register device (bind deviceId via JWT auth)", step_register_device),
     ("Verify identity (face match -> 30s token)", step_verify_identity),
-    ("Start attendance session + fetch live nonce", step_start_session),
+    ("Start attendance session (faculty JWT)", step_start_session),
     ("Valid scan -> lock attendance on-chain", step_valid_scan),
     ("Re-scan -> blocked, already locked on-chain", step_rescan_blocked),
     ("Scan with fake nonce -> blocked", step_bad_nonce_blocked),
@@ -361,7 +417,7 @@ def main() -> int:
             action()
         except requests.RequestException as exc:
             print(f"   \u274c FAIL: cannot reach the backend at {BASE_URL} ({exc})")
-            print("      start it first:  .venv\\Scripts\\python.exe run.py   (from backend/)")
+            print("      start it first:  .\\venv\\Scripts\\python.exe run.py   (from backend/)")
             print("\n" + "=" * 60)
             print(f"   TEST RUN FAILED AT STEP {index}: {title}")
             print("=" * 60)
@@ -372,7 +428,7 @@ def main() -> int:
             print(f"   TEST RUN FAILED AT STEP {index}: {title}")
             print("=" * 60)
             return 1
-        except Exception as exc:  # keep the run free of uncaught exceptions
+        except Exception as exc:
             print(f"   \u274c FAIL: unexpected {type(exc).__name__}: {exc}")
             print("\n" + "=" * 60)
             print(f"   TEST RUN FAILED AT STEP {index}: {title}")

@@ -8,11 +8,11 @@ must match real ``scheduled_classes`` rows. This script creates them, in
 the same spirit as the mock attendance class dropdown on InstructorPage.
 
 It seeds:
-- three classes for professor 101 (the demo "logged-in" professor), with
+- three classes for a real demo FACULTY user, with
   start times safely in the FUTURE so the background auto-flag job
   (UNCONDUCTED_THRESHOLD_MINUTES, default 15) cannot conclude them before
   the demo runs
-- one already-overdue class for professor 103, which the LIVE Flask
+- one already-overdue class for a second real FACULTY user, which the LIVE Flask
   server's scheduler auto-flags UNCONDUCTED on-chain within a minute —
   giving the admin workload audit log a realistic entry without touching
   the UI
@@ -42,23 +42,55 @@ from datetime import timedelta
 
 # One-off script: no Flask server, so no background jobs either. Must be
 # set before `app` is imported (the config reads it at import time).
-os.environ.setdefault("SCHEDULER_ENABLED", "false")
+os.environ["SCHEDULER_ENABLED"] = "false"
 
 from app import create_app  # noqa: E402 (import after the env tweak)
 from app.extensions import db  # noqa: E402
-from app.models import ScheduledClass, SessionLog  # noqa: E402
+from app.models import FacultyProfile, ScheduledClass, SessionLog, User, UserRole  # noqa: E402
+from app.services.auth import hash_password  # noqa: E402
 from app.util import utcnow  # noqa: E402
+from flask import current_app  # noqa: E402
 
-# Mirrors frontend/src/lib/workload.js (MOCK_CLASSES) — professor 101's
-# roster for the demo, plus one overdue class for professor 103 that the
-# live scheduler will auto-flag.
+# Local demo credentials only; existing accounts are never assigned new passwords.
+DEMO_FACULTY_PASSWORD = "WorkloadDemoFaculty123!"
+_DEMO_FACULTY = {
+    "professor": ("faculty.workload.demo", "EMP-WORKLOAD-DEMO", "Demo Workload Professor"),
+    "substitute": ("faculty.workload.substitute", "EMP-WORKLOAD-SUB", "Demo Workload Substitute"),
+    "overdue": ("faculty.workload.overdue", "EMP-WORKLOAD-OVERDUE", "Demo Overdue Professor"),
+}
+
+# Mirrors the frontend mock roster, using account names resolved to real User ids.
 _DEMO_CLASSES = [
-    # (course_id, room, professor_id, start offset from now, in mock list?)
-    ("BSCS-401", "A-101", 101, timedelta(hours=3), True),
-    ("BSCS-402", "B-204", 101, timedelta(hours=6), True),
-    ("BSCS-501", "C-301", 101, timedelta(hours=9), True),
-    ("MSCS-501", "D-202", 103, timedelta(minutes=-30), False),  # auto-flag demo
+    # (course_id, room, faculty account, start offset from now, in mock list?)
+    ("BSCS-401", "A-101", "professor", timedelta(hours=3), True),
+    ("BSCS-402", "B-204", "professor", timedelta(hours=6), True),
+    ("BSCS-501", "C-301", "professor", timedelta(hours=9), True),
+    ("MSCS-501", "D-202", "overdue", timedelta(minutes=-30), False),  # auto-flag demo
 ]
+
+
+def ensure_demo_faculty() -> dict[str, User]:
+    """Create/reuse real demo faculty and their profiles by email, in an app context."""
+    domain = current_app.config.get("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk").strip().lower()
+    users = {}
+    for name, (local_part, employee_id, full_name) in _DEMO_FACULTY.items():
+        email = f"{local_part}@{domain}"
+        user = User.query.filter_by(email=email).first()
+        if user is None:
+            user = User(
+                role=UserRole.FACULTY, email=email,
+                password_hash=hash_password(DEMO_FACULTY_PASSWORD),
+                full_name=full_name, department="Computer Science", is_active=True,
+            )
+            db.session.add(user)
+            db.session.flush()
+        elif user.role != UserRole.FACULTY:
+            raise ValueError(f"demo account {email} exists but is not FACULTY")
+        if user.faculty_profile is None:
+            db.session.add(FacultyProfile(user_id=user.id, employee_id=employee_id))
+        users[name] = user
+    db.session.commit()
+    return users
 
 
 def main() -> int:
@@ -80,6 +112,14 @@ def main() -> int:
             )
             return 1
 
+        try:
+            faculty = ensure_demo_faculty()
+        except ValueError as exc:
+            print(f"[REFUSED] {exc}")
+            return 1
+        for name, user in faculty.items():
+            print(f"  {name:<16}: user #{user.id} · {user.email} · FACULTY")
+
         existing = ScheduledClass.query.count()
         if existing:
             print(f"  clearing {existing} leftover scheduled class row(s)")
@@ -89,7 +129,8 @@ def main() -> int:
 
         now = utcnow()
         print(f"  server time        : {now:%Y-%m-%d %H:%M} UTC")
-        for course_id, room, professor_id, offset, in_mock in _DEMO_CLASSES:
+        for course_id, room, faculty_name, offset, in_mock in _DEMO_CLASSES:
+            professor_id = faculty[faculty_name].id
             scheduled_class = ScheduledClass(
                 professor_id=professor_id,
                 room=room,

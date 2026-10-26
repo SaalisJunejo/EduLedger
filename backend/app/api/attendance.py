@@ -8,11 +8,12 @@
 
 from datetime import datetime, timezone
 
-from flask import current_app, jsonify, request
+from flask import current_app, g, jsonify, request
 
 from ..extensions import db
 from ..models import AttendanceSession, Student
 from ..services import blockchain
+from ..services.auth import require_auth
 from ..services.face_embedding import (
     EmbeddingMismatchError,
     FaceImageError,
@@ -31,14 +32,16 @@ def _iso_from_unix(timestamp: float) -> str:
 
 
 @api_v1.post("/attendance/verify-identity")
+@require_auth(roles=["STUDENT"])
 def verify_identity():
     """Verify the student's identity and mint a short-lived verification token.
 
     Body (either modality):
-    - Face:    ``{"student_id": 2024001, "face_image": "<base64>"}``
-    - Finger:  ``{"student_id": 2024001, "device_id": "...",
-      "webauthn_assertion": {...}}`` (simplified stub - see services/webauthn.py)
+    - Face:    ``{"face_image": "<base64>"}``
+    - Finger:  ``{"device_id": "...", "webauthn_assertion": {...}}``
+      (simplified stub - see services/webauthn.py)
 
+    Identity is derived from the authenticated student token (g.user_id).
     The submitted face image is embedded and compared (cosine similarity)
     against the student's stored embedding; on a match (>=
     FACE_MATCH_THRESHOLD) a JWT valid for VERIFICATION_TOKEN_SECONDS
@@ -46,13 +49,11 @@ def verify_identity():
     check-in happens in /attendance/scan.
     """
     body = request.get_json(silent=True) or {}
-    student_id = body.get("student_id")
+    student_id = g.user_id
     face_image = body.get("face_image")
     device_id = body.get("device_id")
     assertion = body.get("webauthn_assertion")
 
-    if not isinstance(student_id, int):
-        return api_error("identity", "missing_fields", "student_id (int) is required")
     if not face_image and not assertion:
         return api_error(
             "identity",
@@ -128,6 +129,7 @@ def verify_identity():
 
 
 @api_v1.post("/attendance/scan")
+@require_auth(roles=["STUDENT"])
 def scan():
     """Full attendance check-in: validate everything, then lock on-chain.
 
@@ -135,7 +137,8 @@ def scan():
     "session_id": 1, "nonce": "<scanned from the QR>"}``.
 
     Validation order (each failure response names its check):
-    (a) verification_token - valid, unexpired, issued for attendance
+    (a) verification_token - valid, unexpired, issued for attendance, and matches
+                             the authenticated student (g.user_id)
     (b) session_nonce      - session exists+active, scanned nonce matches the
                              current rotating nonce and is unexpired
     (c) device_match       - device_id matches the student's registered device
@@ -178,6 +181,14 @@ def scan():
     except (TypeError, ValueError):
         return api_error(
             "verification_token", "verification_token_invalid", "token has no valid subject", 401
+        )
+
+    if student_id != g.user_id:
+        return api_error(
+            "verification_token",
+            "student_mismatch",
+            f"verification token belongs to student {student_id}, not authenticated student {g.user_id}",
+            403,
         )
 
     # -- (b) session + rotating nonce -----------------------------------------
