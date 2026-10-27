@@ -12,9 +12,18 @@ Every case prints a clear PASS/FAIL line and the run exits non-zero if
 any case fails.
 """
 
+import os
 import sys
+from datetime import timedelta
 
 import requests
+
+os.environ["SCHEDULER_ENABLED"] = "false"
+
+from app import create_app
+from app.extensions import db
+from app.models.workload import ScheduledClass
+from app.util import utcnow
 from test_identity_scan import ENROLL_IMAGE
 
 # Windows consoles often default to a legacy code page (cp1252) that cannot
@@ -30,6 +39,7 @@ STUDENT_ID = None
 AUTH = {
     "hod_token": None,
     "faculty_token": None,
+    "faculty_id": None,
     "student_token": None,
 }
 
@@ -75,6 +85,7 @@ def setup_auth():
     ).json()
     AUTH["faculty_token"] = f_res.get("token")
     assert AUTH["faculty_token"], f"Faculty login failed: {f_res}"
+    AUTH["faculty_id"] = f_res["user"]["id"]
 
     student_email = "student.neg.test@gcu.edu.pk"
     student_pass = "StudentPass123!"
@@ -125,16 +136,32 @@ def setup_auth():
 
 
 def get_session_and_nonce():
-    """Starts a session and returns (session_id, current_nonce)."""
+    """Starts a session for a separate valid scheduled class and returns its nonce."""
+    with create_app().app_context():
+        start = utcnow() - timedelta(seconds=5)
+        scheduled_class = ScheduledClass(
+            professor_id=AUTH["faculty_id"],
+            room="NEGATIVE-SCAN-TEST",
+            course_code="BSCS-401",
+            start_time=start,
+            end_time=start + timedelta(hours=1),
+            day_of_week=None,
+        )
+        db.session.add(scheduled_class)
+        db.session.commit()
+        class_id = scheduled_class.id
+
     s_req = requests.post(
         f"{BASE}/session/start",
         headers={"Authorization": f"Bearer {AUTH['faculty_token']}"},
-        json={"class_id": "BSCS-401"},
+        json={"class_id": class_id},
     )
     s_res = s_req.json()
+    assert s_req.status_code == 201, f"session/start failed ({s_req.status_code}): {s_res}"
     session_data = s_res.get("session", s_res)
     session_id = session_data.get("id")
     nonce = session_data.get("current_nonce")
+    assert session_id is not None and nonce, f"Missing session ID or nonce: {s_res}"
     return session_id, nonce
 
 

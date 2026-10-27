@@ -1,6 +1,17 @@
+import os
 import sys
 import time
+from datetime import timedelta
+from uuid import uuid4
+
 import requests
+
+os.environ["SCHEDULER_ENABLED"] = "false"
+
+from app import create_app
+from app.extensions import db
+from app.models.workload import ScheduledClass
+from app.util import utcnow
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -8,37 +19,56 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 BASE_URL = "http://localhost:5000/api/v1"
 
 
-def setup_auth() -> str:
-    faculty_email = "faculty.qr.test@gcu.edu.pk"
+def setup_auth() -> tuple[str, int]:
+    run_id = uuid4().hex
+    faculty_email = f"faculty.qr.{run_id}@gcu.edu.pk"
     faculty_pass = "FacultyPass123!"
-    requests.post(
+    registration = requests.post(
         f"{BASE_URL}/auth/register/faculty",
         json={
-            "employee_id": "EMP-QR-TEST",
+            "employee_id": f"EMP-QR-{run_id}",
             "full_name": "Dr. QR Faculty",
             "department": "Computer Science",
             "email": faculty_email,
             "password": faculty_pass,
         },
     )
-    res = requests.post(
+    assert registration.status_code == 201, f"Faculty registration failed: {registration.text}"
+    login_response = requests.post(
         f"{BASE_URL}/auth/login",
         json={"email": faculty_email, "password": faculty_pass},
-    ).json()
+    )
+    res = login_response.json()
+    assert login_response.status_code == 200, f"Faculty login failed: {res}"
     token = res.get("token")
     assert token, f"Faculty login failed: {res}"
-    return token
+    assert res["user"]["id"] == registration.json()["user"]["id"], "Faculty user ID changed at login"
+    return token, res["user"]["id"]
 
 
 def test_qr_rotation():
-    faculty_token = setup_auth()
+    faculty_token, faculty_id = setup_auth()
     headers = {"Authorization": f"Bearer {faculty_token}"}
+
+    with create_app().app_context():
+        start = utcnow() - timedelta(seconds=5)
+        scheduled_class = ScheduledClass(
+            professor_id=faculty_id,
+            room="QR-NONCE-TEST",
+            course_code="TEST-QR-NONCE",
+            start_time=start,
+            end_time=start + timedelta(hours=1),
+            day_of_week=None,
+        )
+        db.session.add(scheduled_class)
+        db.session.commit()
+        class_id = scheduled_class.id
 
     print("--- 1. Starting Session ---")
     res = requests.post(
         f"{BASE_URL}/session/start",
         headers=headers,
-        json={"class_id": "1", "duration_minutes": 10},
+        json={"class_id": class_id, "duration_minutes": 10},
     )
     assert res.status_code in (200, 201), f"Failed to start session: {res.text}"
 

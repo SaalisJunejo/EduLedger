@@ -25,6 +25,8 @@ local rows compare equal with on-chain state. `to_dict()` emits camelCase,
 like every other model.
 """
 
+from sqlalchemy.orm import synonym
+
 from ..extensions import db
 from ..util import iso_z, utcnow
 
@@ -42,16 +44,29 @@ class ScheduledClass(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
 
-    # Professor the class is scheduled for (opaque id - there is no
-    # professor table yet, mirroring how Module 2 treats student ids).
-    professor_id = db.Column(db.Integer, nullable=False, index=True)
+    professor_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", name="fk_scheduled_classes_professor_id_users"),
+        nullable=False,
+        index=True,
+    )
 
     room = db.Column(db.String(64), nullable=False)
 
+    # UTC-naive dated occurrences, including when imported from local wall times.
     start_time = db.Column(db.DateTime, nullable=False, default=utcnow)
+    end_time = db.Column(db.DateTime, nullable=True)
+    day_of_week = db.Column(db.Integer, nullable=True)  # Monday=0, Sunday=6.
+    __table_args__ = (
+        db.CheckConstraint(
+            "day_of_week BETWEEN 0 AND 6",
+            name="ck_scheduled_classes_day_of_week",
+        ),
+    )
 
-    # Course code, e.g. "BSCS-401" (descriptive; not a courses-table FK).
-    course_id = db.Column(db.String(64), nullable=False)
+    course_code = db.Column(db.String(64), nullable=False)
+    # Preserve existing seed/test constructors and code-level readers.
+    course_id = synonym("course_code")
 
     def to_dict(self) -> dict:
         """JSON-friendly view of the scheduled class."""
@@ -60,7 +75,10 @@ class ScheduledClass(db.Model):
             "professorId": self.professor_id,
             "room": self.room,
             "startTime": iso_z(self.start_time),
-            "courseId": self.course_id,
+            "courseId": self.course_code,
+            "courseCode": self.course_code,
+            "dayOfWeek": self.day_of_week,
+            "endTime": iso_z(self.end_time) if self.end_time else None,
         }
 
 

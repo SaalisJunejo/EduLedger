@@ -16,10 +16,8 @@ exceptions):
 
      0. preflight              - GET /health (backend reachable, DB + RPC +
                                   workload ledger configured)
-     1. seed classes           - ScheduledClass rows inserted directly (the
-                                  module deliberately has no class-creation
-                                  endpoint; timetable ingestion is future
-                                  scope), one per scenario
+     1. seed classes           - ScheduledClass rows inserted directly,
+                                  one dated occurrence per scenario
      2. start (missing field)  - rejected 400 missing_fields        [request]
      3. start (wrong prof)     - rejected 403 not_class_professor   [professor]
      4. start (happy)          - 201: live session + rotating QR for the class
@@ -290,14 +288,17 @@ def step_preflight():
 
 
 def step_seed_classes():
-    """One ScheduledClass per scenario, inserted directly (no creation endpoint)."""
+    """One faculty-owned absolute-time ScheduledClass per scenario."""
     with APP.app_context():
         def seed(professor_id: int, minutes_from_now: float, course: str) -> int:
+            start = utcnow() + timedelta(minutes=minutes_from_now) - timedelta(seconds=5)
             scheduled_class = ScheduledClass(
                 professor_id=professor_id,
                 room="Room 204",
-                start_time=utcnow() + timedelta(minutes=minutes_from_now),
-                course_id=course,
+                start_time=start,
+                end_time=start + timedelta(hours=1),
+                day_of_week=None,
+                course_code=course,
             )
             db.session.add(scheduled_class)
             db.session.commit()

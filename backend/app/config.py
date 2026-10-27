@@ -34,6 +34,8 @@ class BaseConfig:
     # -- Attendance sessions -------------------------------------------------
     # How often the background job rotates the QR nonce of active sessions.
     NONCE_ROTATION_SECONDS = int(os.getenv("NONCE_ROTATION_SECONDS", "5"))
+    SESSION_START_GRACE_MINUTES = int(os.getenv("SESSION_START_GRACE_MINUTES", "5"))
+    TIMETABLE_TIMEZONE = os.getenv("TIMETABLE_TIMEZONE", "Asia/Karachi")
     # Set to false to skip starting the background scheduler (tests, scripts).
     SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 

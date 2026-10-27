@@ -17,3 +17,6 @@ Pillow>=12.0,<13.0
 requests>=2.31,<3.0
 # Password hashing (Argon2id)
 argon2-cffi>=23.1.0
+# Timetable XLSX ingestion and IANA timezone data on Windows
+openpyxl>=3.1,<4.0
+tzdata>=2024.1

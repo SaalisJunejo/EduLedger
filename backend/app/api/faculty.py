@@ -48,6 +48,7 @@ from ..models import (
 from ..models.workload import STATUS_CONDUCTED, STATUS_CONDUCTED_ZERO_STUDENTS
 from ..services import workload
 from ..services.auth import require_auth
+from ..services.timetable import start_gate
 from ..services.substitute_token import (
     SubstituteTokenError,
     mint as mint_substitute_token,
@@ -178,6 +179,10 @@ def faculty_start_session():
             "(one entry per class)",
             409,
         )
+
+    denied = start_gate(scheduled_class)
+    if denied is not None:
+        return denied
 
     attendance_session, workload_session = _start_live_session(scheduled_class, professor_id)
     db.session.commit()
@@ -534,6 +539,10 @@ def redeem_substitute():
             f"class {scheduled_class.id} already has a final workload entry on-chain",
             409,
         )
+
+    denied = start_gate(scheduled_class)
+    if denied is not None:
+        return denied
 
     # Redemption is one-shot: mark the token, then start the live session
     # with the substitute as conductor (a single commit covers both).

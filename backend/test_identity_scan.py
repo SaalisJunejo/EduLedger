@@ -27,11 +27,20 @@ Steps:
 
 import base64
 import io
+import os
 import sys
 import time
+from datetime import timedelta
 
 import requests
 from PIL import Image
+
+os.environ["SCHEDULER_ENABLED"] = "false"
+
+from app import create_app
+from app.extensions import db
+from app.models.workload import ScheduledClass
+from app.util import utcnow
 
 # Windows consoles often default to a legacy code page (cp1252) that cannot
 # print the status marks below; force UTF-8 so the run never dies on a print.
@@ -43,7 +52,7 @@ BASE_URL = "http://127.0.0.1:5000/api/v1"
 STUDENT_NAME = "Ayesha Khan"
 VALID_DEVICE = "device_keychain_uuid_12345"
 INVALID_DEVICE = "hacker_phone_uuid_99999"
-TEST_CLASS_ID = "TEST-IDENTITY-SCAN"
+TEST_CLASS_ID = None
 
 # Dynamic state filled in as the run progresses.
 STUDENT_ID = None
@@ -215,6 +224,21 @@ def step_auth_setup():
     status, f_res = api("POST", "/auth/login", json={"email": faculty_email, "password": faculty_pass})
     assert status == 200, f"Faculty login failed ({status}): {f_res}"
     AUTH["faculty_token"] = f_res["token"]
+
+    global TEST_CLASS_ID
+    with create_app().app_context():
+        start = utcnow() - timedelta(seconds=5)
+        scheduled_class = ScheduledClass(
+            professor_id=f_res["user"]["id"],
+            room="IDENTITY-SCAN-TEST",
+            course_code="TEST-IDENTITY-SCAN",
+            start_time=start,
+            end_time=start + timedelta(hours=1),
+            day_of_week=None,
+        )
+        db.session.add(scheduled_class)
+        db.session.commit()
+        TEST_CLASS_ID = scheduled_class.id
 
     student_email = "student.scan.test@gcu.edu.pk"
     student_pass = "StudentPass123!"

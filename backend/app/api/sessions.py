@@ -13,13 +13,15 @@ import io
 import json
 
 import qrcode
-from flask import current_app, jsonify, request
+from flask import current_app, g, jsonify, request
 
 from ..extensions import db
-from ..models import AttendanceSession
+from ..models import AttendanceSession, ScheduledClass
 from ..services.auth import require_auth
+from ..services.timetable import start_gate
 from ..util import iso_z, utcnow
 from . import api_v1
+from .errors import api_error
 
 
 def _qr_png_data_uri(payload: str) -> str:
@@ -49,16 +51,25 @@ def _refresh_if_stale(session: AttendanceSession) -> None:
 def start_session():
     """Start a new attendance session for a class.
 
-    Body: ``{"class_id": "BSCS-401"}``. Any previously active session of the
-    same class is closed first (one live session per class), and the new
-    session begins nonce rotation immediately. Instructor authentication is
-    not enforced yet - it is wired up with the JWT layer (see roadmap).
+    Body: ``{"class_id": 7}`` (ScheduledClass.id, not a course code).
+    The authenticated faculty must own that class and pass the schedule gate
+    before any existing session is closed or a rotating nonce is created.
     """
     body = request.get_json(silent=True) or {}
-    class_id = str(body.get("class_id", "")).strip()
-
-    if not class_id:
-        return jsonify({"error": "class_id is required and must be a non-empty string"}), 400
+    value = body.get("class_id")
+    if isinstance(value, str) and len(value.strip()) <= 10 and value.strip().isascii() and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= 2147483647:
+        return api_error("request", "missing_fields", "class_id must be a positive ScheduledClass.id", 400)
+    scheduled_class = db.session.get(ScheduledClass, value)
+    if scheduled_class is None:
+        return api_error("class", "class_not_found", f"scheduled class {value} does not exist", 404)
+    if scheduled_class.professor_id != g.user_id:
+        return api_error("professor", "not_class_professor", "class is not owned by the authenticated faculty", 403)
+    denied = start_gate(scheduled_class)
+    if denied is not None:
+        return denied
+    class_id = str(scheduled_class.id)
 
     now = utcnow()
     ttl_seconds = current_app.config["NONCE_ROTATION_SECONDS"]
