@@ -1,4 +1,6 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
+import Button from "./ui/Button.jsx";
+import { logout } from "../lib/auth.js";
 
 /**
  * Shared shell for role dashboards. Each dashboard grows feature widgets
@@ -9,13 +11,23 @@ import { Link } from "react-router-dom";
  * Phase 3/4). The header/nav/role-badge structure is identical in both modes.
  */
 export default function PageLayout({ role, title, description, features = [], children }) {
+  const navigate = useNavigate();
+
+  function handleLogout() {
+    logout();
+    navigate("/login", { replace: true });
+  }
+
   return (
     <main className="page">
       <header className="page-header">
         <Link to="/login" className="brand">
           EduLedger
         </Link>
-        <span className="role-badge">{role}</span>
+        <div className="flex items-center gap-3">
+          <span className="role-badge">{role}</span>
+          <Button variant="secondary" onClick={handleLogout}>Logout</Button>
+        </div>
       </header>
 
       {children ? (

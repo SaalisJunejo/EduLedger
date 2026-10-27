@@ -2,13 +2,13 @@
  * Audit-trail (records) frontend helpers — the Module 2 counterpart of
  * lib/api.js + lib/attendanceMessages.js.
  *
- * POST /api/v1/ipfs/upload is multipart/form-data, which lib/api.js (JSON
- * only) can't express, so the evidence upload gets its own transport here.
+ * POST /api/v1/ipfs/upload uses multipart/form-data through lib/api.js,
+ * sharing its bearer-token headers and unauthorized-response handling.
  * Failures still throw ApiError, so every records/IPFS error flows through
  * describeRecordsError and the shared StatusBanner pattern like the
  * attendance module.
  */
-import { ApiError } from "./api.js";
+import { api } from "./api.js";
 
 /**
  * URL for an evidence CID on the local Kubo gateway (the daemon the backend
@@ -29,27 +29,7 @@ export async function uploadEvidence(file) {
   const formData = new FormData();
   formData.append("file", file);
 
-  let response;
-  try {
-    // No Content-Type header: the browser must set the multipart boundary.
-    response = await fetch("/api/v1/ipfs/upload", { method: "POST", body: formData });
-  } catch {
-    throw new ApiError(0, {
-      error: "network_error",
-      message: "Cannot reach the backend — is Flask running on port 5000?",
-    });
-  }
-
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch {
-    /* non-JSON body (e.g. an empty response) */
-  }
-  if (!response.ok) {
-    throw new ApiError(response.status, payload);
-  }
-  return payload;
+  return api("/ipfs/upload", { method: "POST", body: formData });
 }
 
 // Evidence policy, mirrored from backend/app/api/ipfs.py so the form can

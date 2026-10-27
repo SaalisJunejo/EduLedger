@@ -5,6 +5,8 @@
  * Non-2xx responses throw an ApiError carrying the backend's structured
  * error body: { error: <code>, check: <check name>, message, ...details }.
  */
+import { getToken, logout } from "./auth.js";
+
 const BASE = "/api/v1";
 
 export class ApiError extends Error {
@@ -21,7 +23,12 @@ export class ApiError extends Error {
 
 export async function api(path, { method = "GET", body } = {}) {
   const options = { method, headers: {} };
-  if (body !== undefined) {
+  const token = getToken();
+  if (token) options.headers.Authorization = `Bearer ${token}`;
+  if (body instanceof FormData) {
+    // The browser supplies the multipart Content-Type and boundary.
+    options.body = body;
+  } else if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
@@ -44,6 +51,11 @@ export async function api(path, { method = "GET", body } = {}) {
   }
 
   if (!response.ok) {
+    if (response.status === 401) {
+      logout();
+      // Keep login failures on the form so its backend message remains visible.
+      if (window.location.pathname !== "/login") window.location.replace("/login");
+    }
     throw new ApiError(response.status, payload);
   }
   return payload;
