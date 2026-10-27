@@ -81,7 +81,26 @@ class BaseConfig:
         "attendance_engine": os.getenv("ATTENDANCE_ENGINE_CONTRACT_ADDRESS", ""),
         "audit_trail": os.getenv("AUDIT_TRAIL_CONTRACT_ADDRESS", ""),
         "workload_ledger": os.getenv("WORKLOAD_LEDGER_CONTRACT_ADDRESS", ""),
+        "governance": os.getenv("GOVERNANCE_CONTRACT_ADDRESS", ""),
     }
+
+    # -- Governance registry / admin bootstrap (Phase 0.5) ------------------
+    # Optional explicit path to contracts/deployed/GovernanceRegistry.json
+    # (default: <repo>/contracts/deployed/GovernanceRegistry.json).
+    GOVERNANCE_REGISTRY_ARTIFACT = os.getenv("GOVERNANCE_REGISTRY_ARTIFACT", "")
+    # Shared secret the one-time POST /auth/bootstrap/admin call must present.
+    # Intentionally has no default: with no ADMIN user yet the route cannot be
+    # protected by require_auth, so an unset secret disables it entirely.
+    BOOTSTRAP_ADMIN_SECRET = os.getenv("BOOTSTRAP_ADMIN_SECRET", "")
+    # Address locked as the system root by GovernanceRegistry.lockRoot().
+    # Default = Hardhat account #5, unused by the other modules' signers
+    # (accounts #0-#4 in contracts/deployed/accounts.json) - LOCAL DEMO ONLY.
+    # lockRoot() is signed by BACKEND_SIGNER_PRIVATE_KEY (the deployer), so
+    # this address only has to be the intended root, not a key we hold.
+    ADMIN_ROOT_ADDRESS = os.getenv(
+        "ADMIN_ROOT_ADDRESS",
+        "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc",
+    )
 
     # -- Audit trail signers (Module 2 - RecordAuditTrail) ------------------
     # Three role signers matching the labeled accounts in
