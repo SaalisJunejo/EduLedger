@@ -4,21 +4,30 @@ The code is derived deterministically from a session's CURRENT nonce -
 HMAC-SHA256(SECRET_KEY, nonce) mod 10**6, zero-padded - so it needs no
 stored state and rotates in lockstep with the QR. Students who cannot scan
 the QR type the code instead; /attendance/scan then runs the same checks.
+The code may also be typed alone (Phase 1.1b): `sessions_showing()` finds
+the live session whose current code it is.
 
-Brute-force guard: wrong codes are counted per (student, session) and the
-code path is refused once MAX_WRONG_CODE_ATTEMPTS is reached. The counter
-lives in Redis (INCR + EXPIRE, Phase 1.2a) so every server process shares
-it; if Redis is unreachable the module warns once and falls back to this
-process's memory, which still blocks a single-process brute force.
+Brute-force guard: with a session_id, wrong codes are counted per
+(student, session) and the code path is refused once
+MAX_WRONG_CODE_ATTEMPTS is reached. Code-only scans guess across every live
+session at once, so they are counted per student instead
+(MAX_WRONG_CODE_ONLY_ATTEMPTS within WRONG_CODE_ONLY_TTL_SECONDS). The
+counters live in Redis (INCR + EXPIRE, Phase 1.2a) so every server process
+shares them; if Redis is unreachable the module warns once and falls back to
+this process's memory, which still blocks a single-process brute force.
 """
 
 import hashlib
 import hmac
 import logging
 import threading
+import time
 
 import redis
 from flask import current_app
+
+from ..models import AttendanceSession
+from ..util import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +37,14 @@ MAX_WRONG_CODE_ATTEMPTS = 5
 # meeting, so the counter cannot be reset by simply waiting one out.
 WRONG_CODE_TTL_SECONDS = 3600
 
+# Code-only scans (no session_id): one counter per student across sessions.
+MAX_WRONG_CODE_ONLY_ATTEMPTS = 5
+WRONG_CODE_ONLY_TTL_SECONDS = 600
+
 _attempts_lock = threading.Lock()
 _wrong_attempts: dict[tuple[int, int], int] = {}
+# student id -> (wrong code-only attempts, time.monotonic() they expire at)
+_wrong_code_only_attempts: dict[int, tuple[int, float]] = {}
 
 _redis_lock = threading.Lock()
 # client: the live connection; warned: Redis already proved unreachable, so
@@ -39,6 +54,10 @@ _redis_state: dict = {"url": None, "client": None, "warned": False}
 
 def _redis_key(student_id: int, session_id: int) -> str:
     return f"eduledger:wrong_code:{session_id}:{student_id}"
+
+
+def _code_only_redis_key(student_id: int) -> str:
+    return f"eduledger:wrong_code_only:{student_id}"
 
 
 def _redis_client():
@@ -114,6 +133,28 @@ def code_matches(session, submitted) -> bool:
     return hmac.compare_digest(normalized, current_code(session))
 
 
+def sessions_showing(submitted) -> list[AttendanceSession]:
+    """Every live session whose current code is `submitted` right now.
+
+    Same window rules as the QR nonce check: the session is active, was not
+    ended by its conductor, and its nonce (so its code) has not expired.
+    """
+    normalized = _normalize(submitted)
+    if normalized is None:
+        return []
+    secret_key = current_app.config["SECRET_KEY"]
+    live = AttendanceSession.query.filter(
+        AttendanceSession.is_active.is_(True),
+        AttendanceSession.ended_at.is_(None),
+        AttendanceSession.nonce_expires_at > utcnow(),
+    ).all()
+    return [
+        session
+        for session in live
+        if hmac.compare_digest(normalized, derive_code(session.current_nonce, secret_key))
+    ]
+
+
 def too_many_attempts(student_id: int, session_id: int) -> bool:
     """True once the student has used up their wrong codes for this session."""
     client = _redis_client()
@@ -143,3 +184,47 @@ def record_wrong_attempt(student_id: int, session_id: int) -> int:
         key = (student_id, session_id)
         _wrong_attempts[key] = _wrong_attempts.get(key, 0) + 1
         return _wrong_attempts[key]
+
+
+def _code_only_in_memory(student_id: int, now: float) -> int:
+    """The in-memory code-only count; drops an expired window. Hold the lock."""
+    count, expires_at = _wrong_code_only_attempts.get(student_id, (0, 0.0))
+    if expires_at <= now:
+        _wrong_code_only_attempts.pop(student_id, None)
+        return 0
+    return count
+
+
+def too_many_code_only_attempts(student_id: int) -> bool:
+    """True once the student has used up their wrong code-only scans."""
+    client = _redis_client()
+    if client is not None:
+        try:
+            counted = client.get(_code_only_redis_key(student_id))
+            return int(counted or 0) >= MAX_WRONG_CODE_ONLY_ATTEMPTS
+        except Exception:
+            _redis_failed()
+    with _attempts_lock:
+        return _code_only_in_memory(student_id, time.monotonic()) >= MAX_WRONG_CODE_ONLY_ATTEMPTS
+
+
+def record_wrong_code_only_attempt(student_id: int) -> int:
+    """Count one code-only scan that matched no live session; returns the total."""
+    client = _redis_client()
+    if client is not None:
+        try:
+            key = _code_only_redis_key(student_id)
+            total = int(client.incr(key))
+            if total == 1:  # first miss starts the window
+                client.expire(key, WRONG_CODE_ONLY_TTL_SECONDS)
+            return total
+        except Exception:
+            _redis_failed()
+    with _attempts_lock:
+        now = time.monotonic()
+        count = _code_only_in_memory(student_id, now)
+        expires_at = (
+            _wrong_code_only_attempts[student_id][1] if count else now + WRONG_CODE_ONLY_TTL_SECONDS
+        )
+        _wrong_code_only_attempts[student_id] = (count + 1, expires_at)
+        return count + 1

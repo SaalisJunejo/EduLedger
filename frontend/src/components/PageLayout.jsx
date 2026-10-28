@@ -9,8 +9,10 @@ import { logout } from "../lib/auth.js";
  * Pages that pass `children` render their real module UI in the content area;
  * pages without children keep the scaffold placeholder card (HOD/Admin until
  * Phase 3/4). The header/nav/role-badge structure is identical in both modes.
+ *
+ * `wide` lifts the 720px reading width for projector views (live QR + roster).
  */
-export default function PageLayout({ role, title, description, features = [], children }) {
+export default function PageLayout({ role, title, description, features = [], wide = false, children }) {
   const navigate = useNavigate();
 
   function handleLogout() {
@@ -19,7 +21,7 @@ export default function PageLayout({ role, title, description, features = [], ch
   }
 
   return (
-    <main className="page">
+    <main className={wide ? "page page-wide" : "page"}>
       <header className="page-header">
         <Link to="/login" className="brand">
           EduLedger

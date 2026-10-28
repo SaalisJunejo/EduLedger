@@ -4,6 +4,7 @@ import Button from "../components/ui/Button.jsx";
 import Card from "../components/ui/Card.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import Spinner from "../components/ui/Spinner.jsx";
+import CodeEntryForm from "../components/student/CodeEntryForm.jsx";
 import DeviceRegistrationCard from "../components/student/DeviceRegistrationCard.jsx";
 import FaceCaptureCard from "../components/student/FaceCaptureCard.jsx";
 import QrScannerCard from "../components/student/QrScannerCard.jsx";
@@ -38,12 +39,26 @@ function generateDeviceId() {
   return `device-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function formatTime(iso) {
-  try {
-    return new Date(iso).toLocaleTimeString();
-  } catch {
-    return iso;
-  }
+// "hh:mm:ss AM/PM, DD MMM YYYY" in the timetable's zone, whatever the
+// phone's own zone is. Accepts an ISO string or epoch milliseconds.
+const KARACHI_FORMAT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Karachi",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: true,
+  day: "2-digit",
+  month: "short",
+  year: "numeric",
+});
+
+function formatKarachi(value) {
+  const date = new Date(value);
+  if (value == null || Number.isNaN(date.getTime())) return "—";
+  const part = Object.fromEntries(
+    KARACHI_FORMAT.formatToParts(date).map(({ type, value: text }) => [type, text])
+  );
+  return `${part.hour}:${part.minute}:${part.second} ${part.dayPeriod}, ${part.day} ${part.month} ${part.year}`;
 }
 
 export default function StudentPage() {
@@ -64,6 +79,7 @@ export default function StudentPage() {
   const [enrollName, setEnrollName] = useState("");
   const [enrollBusy, setEnrollBusy] = useState(false);
   const [submitBusy, setSubmitBusy] = useState(false);
+  const [codeMode, setCodeMode] = useState(false); // typing the code instead of scanning
 
   const registered = Boolean(stored.deviceId && stored.studentId);
   const activeStudentId = stored.studentId || (regAttempt ? String(regAttempt.studentId) : "");
@@ -123,8 +139,10 @@ export default function StudentPage() {
     }
   }
 
-  const handleScan = useCallback(
-    async (payload) => {
+  // Shared by the QR scan and the typed code: `body` carries either
+  // session_id + nonce or numeric_code alone (the backend finds the session).
+  const submitScan = useCallback(
+    async (body, sessionId) => {
       setFlowError(null);
       setSubmitBusy(true);
       try {
@@ -133,8 +151,7 @@ export default function StudentPage() {
           body: {
             verification_token: token.verification_token,
             device_id: stored.deviceId,
-            session_id: payload.session_id,
-            nonce: payload.nonce,
+            ...body,
           },
         });
         setResult(data);
@@ -145,11 +162,11 @@ export default function StudentPage() {
           setResult({
             already_locked: true,
             student_id: Number(activeStudentId),
-            session_id: payload.session_id,
+            session_id: sessionId,
           });
           setStep(STEP.SUCCESS);
         } else {
-          setFlowError(error); // shown inside the scanner card — rescan after fixing
+          setFlowError(error); // shown inside the scanner card / code form — retry after fixing
         }
       } finally {
         setSubmitBusy(false);
@@ -157,6 +174,14 @@ export default function StudentPage() {
     },
     [token, stored.deviceId, activeStudentId]
   );
+
+  const handleScan = useCallback(
+    (payload) => submitScan({ session_id: payload.session_id, nonce: payload.nonce }, payload.session_id),
+    [submitScan]
+  );
+
+  // A code-only rejection names no session, so an already-locked one shows none.
+  const handleCode = useCallback((code) => submitScan({ numeric_code: code }, null), [submitScan]);
 
   async function enrollAndContinue() {
     setEnrollBusy(true);
@@ -200,6 +225,7 @@ export default function StudentPage() {
     setFlowError(null);
     setEnrollName("");
     setSubmitBusy(false);
+    setCodeMode(false);
   }
 
   function spinnerCard(title, text) {
@@ -314,25 +340,51 @@ export default function StudentPage() {
     attendanceBody = (
       <Card
         title="Scan the live QR code"
-        description="Point your camera at the code projected by your instructor. It rotates every few seconds — scan the one on screen right now."
+        description="Point your camera at the code projected by your instructor. It rotates every few seconds — scan the one on screen right now, or type the 6-digit code shown beside it."
       >
         <QrScannerCard
           expiresAt={token ? token.deadline : 0}
           windowSeconds={token ? token.expires_in : 30}
           busy={submitBusy}
-          error={flowError}
+          error={codeMode ? null : flowError}
           onScan={handleScan}
           onReverify={() => {
             setToken(null);
             setFlowError(null);
+            setCodeMode(false);
             setStep(STEP.CAMERA);
           }}
           onCancel={() => {
             setToken(null);
             setFlowError(null);
+            setCodeMode(false);
             setStep(STEP.IDLE);
           }}
         />
+        <div className="mt-4">
+          {codeMode ? (
+            <CodeEntryForm
+              busy={submitBusy}
+              error={flowError}
+              onSubmit={handleCode}
+              onCancel={() => {
+                setFlowError(null);
+                setCodeMode(false);
+              }}
+            />
+          ) : (
+            <Button
+              variant="secondary"
+              disabled={submitBusy}
+              onClick={() => {
+                setFlowError(null);
+                setCodeMode(true);
+              }}
+            >
+              Enter code instead
+            </Button>
+          )}
+        </div>
       </Card>
     );
   } else {
@@ -350,25 +402,34 @@ export default function StudentPage() {
           </div>
         </div>
         <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
+          {result.already_locked ? null : (
+            <div className="col-span-2">
+              <dt className="text-xs font-bold uppercase tracking-wide text-ink-muted">Checked in at</dt>
+              <dd className="mt-0.5 text-base font-semibold text-ink">
+                {formatKarachi(result.checked_in_at)}
+              </dd>
+              {result.locked_at != null ? (
+                <dd className="mt-0.5 text-xs text-ink-muted">
+                  Chain clock: {formatKarachi(result.locked_at * 1000)}
+                </dd>
+              ) : null}
+            </div>
+          )}
           <div>
             <dt className="text-xs font-bold uppercase tracking-wide text-ink-muted">Student</dt>
             <dd className="mt-0.5 font-semibold text-ink">#{result.student_id}</dd>
           </div>
           <div>
             <dt className="text-xs font-bold uppercase tracking-wide text-ink-muted">Session</dt>
-            <dd className="mt-0.5 font-semibold text-ink">#{result.session_id}</dd>
+            <dd className="mt-0.5 font-semibold text-ink">
+              {result.session_id != null ? `#${result.session_id}` : "—"}
+            </dd>
           </div>
           {result.already_locked ? null : (
-            <>
-              <div>
-                <dt className="text-xs font-bold uppercase tracking-wide text-ink-muted">Block</dt>
-                <dd className="mt-0.5 font-semibold text-ink">#{result.block_number}</dd>
-              </div>
-              <div>
-                <dt className="text-xs font-bold uppercase tracking-wide text-ink-muted">Locked at</dt>
-                <dd className="mt-0.5 font-semibold text-ink">{formatTime(result.locked_at)}</dd>
-              </div>
-            </>
+            <div>
+              <dt className="text-xs font-bold uppercase tracking-wide text-ink-muted">Block</dt>
+              <dd className="mt-0.5 font-semibold text-ink">#{result.block_number}</dd>
+            </div>
           )}
         </dl>
         {result.transaction_hash ? (

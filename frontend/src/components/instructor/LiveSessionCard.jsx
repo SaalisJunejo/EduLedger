@@ -171,8 +171,8 @@ export default function LiveSessionCard({ session, onEnded }) {
         </div>
       ) : null}
 
-      <div className="mt-5 grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-        <div>
+      <div className="mt-5 grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <div className="min-w-0">
           {ended ? (
             <p className="rounded-xl border border-line bg-surface-muted px-4 py-10 text-center text-sm leading-relaxed text-ink-muted">
               The projected code is gone. Start a new session to take attendance
@@ -180,14 +180,17 @@ export default function LiveSessionCard({ session, onEnded }) {
             </p>
           ) : qr ? (
             <>
-              <div className="grid items-center gap-4 rounded-xl border border-line bg-white p-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+              {/* Fixed-size square QR (never a share of the column, which once
+                  collapsed it to 0px beside the code); the code wraps below
+                  it whenever the two don't fit on one line. */}
+              <div className="flex flex-wrap items-center justify-center gap-x-8 gap-y-4 rounded-xl border border-line bg-white p-4">
                 <img
                   src={qr.qr_image}
                   alt="Live attendance QR code"
-                  className="mx-auto w-full max-w-[420px] [image-rendering:pixelated]"
+                  className="aspect-square w-[min(60vh,420px,100%)] shrink-0 [image-rendering:pixelated]"
                 />
                 {qr.numeric_code ? (
-                  <div className="text-center sm:px-4">
+                  <div className="shrink-0 text-center">
                     <p className="text-xs font-bold uppercase tracking-wide text-ink-muted">
                       Or enter code
                     </p>

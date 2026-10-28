@@ -2,9 +2,9 @@
 
 - POST /api/v1/attendance/verify-identity - face match (or WebAuthn stub) -> 30s JWT
 - POST /api/v1/attendance/scan            - the full check-in: token, nonce
-  (or the 6-digit numeric code), device, on-chain lock. Checks run in a
-  fixed order (a) to (d) and every failure response names the check that
-  failed, for demo debugging.
+  (or the 6-digit numeric code, with or without a session_id), device,
+  on-chain lock. Checks run in a fixed order (a) to (d) and every failure
+  response names the check that failed, for demo debugging.
 """
 
 from datetime import datetime, timezone
@@ -24,6 +24,7 @@ from ..services.face_embedding import (
 from ..services.verification_token import VerificationTokenError, mint, verify
 from ..services.webauthn import WebAuthnError, verify_assertion
 from ..sockets import emit_checked_in
+from ..util import iso_z, utcnow
 from .errors import api_error
 from . import api_v1
 
@@ -31,6 +32,39 @@ from . import api_v1
 def _iso_from_unix(timestamp: float) -> str:
     """Format a unix timestamp as an ISO-8601 UTC string."""
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def _session_from_code(student_id: int, numeric_code):
+    """Resolve a code typed without a session_id to the one session showing it.
+
+    Returns ``(session, None)`` or ``(None, error_response)``. Wrong codes
+    are counted per student (not per session); an ambiguous code is not the
+    student's fault, so it is not counted.
+    """
+    if attendance_code.too_many_code_only_attempts(student_id):
+        return None, api_error(
+            "rate_limit",
+            "too_many_attempts",
+            "too many wrong codes - scan the QR instead, or wait a few minutes",
+            429,
+        )
+    matches = attendance_code.sessions_showing(numeric_code)
+    if not matches:
+        attendance_code.record_wrong_code_only_attempt(student_id)
+        return None, api_error(
+            "session_nonce",
+            "code_mismatch",
+            "the code does not match any live session's current code "
+            "(it may have rotated - read the projector again)",
+        )
+    if len(matches) > 1:
+        return None, api_error(
+            "session_nonce",
+            "ambiguous_code",
+            "Two classes show the same code right now - scan the QR or try again in a few seconds",
+            409,
+        )
+    return matches[0], None
 
 
 @api_v1.post("/attendance/verify-identity")
@@ -138,7 +172,8 @@ def scan():
     Body: ``{"verification_token": "...", "device_id": "...",
     "session_id": 1, "nonce": "<scanned from the QR>"}``, or the same with
     ``"numeric_code": "123456"`` (typed from the projector) instead of
-    ``nonce``.
+    ``nonce``. The code may also be sent without ``session_id``: the session
+    is then the one live session currently showing that code (Phase 1.1b).
 
     Validation order (each failure response names its check):
     (a) verification_token - valid, unexpired, issued for attendance, and matches
@@ -148,6 +183,9 @@ def scan():
                              numeric code matches that nonce (wrong/expired
                              -> code_mismatch; after MAX_WRONG_CODE_ATTEMPTS
                              wrong codes -> 429 rate_limit/too_many_attempts).
+                             Code-only: no live session shows it ->
+                             code_mismatch, two do -> 409 ambiguous_code,
+                             and wrong codes are limited per student.
                              A session the conductor ended fails earlier, as
                              {check: "session", error: "session_ended"}
     (c) device_match       - device_id matches the student's registered device
@@ -156,7 +194,8 @@ def scan():
     If everything passes, AttendanceLedger.lockAttendance() is sent from the
     backend signer and the response carries the transaction hash. The
     check-in is then mirrored locally and pushed to the instructor's live
-    panel over the session room (Phase 1.2a).
+    panel over the session room (Phase 1.2a); the response's
+    ``checked_in_at`` is that mirrored check-in time.
     """
     body = request.get_json(silent=True) or {}
     token = body.get("verification_token")
@@ -166,16 +205,12 @@ def scan():
     numeric_code = body.get("numeric_code")
     has_nonce = nonce not in (None, "")
     has_code = numeric_code not in (None, "")
+    code_only = has_code and session_id in (None, "")
 
-    missing = [
-        field
-        for field, value in (
-            ("verification_token", token),
-            ("device_id", device_id),
-            ("session_id", session_id),
-        )
-        if value in (None, "")
-    ]
+    required = [("verification_token", token), ("device_id", device_id)]
+    if not code_only:
+        required.append(("session_id", session_id))
+    missing = [field for field, value in required if value in (None, "")]
     if not has_nonce and not has_code:
         missing.append("nonce or numeric_code")
     if missing:
@@ -213,7 +248,15 @@ def scan():
         )
 
     # -- (b) session + rotating nonce (or the code derived from it) -----------
-    session = db.session.get(AttendanceSession, session_id) if isinstance(session_id, int) else None
+    if code_only:
+        session, error = _session_from_code(student_id, numeric_code)
+        if error is not None:
+            return error
+        session_id = session.id
+    else:
+        session = (
+            db.session.get(AttendanceSession, session_id) if isinstance(session_id, int) else None
+        )
     if session is None:
         return api_error(
             "session_nonce", "session_not_found", f"session {session_id} does not exist", 404
@@ -233,22 +276,26 @@ def scan():
             409,
         )
     if has_code:
-        if attendance_code.too_many_attempts(student_id, session.id):
-            return api_error(
-                "rate_limit",
-                "too_many_attempts",
-                f"too many wrong codes for session {session_id} - scan the QR instead",
-                429,
-            )
-        # An expired nonce means the code shown with it has expired too.
-        if session.nonce_is_expired() or not attendance_code.code_matches(session, numeric_code):
-            attendance_code.record_wrong_attempt(student_id, session.id)
-            return api_error(
-                "session_nonce",
-                "code_mismatch",
-                "the code does not match the session's current code "
-                "(it may have rotated - read the projector again)",
-            )
+        # A code-only scan was already matched while resolving its session.
+        if not code_only:
+            if attendance_code.too_many_attempts(student_id, session.id):
+                return api_error(
+                    "rate_limit",
+                    "too_many_attempts",
+                    f"too many wrong codes for session {session_id} - scan the QR instead",
+                    429,
+                )
+            # An expired nonce means the code shown with it has expired too.
+            if session.nonce_is_expired() or not attendance_code.code_matches(
+                session, numeric_code
+            ):
+                attendance_code.record_wrong_attempt(student_id, session.id)
+                return api_error(
+                    "session_nonce",
+                    "code_mismatch",
+                    "the code does not match the session's current code "
+                    "(it may have rotated - read the projector again)",
+                )
     elif str(nonce) != session.current_nonce:
         return api_error(
             "session_nonce",
@@ -305,11 +352,14 @@ def scan():
     # Mirror the lock locally and push it to the instructor's live panel.
     # Attendance is already anchored on-chain at this point, so neither step
     # may break (or slow down) the response - the emit helper never raises
-    # and a failed mirror write is logged and dropped.
+    # and a failed mirror write is logged and dropped (the response then
+    # reports the server's current time as the check-in time).
+    checked_in_at = None
     try:
         check_in = live_attendance.record_check_in(
             session.id, student_id, result["transaction_hash"]
         )
+        checked_in_at = iso_z(check_in.checked_in_at)
         emit_checked_in(
             session.id,
             live_attendance.check_in_payload(
@@ -332,6 +382,7 @@ def scan():
             "transaction_hash": result["transaction_hash"],
             "block_number": result["block_number"],
             "locked_at": result["locked_at"],
+            "checked_in_at": checked_in_at or iso_z(utcnow()),
             "signer": result["signer"],
         }
     )

@@ -94,6 +94,7 @@ export default function InstructorPage() {
     <PageLayout
       role="Instructor"
       title="Instructor Dashboard"
+      wide
       description="One dashboard, three modules: project the rotating attendance QR (students verify, scan, and attendance locks on-chain); run today's classes on the workload ledger — sessions, substitute keys and zero-attendance declarations; and propose record changes with IPFS evidence, executed once the HOD or Exam Controller co-signs."
     >
       <div role="tablist" aria-label="Instructor dashboard sections" className="flex flex-wrap gap-2">

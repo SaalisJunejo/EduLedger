@@ -74,6 +74,13 @@ body {
   padding: 32px 20px;
 }
 
+/* Projector dashboards (Instructor): room for a full-size QR plus the live
+ * attendance panel beside it. Unlayered like .page, so a Tailwind max-w-*
+ * utility could not override it — hence a class of its own. */
+.page.page-wide {
+  max-width: 1440px;
+}
+
 .page-centered {
   display: flex;
   align-items: center;

@@ -38,6 +38,11 @@ const MESSAGES = {
     "This attendance session doesn't exist (anymore). Ask your instructor to start one.",
   "session_nonce/session_inactive":
     "This attendance session has ended — a newer one may have started. Scan the latest QR.",
+  "session_nonce/code_mismatch": "Wrong or expired code - check the projector",
+  "session_nonce/ambiguous_code":
+    "Two classes show the same code right now — scan the QR, or try again in a few seconds.",
+  "rate_limit/too_many_attempts":
+    "Too many wrong codes — scan the QR instead, or wait a few minutes and try again.",
 
   // Session lifecycle — check "session" (ended by the conductor, phase 1.2)
   "session/session_ended":
