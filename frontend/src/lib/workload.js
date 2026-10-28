@@ -2,39 +2,18 @@
  * Faculty workload (Module 3) frontend helpers — the counterpart of
  * lib/records.js for the instructor's "My Classes" tab and the admin
  * workload audit log.
- *
- * There is no class-management UI or timetable ingestion yet (Phase 4+), so
- * the professor's roster for today is a mock mirroring the ScheduledClass
- * rows seeded by backend/seed_workload_demo.py — the same approach as the
- * Phase 2.4 attendance class dropdown in InstructorPage.
  */
+import { api } from "./api.js";
 
-// The professor "logged in" for the demo. No auth layer exists yet — the
-// faculty endpoints take the id in the request body, exactly like every
-// other module.
-export const PROFESSOR_ID = 101;
-
-// Professor directory for the substitute flows (the backend stores opaque
-// professor ids only; names are demo flavor for the mock roster).
-export const PROFESSORS = [
-  { id: 101, name: "Dr. Sana Raza" },
-  { id: 102, name: "Dr. Ayesha Khan" },
-  { id: 103, name: "Dr. Bilal Ahmed" },
-];
-
-export function professorLabel(id) {
-  const professor = PROFESSORS.find((entry) => entry.id === Number(id));
-  return professor ? `Prof. ${professor.id} · ${professor.name}` : `Prof. ${id}`;
+export async function loadFacultyClasses() {
+  const data = await api("/faculty/classes");
+  return data.classes;
 }
 
-// Today's timetable for the logged-in professor (mock — the ids must match
-// the ScheduledClass rows in the database; see seed_workload_demo.py, which
-// prints the start times these labels mirror).
-export const MOCK_CLASSES = [
-  { id: 1, courseId: "BSCS-401", title: "Distributed Systems", room: "A-101", start: "02:52", professorId: 101 },
-  { id: 2, courseId: "BSCS-402", title: "Blockchain Engineering", room: "B-204", start: "05:52", professorId: 101 },
-  { id: 3, courseId: "BSCS-501", title: "Information Security", room: "C-301", start: "08:52", professorId: 101 },
-];
+// The API exposes IDs, not a faculty directory. Never attach mock names.
+export function professorLabel(id) {
+  return id == null ? "Not available" : `Faculty #${id}`;
+}
 
 // SessionLog.status -> badge label + chip classes (the design foundation's
 // chip recipe: rounded-full bg-*-soft px-2.5 py-1 text-xs font-bold text-*).
@@ -62,8 +41,13 @@ export function shortToken(token) {
 }
 
 export function formatDateTime(iso) {
+  if (!iso) return "Not available";
   try {
-    return new Date(iso).toLocaleString(undefined, {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return iso;
+    return date.toLocaleString("en-US", {
+      timeZone: "Asia/Karachi",
+      year: "numeric",
       month: "short",
       day: "numeric",
       hour: "2-digit",
@@ -79,6 +63,8 @@ export function formatDateTime(iso) {
 // message still shows as the banner's detail line, so contract reverts stay
 // debuggable during demos.
 const MESSAGES = {
+  "schedule/too_early": "This class hasn't reached its start time yet.",
+
   // Input validation — check "request"
   "request/missing_fields": "Some required information is missing — check the fields and retry.",
   "request/invalid_substitute": "Pick a colleague other than yourself as the substitute.",

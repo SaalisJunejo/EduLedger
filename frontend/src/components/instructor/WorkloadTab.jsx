@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useState } from "react";
 import Button from "../ui/Button.jsx";
 import Card from "../ui/Card.jsx";
 import StatusBanner from "../ui/StatusBanner.jsx";
@@ -6,19 +6,11 @@ import LiveSessionCard from "./LiveSessionCard.jsx";
 import RedeemSubstituteCard from "./RedeemSubstituteCard.jsx";
 import ScheduledClassCard from "./ScheduledClassCard.jsx";
 import ZeroAttendanceAction from "./ZeroAttendanceAction.jsx";
-import { api } from "../../lib/api.js";
 import {
-  MOCK_CLASSES,
-  PROFESSOR_ID,
-  describeWorkloadError,
   formatDateTime,
   professorLabel,
   statusMeta,
 } from "../../lib/workload.js";
-
-// How often the tab re-reads GET /faculty/logs. Badges and the live view's
-// "conducted" swap react to student scans / auto-flags within this window.
-const LOGS_POLL_MS = 5000;
 
 const LABEL_CLASS = "text-xs font-bold uppercase tracking-wide text-ink-muted";
 
@@ -32,55 +24,40 @@ const LABEL_CLASS = "text-xs font-bold uppercase tracking-wide text-ink-muted";
  * class list for today, and the substitute-key redemption (the surface a
  * covering colleague uses as themselves).
  *
- * A light poll of /faculty/logs keeps every badge current: the moment a
+ * The page polls /faculty/classes to keep owned-class badges current: when a
  * class's outcome anchors on-chain — a student scan, a zero-attendance
  * declaration, a substitute concluding a covered class, or the background
  * auto-flag — the live view swaps to the outcome card and the class badge
  * updates, no manual refresh needed.
  */
-export default function WorkloadTab() {
-  const [logs, setLogs] = useState(null); // null until the first successful load
-  const [logsError, setLogsError] = useState(null);
+export default function WorkloadTab({ user, classes, onRefresh }) {
+  // Full log details are available only from actions performed here, not
+  // from /faculty/classes. Never call the HOD/ADMIN-only /faculty/logs.
+  const [recordedLogs, setRecordedLogs] = useState(new Map());
   const [liveSession, setLiveSession] = useState(null);
   const [endedNote, setEndedNote] = useState(null); // { reason, message }
 
-  const fetchLogs = useCallback(async () => {
-    try {
-      const data = await api("/faculty/logs");
-      setLogs(data.logs || []);
-      setLogsError(null);
-    } catch (error) {
-      setLogsError(error);
+  function handleRecorded(data) {
+    if (data.session_log) {
+      setRecordedLogs((previous) => new Map(previous).set(data.session_log.classId, data.session_log));
     }
-  }, []);
+    onRefresh();
+  }
 
-  useEffect(() => {
-    fetchLogs();
-    const timer = setInterval(fetchLogs, LOGS_POLL_MS);
-    return () => clearInterval(timer);
-  }, [fetchLogs]);
-
-  // Newest-first list -> one entry per class (the latest, should the
-  // backend ever return more than one).
-  const logsByClass = useMemo(() => {
-    const map = new Map();
-    for (const entry of logs || []) {
-      if (!map.has(entry.classId)) map.set(entry.classId, entry);
-    }
-    return map;
-  }, [logs]);
-
-  const liveLog = liveSession ? logsByClass.get(liveSession.classId) ?? null : null;
+  const liveLog = liveSession ? recordedLogs.get(liveSession.classId) : null;
+  const liveOutcome = liveSession
+    ? liveLog?.status || classes?.find((entry) => entry.id === liveSession.classId)?.outcome
+    : null;
 
   function handleSessionStarted(data, scheduledClass) {
-    const label = `${scheduledClass.courseId} · ${scheduledClass.title}`;
+    const label = `${scheduledClass.courseCode} · Room ${scheduledClass.room}`;
     setEndedNote(null);
     setLiveSession({
       classId: scheduledClass.id,
       classLabel: label,
-      scheduledProfessorId: scheduledClass.professorId,
+      scheduledProfessorId: user.id,
       conductorId: data.workload_session.conductorId,
-      substitute: data.workload_session.conductorId !== scheduledClass.professorId,
+      substitute: data.workload_session.conductorId !== user.id,
       // LiveSessionCard renders class_id as its title — show the course
       // instead of the internal "workload-<id>" session namespace.
       session: { ...data.session, class_id: label, rotation_seconds: data.rotation_seconds },
@@ -88,20 +65,20 @@ export default function WorkloadTab() {
   }
 
   function handleRedeemed(data) {
-    const scheduledClass = MOCK_CLASSES.find((entry) => entry.id === data.class_id);
+    const scheduledClass = classes?.find((entry) => entry.id === data.class_id);
     const label = scheduledClass
-      ? `${scheduledClass.courseId} · ${scheduledClass.title}`
-      : `Class #${data.class_id}`;
+      ? `${scheduledClass.courseCode} · Room ${scheduledClass.room}`
+      : `Scheduled class #${data.class_id}`;
     setEndedNote(null);
     setLiveSession({
       classId: data.class_id,
       classLabel: label,
-      scheduledProfessorId: scheduledClass ? scheduledClass.professorId : null,
+      scheduledProfessorId: scheduledClass ? user.id : null,
       conductorId: data.substitute_id,
       substitute: true,
       session: { ...data.session, class_id: label, rotation_seconds: data.rotation_seconds },
     });
-    fetchLogs();
+    onRefresh();
   }
 
   const handleEnded = useCallback((reason, error) => {
@@ -120,10 +97,11 @@ export default function WorkloadTab() {
       ) : null}
 
       {liveSession ? (
-        liveLog ? (
+        liveOutcome ? (
           <ConductedOutcomeCard
             classLabel={liveSession.classLabel}
             scheduledProfessorId={liveSession.scheduledProfessorId}
+            outcome={liveOutcome}
             log={liveLog}
             onBack={() => setLiveSession(null)}
           />
@@ -141,7 +119,7 @@ export default function WorkloadTab() {
               </StatusBanner>
             ) : null}
 
-            <LiveSessionCard session={liveSession.session} onEnded={handleEnded} />
+            <LiveSessionCard key={liveSession.session.id} session={liveSession.session} onEnded={handleEnded} />
 
             {liveSession.substitute ? (
               <Card
@@ -150,53 +128,44 @@ export default function WorkloadTab() {
               >
                 <ZeroAttendanceAction
                   classId={liveSession.classId}
-                  conductorId={liveSession.conductorId}
-                  onDeclared={fetchLogs}
+                  onDeclared={handleRecorded}
                 />
+                <p className="mt-3 text-xs text-ink-muted">
+                  The class list only reports your own scheduled classes. A covered colleague's
+                  outcome cannot be refreshed here after a student scan; zero-attendance results
+                  are shown when declared from this view.
+                </p>
               </Card>
             ) : null}
           </>
         )
       ) : null}
 
-      {logsError ? (
-        logs === null ? (
-          <StatusBanner
-            tone="error"
-            title="Couldn't load the workload ledger"
-            detail={logsError.status ? logsError.message : undefined}
-          >
-            {describeWorkloadError(logsError)}
-          </StatusBanner>
-        ) : (
-          <StatusBanner tone="warning" title="Lost contact with the workload ledger">
-            {describeWorkloadError(logsError)} — showing the last known statuses and retrying
-            automatically.
-          </StatusBanner>
-        )
-      ) : null}
-
       <section>
-        <h2 className={LABEL_CLASS}>My classes — today</h2>
+        <h2 className={LABEL_CLASS}>My scheduled classes · Asia/Karachi</h2>
+        {classes?.length === 0 ? (
+          <p className="mt-3 text-sm text-ink-muted">No classes assigned yet. Ask your HOD to upload your timetable.</p>
+        ) : null}
         <div className="mt-3 flex flex-col gap-4">
-          {MOCK_CLASSES.map((scheduledClass) => (
+          {(classes || []).map((scheduledClass) => (
             <ScheduledClassCard
               key={scheduledClass.id}
               scheduledClass={scheduledClass}
-              log={logsByClass.get(scheduledClass.id) ?? null}
-              liveHere={liveSession?.classId === scheduledClass.id && !liveLog}
+              facultyId={user.id}
+              log={recordedLogs.get(scheduledClass.id)}
+              liveHere={liveSession?.classId === scheduledClass.id && !liveOutcome}
               viewerIsConductor={
                 liveSession?.classId === scheduledClass.id &&
-                liveSession?.conductorId === PROFESSOR_ID
+                liveSession?.conductorId === user.id
               }
               onSessionStarted={handleSessionStarted}
-              onWorkloadRecorded={fetchLogs}
+              onWorkloadRecorded={handleRecorded}
             />
           ))}
         </div>
       </section>
 
-      <RedeemSubstituteCard onRedeemed={handleRedeemed} />
+      <RedeemSubstituteCard user={user} onRedeemed={handleRedeemed} />
     </div>
   );
 }
@@ -207,21 +176,23 @@ export default function WorkloadTab() {
  * declaration or auto-flag). Mirrors the audit-trail module's success card:
  * heading, dl grid and the on-chain transaction hash in a mono block.
  */
-function ConductedOutcomeCard({ classLabel, scheduledProfessorId, log, onBack }) {
-  const meta = statusMeta(log.status);
+function ConductedOutcomeCard({ classLabel, scheduledProfessorId, outcome, log, onBack }) {
+  const meta = statusMeta(outcome);
   const substituteCovered =
-    Boolean(scheduledProfessorId) && log.conductedBy !== scheduledProfessorId;
+    Boolean(log && scheduledProfessorId) && log.conductedBy !== scheduledProfessorId;
 
   return (
     <Card>
       <div className="flex items-start gap-3">
-        <span className="text-3xl leading-none">{log.status === "UNCONDUCTED" ? "⚠️" : "✅"}</span>
+        <span className="text-3xl leading-none">{outcome === "UNCONDUCTED" ? "⚠️" : "✅"}</span>
         <div>
           <h3 className="text-xl font-bold text-ink">{classLabel}</h3>
           <p className="mt-1 text-sm leading-relaxed text-ink-muted">
-            {meta.label} — anchored on the workload ledger. Workload credited to{" "}
-            <span className="font-semibold text-ink">{professorLabel(log.conductedBy)}</span>
-            {substituteCovered ? " (substitute)" : ""}.
+            {meta.label} — anchored on the workload ledger.
+            {log ? (
+              <> Workload credited to <span className="font-semibold text-ink">{professorLabel(log.conductedBy)}</span>
+                {substituteCovered ? " (substitute)" : ""}.</>
+            ) : null}
           </p>
         </div>
       </div>
@@ -231,18 +202,22 @@ function ConductedOutcomeCard({ classLabel, scheduledProfessorId, log, onBack })
           <dt className={LABEL_CLASS}>Status</dt>
           <dd className="mt-0.5 font-semibold text-ink">{meta.label}</dd>
         </div>
-        <div>
-          <dt className={LABEL_CLASS}>Recorded</dt>
-          <dd className="mt-0.5 font-semibold text-ink">{formatDateTime(log.timestamp)}</dd>
-        </div>
+        {log ? (
+          <div>
+            <dt className={LABEL_CLASS}>Recorded · Asia/Karachi</dt>
+            <dd className="mt-0.5 font-semibold text-ink">{formatDateTime(log.timestamp)}</dd>
+          </div>
+        ) : null}
       </dl>
 
-      <div className="mt-4">
-        <p className={LABEL_CLASS}>Transaction hash</p>
-        <p className="mt-1 break-all rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink">
-          {log.onchainTxHash}
-        </p>
-      </div>
+      {log ? (
+        <div className="mt-4">
+          <p className={LABEL_CLASS}>Transaction hash</p>
+          <p className="mt-1 break-all rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink">
+            {log.onchainTxHash}
+          </p>
+        </div>
+      ) : null}
 
       <div className="mt-5">
         <Button variant="secondary" onClick={onBack}>

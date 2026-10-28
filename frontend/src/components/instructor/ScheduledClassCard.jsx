@@ -5,8 +5,6 @@ import StatusBanner from "../ui/StatusBanner.jsx";
 import ZeroAttendanceAction from "./ZeroAttendanceAction.jsx";
 import { api } from "../../lib/api.js";
 import {
-  PROFESSORS,
-  PROFESSOR_ID,
   describeWorkloadError,
   formatDateTime,
   professorLabel,
@@ -21,7 +19,7 @@ const LABEL_CLASS = "text-xs font-bold uppercase tracking-wide text-ink-muted";
  * One scheduled class of the professor's day (Module 3 — My Classes).
  *
  * States, top to bottom: the workload badge mirrors the on-chain outcome
- * (poll /faculty/logs); while a class has no SessionLog yet, the professor
+ * (poll /faculty/classes); while a class has no SessionLog yet, the professor
  * can start its live QR session, declare zero attendance (only once a
  * session they conduct is live), and issue a one-shot 30-minute substitute
  * key for the class. Once the outcome anchors on-chain, the badge replaces
@@ -29,6 +27,7 @@ const LABEL_CLASS = "text-xs font-bold uppercase tracking-wide text-ink-muted";
  */
 export default function ScheduledClassCard({
   scheduledClass,
+  facultyId,
   log,
   liveHere,
   viewerIsConductor,
@@ -38,9 +37,7 @@ export default function ScheduledClassCard({
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState(null);
   const [issueOpen, setIssueOpen] = useState(false);
-  const [issueSubstituteId, setIssueSubstituteId] = useState(
-    PROFESSORS.find((entry) => entry.id !== PROFESSOR_ID)?.id ?? PROFESSOR_ID
-  );
+  const [issueSubstituteId, setIssueSubstituteId] = useState("");
   const [issuing, setIssuing] = useState(false);
   const [issueError, setIssueError] = useState(null);
   const [issued, setIssued] = useState(null); // issue response (token + expiry)
@@ -50,8 +47,9 @@ export default function ScheduledClassCard({
   // hasn't concluded yet, a "live" chip makes the started state obvious
   // (otherwise the card would still read "Awaiting session" right after
   // Start Session).
-  const badge = log
-    ? statusMeta(log.status)
+  const outcome = log?.status || scheduledClass.outcome;
+  const badge = outcome
+    ? statusMeta(outcome)
     : liveHere
       ? viewerIsConductor
         ? { label: "Session live", chip: "bg-primary-soft text-primary-strong" }
@@ -59,7 +57,7 @@ export default function ScheduledClassCard({
       : { label: "Awaiting session", chip: "bg-surface-muted text-ink-muted" };
   // The workload credits whoever conducted the class — when that isn't the
   // scheduled professor, a substitute covered it.
-  const substituteCovered = Boolean(log?.class && log.conductedBy !== log.class.professorId);
+  const substituteCovered = Boolean(log && log.conductedBy !== facultyId);
 
   async function startSession() {
     setStarting(true);
@@ -67,7 +65,7 @@ export default function ScheduledClassCard({
     try {
       const data = await api("/faculty/session/start", {
         method: "POST",
-        body: { professor_id: PROFESSOR_ID, class_id: scheduledClass.id },
+        body: { class_id: scheduledClass.id },
       });
       onSessionStarted(data, scheduledClass);
     } catch (error) {
@@ -78,15 +76,19 @@ export default function ScheduledClassCard({
   }
 
   async function issueKey() {
+    const substituteId = Number(issueSubstituteId);
+    if (!Number.isSafeInteger(substituteId) || substituteId <= 0 || substituteId === facultyId) {
+      setIssueError({ message: "Enter another faculty member's real user ID (a positive integer)." });
+      return;
+    }
     setIssuing(true);
     setIssueError(null);
     try {
       const data = await api("/faculty/substitute/issue", {
         method: "POST",
         body: {
-          professor_id: PROFESSOR_ID,
           class_id: scheduledClass.id,
-          substitute_id: Number(issueSubstituteId),
+          substitute_id: substituteId,
         },
       });
       setIssued(data);
@@ -119,11 +121,11 @@ export default function ScheduledClassCard({
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h3 className="text-base font-bold text-ink">
-            {scheduledClass.courseId} · {scheduledClass.title}
+            {scheduledClass.courseCode}
           </h3>
           <p className="mt-1 text-xs text-ink-muted">
-            Room {scheduledClass.room} · starts {scheduledClass.start} today ·{" "}
-            {professorLabel(scheduledClass.professorId)}
+            Room {scheduledClass.room} · starts {formatDateTime(scheduledClass.startTime)} (Asia/Karachi) ·{" "}
+            {professorLabel(facultyId)}
           </p>
         </div>
         <span
@@ -133,12 +135,15 @@ export default function ScheduledClassCard({
         </span>
       </div>
 
-      {log ? (
+      {outcome ? (
         <p className="mt-3 text-xs leading-relaxed text-ink-muted">
-          Anchored on-chain {formatDateTime(log.timestamp)} · workload credited to{" "}
-          {professorLabel(log.conductedBy)}
-          {substituteCovered ? " (substitute)" : ""} · tx{" "}
-          <span className="font-mono">{shortHash(log.onchainTxHash)}</span>
+          Final outcome recorded on the workload ledger.
+          {log ? (
+            <> {formatDateTime(log.timestamp)} (Asia/Karachi) · workload credited to{" "}
+              {professorLabel(log.conductedBy)}{substituteCovered ? " (substitute)" : ""} · tx{" "}
+              <span className="font-mono">{shortHash(log.onchainTxHash)}</span>
+            </>
+          ) : null}
         </p>
       ) : (
         <>
@@ -149,7 +154,6 @@ export default function ScheduledClassCard({
 
             <ZeroAttendanceAction
               classId={scheduledClass.id}
-              conductorId={PROFESSOR_ID}
               disabled={!liveHere || !viewerIsConductor}
               disabledHint={
                 !liveHere
@@ -184,27 +188,26 @@ export default function ScheduledClassCard({
                 htmlFor={`substitute-select-${scheduledClass.id}`}
                 className={LABEL_CLASS}
               >
-                Substitute professor
+                Substitute faculty user ID
               </label>
               <div className="mt-1.5 flex flex-col gap-3 sm:flex-row">
-                <select
+                <input
                   id={`substitute-select-${scheduledClass.id}`}
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="Colleague's faculty user ID"
                   value={issueSubstituteId}
                   onChange={(event) => setIssueSubstituteId(event.target.value)}
                   disabled={issuing}
                   className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-sm text-ink focus:outline-2 focus:outline-primary disabled:opacity-60 sm:flex-1"
-                >
-                  {PROFESSORS.filter((entry) => entry.id !== PROFESSOR_ID).map((entry) => (
-                    <option key={entry.id} value={entry.id}>
-                      {professorLabel(entry.id)}
-                    </option>
-                  ))}
-                </select>
+                />
                 <Button onClick={issueKey} loading={issuing} className="sm:w-32">
                   Issue Key
                 </Button>
               </div>
               <p className="mt-2 text-xs leading-relaxed text-ink-muted">
+                No faculty directory endpoint is available: enter the colleague's actual user ID.
                 The key is a signed token valid for 30 minutes and redeemable exactly once —
                 only by the selected professor. Redeeming starts the class session with the
                 workload credited to them as substitute.
@@ -230,7 +233,7 @@ export default function ScheduledClassCard({
                 Substitute key issued — {professorLabel(issued.substitute_id)}
               </p>
               <p className="mt-0.5 text-xs leading-relaxed text-success">
-                Valid until {formatDateTime(issued.expires_at)} ({issued.expires_in_minutes}{" "}
+                Valid until {formatDateTime(issued.expires_at)} (Asia/Karachi; {issued.expires_in_minutes}{" "}
                 minutes). Give the code below to your substitute — they redeem it from their own
                 dashboard&apos;s &quot;Redeem Substitute Key&quot;.
               </p>

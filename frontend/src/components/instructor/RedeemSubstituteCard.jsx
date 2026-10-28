@@ -3,7 +3,7 @@ import Button from "../ui/Button.jsx";
 import Card from "../ui/Card.jsx";
 import StatusBanner from "../ui/StatusBanner.jsx";
 import { api } from "../../lib/api.js";
-import { PROFESSORS, describeWorkloadError, professorLabel } from "../../lib/workload.js";
+import { describeWorkloadError, professorLabel } from "../../lib/workload.js";
 
 const LABEL_CLASS = "text-xs font-bold uppercase tracking-wide text-ink-muted";
 const INPUT_CLASS =
@@ -13,17 +13,12 @@ const INPUT_CLASS =
  * "Redeem a substitute key" — the other half of the substitute flow.
  *
  * This represents a colleague logging in as themselves on their own
- * dashboard: they paste the key a professor issued them and pick who they
- * are. Redeeming starts the class's live session with the substitute as
+ * dashboard: they paste the key a professor issued to their authenticated
+ * account. Redeeming starts the class's live session with the substitute as
  * conductor, so the eventual workload entry credits them — the parent tab
  * renders the QR projector view with a "covering as substitute" banner.
  */
-export default function RedeemSubstituteCard({ onRedeemed }) {
-  // Demo stand-in for the logged-in professor; default to the substitute
-  // the mock roster usually issues keys for.
-  const [substituteId, setSubstituteId] = useState(
-    PROFESSORS.find((entry) => entry.id !== 101)?.id ?? 101
-  );
+export default function RedeemSubstituteCard({ user, onRedeemed }) {
   const [token, setToken] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null); // ApiError or { message } for validation
@@ -42,7 +37,7 @@ export default function RedeemSubstituteCard({ onRedeemed }) {
     try {
       const data = await api("/faculty/substitute/redeem", {
         method: "POST",
-        body: { token: token.trim(), substitute_id: Number(substituteId) },
+        body: { token: token.trim() },
       });
       setToken("");
       onRedeemed(data);
@@ -61,24 +56,12 @@ export default function RedeemSubstituteCard({ onRedeemed }) {
       <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
-            <label htmlFor="redeem-as" className={LABEL_CLASS}>
-              Redeeming as
-            </label>
-            <select
-              id="redeem-as"
-              value={substituteId}
-              onChange={(event) => setSubstituteId(event.target.value)}
-              disabled={submitting}
-              className={INPUT_CLASS}
-            >
-              {PROFESSORS.map((entry) => (
-                <option key={entry.id} value={entry.id}>
-                  {professorLabel(entry.id)}
-                </option>
-              ))}
-            </select>
+            <p className={LABEL_CLASS}>Redeeming as</p>
+            <p className="mt-1.5 rounded-lg border border-line bg-surface-muted px-3 py-2.5 text-sm text-ink">
+              {user.fullName || user.email} · {professorLabel(user.id)}
+            </p>
             <p className="mt-1 text-xs text-ink-muted">
-              Demo stand-in for the logged-in account — pick the professor the key was issued for.
+              Only a key issued for your logged-in account can be redeemed.
             </p>
           </div>
           <div>

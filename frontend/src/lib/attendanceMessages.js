@@ -9,6 +9,8 @@
  * small detail line, so failures stay debuggable during demos.
  */
 const MESSAGES = {
+  "schedule/too_early": "This class hasn't reached its start time yet.",
+
   // Identity verification (POST /attendance/verify-identity)
   "identity/identity_verification_failed":
     "We couldn't verify your face. Try again in better lighting — if it keeps failing, an admin has to re-enroll your face template.",

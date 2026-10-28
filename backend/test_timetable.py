@@ -25,6 +25,8 @@ for stream in (sys.stdout, sys.stderr):
 
 API = "/api/v1"
 UPLOAD = "/hod/timetable/upload"
+FACULTY_CLASSES = "/faculty/classes"
+FACULTY_CLASS_FIELDS = ("id", "courseCode", "room", "dayOfWeek", "startTime", "endTime")
 COLUMNS = (
     "course_code", "faculty_employee_id", "room", "day_of_week",
     "start_time", "end_time",
@@ -67,6 +69,18 @@ class TimetableTests:
         payload = response.get_json(silent=True)
         assert isinstance(payload, dict), (
             f"POST {path}: expected JSON object, got {response.status_code}: "
+            f"{response.get_data(as_text=True)}"
+        )
+        return response.status_code, payload
+
+    def get(self, path, persona="owner", **kwargs):
+        headers = dict(kwargs.pop("headers", {}))
+        if persona is not None:
+            headers["Authorization"] = f"Bearer {self.auth[persona]['token']}"
+        response = self.client.get(API + path, headers=headers, **kwargs)
+        payload = response.get_json(silent=True)
+        assert isinstance(payload, dict), (
+            f"GET {path}: expected JSON object, got {response.status_code}: "
             f"{response.get_data(as_text=True)}"
         )
         return response.status_code, payload
@@ -536,6 +550,95 @@ class TimetableTests:
         finally:
             self.app.config[GRACE_KEY] = 5
 
+    def faculty_classes_permissions(self):
+        before = self.class_count()
+        for persona in (None, "hod", "student", "admin"):
+            self.expect_error(
+                self.get(FACULTY_CLASSES, persona=persona),
+                401 if persona is None else 403, "auth",
+                "missing_token" if persona is None else "insufficient_role",
+            )
+            assert self.class_count() == before, "Rejected listing changed scheduled classes"
+
+    def assert_faculty_listing(self, persona, outcomes=None):
+        status, payload = self.get(FACULTY_CLASSES, persona=persona)
+        assert status == 200, f"{persona} class listing: {status}: {payload}"
+        assert isinstance(payload.get("classes"), list), payload
+        assert type(payload.get("count")) is int, payload
+        assert payload["count"] == len(payload["classes"]), payload
+        expected = []
+        with self.app.app_context():
+            owned = self.m.ScheduledClass.query.filter_by(
+                professor_id=self.auth[persona]["id"],
+            ).order_by(self.m.ScheduledClass.start_time.asc(), self.m.ScheduledClass.id.asc()).all()
+            for saved in owned:
+                serialized = saved.to_dict()
+                item = {field: serialized[field] for field in FACULTY_CLASS_FIELDS}
+                item["outcome"] = (outcomes or {}).get(saved.id)
+                expected.append(item)
+                self.assert_utc_json(item["startTime"], saved.start_time)
+                if saved.end_time is not None:
+                    self.assert_utc_json(item["endTime"], saved.end_time)
+        assert payload["classes"] == expected, f"Wrong ownership, fields, order or outcomes: {payload}"
+        starts = [datetime.fromisoformat(item["startTime"].replace("Z", "+00:00"))
+                  for item in payload["classes"]]
+        assert starts == sorted(starts), "Classes are not ordered by UTC startTime"
+        assert all(set(item) == set(FACULTY_CLASS_FIELDS) | {"outcome"}
+                   for item in payload["classes"]), payload
+        return payload
+
+    def faculty_classes_owner(self):
+        # Faculty B initially has no timetable, despite A's previous uploads.
+        assert self.get(FACULTY_CLASSES, persona="stranger") == (200, {"classes": [], "count": 0})
+        states = ("CONDUCTED", "CONDUCTED_ZERO_STUDENTS", "UNCONDUCTED", None)
+        # Upload in reverse chronological order to catch insertion-order listings.
+        rows = [self.row(f"LIST-{index}", start=f"{13 - index:02d}:00",
+                         end=f"{14 - index:02d}:00") for index in range(len(states))]
+        other = self.row("LIST-OTHER", "Monday",
+                         faculty_employee_id=self.accounts["stranger"]["employee_id"])
+        uploaded = self.assert_upload(self.upload(rows + [other]), len(rows) + 1)
+        by_code = {item["courseCode"]: item for item in uploaded["classes"]}
+        outcomes = {}
+        with self.app.app_context():
+            # Only the isolated SQLite fixture mirrors outcomes; no chain write.
+            for index, (row, outcome) in enumerate(zip(rows, states)):
+                if outcome is not None:
+                    class_id = by_code[row["course_code"]]["id"]
+                    outcomes[class_id] = outcome
+                    self.db.session.add(self.m.SessionLog(
+                        class_id=class_id, status=outcome,
+                        conducted_by=self.auth["stranger" if index == 0 else "owner"]["id"],
+                        timestamp=FIXTURE_START + timedelta(minutes=index),
+                        onchain_tx_hash=f"0x{index + 1:064x}",
+                    ))
+            self.db.session.commit()
+        for row in rows:
+            self.assert_class(by_code[row["course_code"]], row, 1)
+        payload = self.assert_faculty_listing("owner", outcomes)
+        returned = {item["id"]: item for item in payload["classes"]}
+        for row, outcome in zip(rows, states):
+            assert returned[by_code[row["course_code"]]["id"]]["outcome"] == outcome
+        assert by_code[other["course_code"]]["id"] not in returned, "A can see B's class"
+
+    def faculty_classes_other(self):
+        payload = self.assert_faculty_listing("stranger")
+        assert payload["count"] == 1, f"B should see only B's uploaded class: {payload}"
+        status, owner_payload = self.get(FACULTY_CLASSES, persona="owner")
+        assert status == 200 and owner_payload["classes"], owner_payload
+        owner_ids = {item["id"] for item in owner_payload["classes"]}
+        assert owner_ids.isdisjoint(item["id"] for item in payload["classes"]), "B can see A's classes"
+        for persona, baseline, spoof_id in (
+            ("stranger", payload, self.auth["owner"]["id"]),
+            ("owner", owner_payload, self.auth["stranger"]["id"]),
+        ):
+            for supplied in (
+                {"query_string": {"professor_id": spoof_id}},
+                {"json": {"professor_id": spoof_id}},
+            ):
+                assert self.get(FACULTY_CLASSES, persona=persona, **supplied) == (200, baseline), (
+                    "A supplied professor_id changed the authenticated faculty's class list"
+                )
+
     def cleanup(self):
         """Delete only this run's owned rows, children first; never drop tables."""
         with self.app.app_context():
@@ -567,6 +670,9 @@ class TimetableTests:
                 ).delete(synchronize_session=False)
                 self.m.SubstituteToken.query.filter(
                     self.m.SubstituteToken.class_id.in_(class_ids),
+                ).delete(synchronize_session=False)
+                self.m.SessionLog.query.filter(
+                    self.m.SessionLog.class_id.in_(class_ids),
                 ).delete(synchronize_session=False)
                 self.m.ScheduledClass.query.filter(
                     self.m.ScheduledClass.id.in_(class_ids),
@@ -624,6 +730,11 @@ def main():
             ("Uploaded local-midnight classes gate both routes at the parsed UTC instant", suite.uploaded_class_gates),
             ("Substitute redemption cannot bypass the gate or consume an early token", suite.substitute_start_gate),
             ("Changing configured grace to zero changes both route gates", suite.configurable_grace),
+            ("Faculty class listing: anonymous 401; HOD/STUDENT/ADMIN 403", suite.faculty_classes_permissions),
+            ("Faculty A sees only own classes, ordered UTC times and all final/null outcomes",
+             suite.faculty_classes_owner),
+            ("Faculty B sees none of A's classes; spoofed query/body IDs are ignored",
+             suite.faculty_classes_other),
         )
         for index, (title, action) in enumerate(steps, start=1):
             print(f"\n{index:02d}. {title}")

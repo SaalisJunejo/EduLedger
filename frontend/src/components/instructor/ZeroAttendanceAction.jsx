@@ -10,13 +10,12 @@ import { describeWorkloadError } from "../../lib/workload.js";
  * class, irreversible), so it must never fire on a stray click.
  *
  * Shared by the professor's class card and the substitute's live-session
- * view: whoever is the live conductor submits with their own id, so the
+ * view: the backend takes the live conductor's identity from the JWT, so the
  * workload credits the person actually teaching (the substitute when they
  * cover the class).
  */
 export default function ZeroAttendanceAction({
   classId,
-  conductorId,
   disabled = false,
   disabledHint = "",
   onDeclared,
@@ -31,7 +30,7 @@ export default function ZeroAttendanceAction({
     try {
       const data = await api("/faculty/session/zero-attendance", {
         method: "POST",
-        body: { professor_id: conductorId, class_id: classId },
+        body: { class_id: classId },
       });
       setConfirming(false);
       if (onDeclared) onDeclared(data);

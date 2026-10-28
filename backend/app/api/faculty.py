@@ -10,6 +10,8 @@
   short-lived signed token authorizing a named substitute for one class
 - POST /api/v1/faculty/substitute/redeem      - substitute redeems the
   token and starts the session (workload credits the substitute)
+- GET  /api/v1/faculty/classes                - the caller's scheduled
+  classes and final outcomes (faculty only)
 - GET  /api/v1/faculty/logs                   - every SessionLog entry
   (admin / history view)
 
@@ -565,6 +567,37 @@ def redeem_substitute():
         ),
         201,
     )
+
+
+@api_v1.get("/faculty/classes")
+@require_auth(roles=["FACULTY"])
+def list_faculty_classes():
+    """The authenticated faculty's dated occurrences and mirrored outcomes.
+
+    Ownership comes only from g.user_id; query-string and body IDs are ignored.
+    SessionLog rows mirror final WorkloadLedger outcomes, so no RPC is needed.
+    """
+    classes = ScheduledClass.query.filter_by(professor_id=g.user_id).order_by(
+        ScheduledClass.start_time.asc(), ScheduledClass.id.asc(),
+    ).all()
+    logs = SessionLog.query.join(
+        ScheduledClass, SessionLog.class_id == ScheduledClass.id,
+    ).filter(ScheduledClass.professor_id == g.user_id).order_by(
+        SessionLog.timestamp.desc(), SessionLog.id.desc(),
+    ).all()
+    outcomes = {}
+    for log in logs:
+        # Normally one final log per class; prefer the latest if duplicates exist.
+        outcomes.setdefault(log.class_id, log.status)
+
+    fields = ("id", "courseCode", "room", "dayOfWeek", "startTime", "endTime")
+    entries = []
+    for scheduled_class in classes:
+        serialized = scheduled_class.to_dict()
+        entry = {field: serialized[field] for field in fields}
+        entry["outcome"] = outcomes.get(scheduled_class.id)
+        entries.append(entry)
+    return jsonify({"classes": entries, "count": len(entries)})
 
 
 @api_v1.get("/faculty/logs")
