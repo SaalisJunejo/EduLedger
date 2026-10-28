@@ -19,7 +19,7 @@ The live QR deliberately reuses the Module 1 attendance session machinery
 end to end instead of duplicating it: sessions opened here are plain
 ``AttendanceSession`` rows (class_id ``workload-<id>``), so the existing
 background nonce-rotation job keeps their QRs rotating every
-NONCE_ROTATION_SECONDS and the existing GET /api/v1/session/<id>/qr
+ATTENDANCE_ROTATION_SECONDS and the existing GET /api/v1/session/<id>/qr
 projector endpoint serves them unchanged. Only the conductor bookkeeping
 (``WorkloadSession``) and the on-chain workload anchoring are new.
 
@@ -93,7 +93,7 @@ def _start_live_session(scheduled_class: ScheduledClass, conductor_id: int):
     app/api/sessions.py). Callers commit.
     """
     now = utcnow()
-    ttl_seconds = current_app.config["NONCE_ROTATION_SECONDS"]
+    ttl_seconds = current_app.config["ATTENDANCE_ROTATION_SECONDS"]
     attendance_class_id = _attendance_class_id(scheduled_class.id)
 
     for previous in AttendanceSession.query.filter_by(
@@ -196,7 +196,7 @@ def faculty_start_session():
                 "workload_session": workload_session.to_dict(),
                 "scheduled_class": scheduled_class.to_dict(),
                 "qr_poll_url": f"/api/v1/session/{attendance_session.id}/qr",
-                "rotation_seconds": current_app.config["NONCE_ROTATION_SECONDS"],
+                "rotation_seconds": current_app.config["ATTENDANCE_ROTATION_SECONDS"],
             }
         ),
         201,
@@ -562,7 +562,7 @@ def redeem_substitute():
                 "session": attendance_session.to_dict(),
                 "workload_session": workload_session.to_dict(),
                 "qr_poll_url": f"/api/v1/session/{attendance_session.id}/qr",
-                "rotation_seconds": current_app.config["NONCE_ROTATION_SECONDS"],
+                "rotation_seconds": current_app.config["ATTENDANCE_ROTATION_SECONDS"],
             }
         ),
         201,

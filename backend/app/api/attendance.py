@@ -1,9 +1,10 @@
 """Identity verification + attendance scan endpoints (Module 1).
 
 - POST /api/v1/attendance/verify-identity - face match (or WebAuthn stub) -> 30s JWT
-- POST /api/v1/attendance/scan            - the full check-in: token, nonce,
-  device, on-chain lock. Checks run in a fixed order (a) to (d) and every
-  failure response names the check that failed, for demo debugging.
+- POST /api/v1/attendance/scan            - the full check-in: token, nonce
+  (or the 6-digit numeric code), device, on-chain lock. Checks run in a
+  fixed order (a) to (d) and every failure response names the check that
+  failed, for demo debugging.
 """
 
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ from flask import current_app, g, jsonify, request
 
 from ..extensions import db
 from ..models import AttendanceSession, Student
-from ..services import blockchain
+from ..services import attendance_code, blockchain
 from ..services.auth import require_auth
 from ..services.face_embedding import (
     EmbeddingMismatchError,
@@ -134,13 +135,18 @@ def scan():
     """Full attendance check-in: validate everything, then lock on-chain.
 
     Body: ``{"verification_token": "...", "device_id": "...",
-    "session_id": 1, "nonce": "<scanned from the QR>"}``.
+    "session_id": 1, "nonce": "<scanned from the QR>"}``, or the same with
+    ``"numeric_code": "123456"`` (typed from the projector) instead of
+    ``nonce``.
 
     Validation order (each failure response names its check):
     (a) verification_token - valid, unexpired, issued for attendance, and matches
                              the authenticated student (g.user_id)
     (b) session_nonce      - session exists+active, scanned nonce matches the
-                             current rotating nonce and is unexpired
+                             current rotating nonce and is unexpired; or the
+                             numeric code matches that nonce (wrong/expired
+                             -> code_mismatch; after MAX_WRONG_CODE_ATTEMPTS
+                             wrong codes -> 429 rate_limit/too_many_attempts)
     (c) device_match       - device_id matches the student's registered device
     (d) onchain_lock       - AttendanceLedger.isLocked() is still false
 
@@ -152,6 +158,9 @@ def scan():
     device_id = body.get("device_id")
     session_id = body.get("session_id")
     nonce = body.get("nonce")
+    numeric_code = body.get("numeric_code")
+    has_nonce = nonce not in (None, "")
+    has_code = numeric_code not in (None, "")
 
     missing = [
         field
@@ -159,15 +168,22 @@ def scan():
             ("verification_token", token),
             ("device_id", device_id),
             ("session_id", session_id),
-            ("nonce", nonce),
         )
         if value in (None, "")
     ]
+    if not has_nonce and not has_code:
+        missing.append("nonce or numeric_code")
     if missing:
         return api_error(
             "request",
             "missing_fields",
             f"missing required field(s): {', '.join(missing)}",
+        )
+    if has_nonce and has_code:
+        return api_error(
+            "request",
+            "conflicting_fields",
+            "send either nonce (QR) or numeric_code, not both",
         )
 
     # -- (a) verification token ---------------------------------------------
@@ -191,7 +207,7 @@ def scan():
             403,
         )
 
-    # -- (b) session + rotating nonce -----------------------------------------
+    # -- (b) session + rotating nonce (or the code derived from it) -----------
     session = db.session.get(AttendanceSession, session_id) if isinstance(session_id, int) else None
     if session is None:
         return api_error(
@@ -204,14 +220,31 @@ def scan():
             f"session {session_id} is no longer active",
             409,
         )
-    if str(nonce) != session.current_nonce:
+    if has_code:
+        if attendance_code.too_many_attempts(student_id, session.id):
+            return api_error(
+                "rate_limit",
+                "too_many_attempts",
+                f"too many wrong codes for session {session_id} - scan the QR instead",
+                429,
+            )
+        # An expired nonce means the code shown with it has expired too.
+        if session.nonce_is_expired() or not attendance_code.code_matches(session, numeric_code):
+            attendance_code.record_wrong_attempt(student_id, session.id)
+            return api_error(
+                "session_nonce",
+                "code_mismatch",
+                "the code does not match the session's current code "
+                "(it may have rotated - read the projector again)",
+            )
+    elif str(nonce) != session.current_nonce:
         return api_error(
             "session_nonce",
             "nonce_mismatch",
             "scanned nonce does not match the session's current nonce "
             "(the QR may have rotated - rescan)",
         )
-    if session.nonce_is_expired():
+    elif session.nonce_is_expired():
         return api_error(
             "session_nonce",
             "nonce_expired",

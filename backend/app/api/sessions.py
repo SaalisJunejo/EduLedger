@@ -2,6 +2,7 @@
 
 - POST /api/v1/session/start       - instructor opens a session for a class
 - GET  /api/v1/session/<id>/qr     - projector-facing QR (rotating nonce)
+  plus the 6-digit numeric code derived from the same nonce
 
 The QR endpoint is designed to be polled every 1-2 seconds: responses carry
 `Cache-Control: no-store`, always reflect the latest nonce, and include the
@@ -17,6 +18,7 @@ from flask import current_app, g, jsonify, request
 
 from ..extensions import db
 from ..models import AttendanceSession, ScheduledClass
+from ..services.attendance_code import current_code
 from ..services.auth import require_auth
 from ..services.timetable import start_gate
 from ..util import iso_z, utcnow
@@ -37,12 +39,12 @@ def _refresh_if_stale(session: AttendanceSession) -> None:
     """Rotate the nonce inline when it expired and the scheduler hasn't yet.
 
     This is a fallback, not the primary mechanism - the background job in
-    `app/scheduler.py` rotates nonces every NONCE_ROTATION_SECONDS. Because
+    `app/scheduler.py` rotates nonces every ATTENDANCE_ROTATION_SECONDS. Because
     rotation only touches expired nonces, this lazy path can never fight the
     scheduler or skip a beat.
     """
     if session.nonce_is_expired():
-        session.rotate_nonce(ttl_seconds=current_app.config["NONCE_ROTATION_SECONDS"])
+        session.rotate_nonce(ttl_seconds=current_app.config["ATTENDANCE_ROTATION_SECONDS"])
         db.session.commit()
 
 
@@ -72,7 +74,7 @@ def start_session():
     class_id = str(scheduled_class.id)
 
     now = utcnow()
-    ttl_seconds = current_app.config["NONCE_ROTATION_SECONDS"]
+    ttl_seconds = current_app.config["ATTENDANCE_ROTATION_SECONDS"]
 
     # One live session per class: close the previous one, if any.
     previous = AttendanceSession.query.filter_by(class_id=class_id, is_active=True).all()
@@ -103,7 +105,9 @@ def session_qr(session_id):
     """Current QR code for a session, as a base64 PNG data URI.
 
     The QR encodes the compact JSON payload ``{"session_id": <id>,
-    "nonce": "<current nonce>"}``. Poll this endpoint every 1-2 seconds and
+    "nonce": "<current nonce>"}``. ``numeric_code`` is the 6-digit code for
+    the same nonce, for students who type it instead of scanning. Poll this
+    endpoint every 1-2 seconds and
     swap the ``<img src>`` to the returned ``qr_image`` to keep the projected
     QR current. Unknown sessions return 404; sessions that were replaced or
     closed return 409 so the projector can stop polling.
@@ -126,9 +130,10 @@ def session_qr(session_id):
             "session_id": session.id,
             "class_id": session.class_id,
             "current_nonce": session.current_nonce,
+            "numeric_code": current_code(session),
             "nonce_expires_at": iso_z(session.nonce_expires_at),
             "server_time": iso_z(utcnow()),
-            "rotation_seconds": current_app.config["NONCE_ROTATION_SECONDS"],
+            "rotation_seconds": current_app.config["ATTENDANCE_ROTATION_SECONDS"],
             "qr_image": _qr_png_data_uri(payload),
         }
     )

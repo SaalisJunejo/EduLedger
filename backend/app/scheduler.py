@@ -7,7 +7,7 @@ share this single scheduler instance (started once per process by
 `init_scheduler`) - the module never creates a second one.
 
 Jobs:
-- `rotate_expired_nonces` (every NONCE_ROTATION_SECONDS) - rotates the QR
+- `rotate_expired_nonces` (every ATTENDANCE_ROTATION_SECONDS) - rotates the QR
   nonce of every active attendance session whose rotation window expired.
   The job only touches expired nonces, which makes rotation idempotent
   within a window - the QR endpoint can rotate lazily as a fallback (see
@@ -49,7 +49,7 @@ def rotate_expired_nonces(app) -> int:
     with app.app_context():
         try:
             now = utcnow()
-            ttl_seconds = app.config["NONCE_ROTATION_SECONDS"]
+            ttl_seconds = app.config["ATTENDANCE_ROTATION_SECONDS"]
             expired = (
                 AttendanceSession.query.filter(
                     AttendanceSession.is_active.is_(True),
@@ -153,7 +153,7 @@ def init_scheduler(app) -> BackgroundScheduler | None:
     scheduler.add_job(
         rotate_expired_nonces,
         trigger="interval",
-        seconds=app.config["NONCE_ROTATION_SECONDS"],
+        seconds=app.config["ATTENDANCE_ROTATION_SECONDS"],
         args=[app],
         id=ROTATION_JOB_ID,
         max_instances=1,
@@ -177,7 +177,7 @@ def init_scheduler(app) -> BackgroundScheduler | None:
     logger.info(
         "Background jobs started: attendance nonce rotation (every %ss), "
         "un-conducted auto-flag (every 60s, threshold %s min)",
-        app.config["NONCE_ROTATION_SECONDS"],
+        app.config["ATTENDANCE_ROTATION_SECONDS"],
         app.config["UNCONDUCTED_THRESHOLD_MINUTES"],
     )
     return scheduler

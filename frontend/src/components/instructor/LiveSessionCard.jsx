@@ -19,8 +19,8 @@ function formatTime(iso) {
 
 /**
  * Projector view for one live session: polls the rotating QR endpoint every
- * 2 seconds, shows a countdown to the next nonce rotation, and lets the
- * instructor end the view.
+ * 2 seconds, shows the 6-digit numeric code derived from the same nonce, a
+ * countdown to the next rotation, and lets the instructor end the view.
  */
 export default function LiveSessionCard({ session, onEnded }) {
   const [qr, setQr] = useState(null);
@@ -74,7 +74,7 @@ export default function LiveSessionCard({ session, onEnded }) {
     return () => clearInterval(timer);
   }, []);
 
-  const rotation = qr ? qr.rotation_seconds : session.rotation_seconds || 5;
+  const rotation = qr ? qr.rotation_seconds : session.rotation_seconds || 10;
   const secondsLeft = qr
     ? Math.max(0, (Date.parse(qr.nonce_expires_at) - (now + clockOffsetRef.current)) / 1000)
     : rotation;
@@ -110,16 +110,29 @@ export default function LiveSessionCard({ session, onEnded }) {
 
       {qr ? (
         <div className="mt-5">
-          <div className="rounded-xl border border-line bg-white p-4">
+          <div className="grid items-center gap-4 rounded-xl border border-line bg-white p-4 sm:grid-cols-[minmax(0,1fr)_auto]">
             <img
               src={qr.qr_image}
               alt="Live attendance QR code"
               className="mx-auto w-full max-w-[420px] [image-rendering:pixelated]"
             />
+            {qr.numeric_code ? (
+              <div className="text-center sm:px-4">
+                <p className="text-xs font-bold uppercase tracking-wide text-ink-muted">
+                  Or enter code
+                </p>
+                <p
+                  className="mt-1 font-mono text-5xl font-bold tracking-widest text-ink tabular-nums sm:text-6xl"
+                  aria-live="polite"
+                >
+                  {qr.numeric_code.slice(0, 3)} {qr.numeric_code.slice(3)}
+                </p>
+              </div>
+            ) : null}
           </div>
           <div className="mt-3">
             <div className="flex items-center justify-between text-xs font-medium text-ink-muted">
-              <span>Rotating nonce — new code every {rotation}s</span>
+              <span>Rotating nonce and code — new every {rotation}s</span>
               <span className={secondsLeft < 1.5 ? "font-bold text-warning" : ""}>
                 next code in {secondsLeft.toFixed(1)}s
               </span>

@@ -86,6 +86,10 @@ def test_qr_rotation():
     assert session_id is not None, "No session ID returned in response!"
     print(f"Active session ID created: {session_id}")
 
+    rotation = session_data.get("rotation_seconds")
+    assert isinstance(rotation, int) and rotation > 0, f"bad rotation_seconds: {session_data}"
+    print(f"Rotation window: {rotation}s")
+
     def get_qr():
         response = requests.get(f"{BASE_URL}/session/{session_id}/qr", headers=headers)
         assert response.status_code == 200, f"Failed GET /qr: {response.text}"
@@ -109,19 +113,19 @@ def test_qr_rotation():
     print("Poll 2 Nonce:", nonce2)
 
     assert nonce1 == nonce2, (
-        f"❌ FAILED: Nonce changed within same 5s window!\n"
+        f"❌ FAILED: Nonce changed within same {rotation}s window!\n"
         f"Poll 1: {nonce1}\n"
         f"Poll 2: {nonce2}"
     )
-    print("✅ PASSED: Nonce remained identical within 5-second window.")
+    print(f"✅ PASSED: Nonce remained identical within {rotation}-second window.")
 
-    print("\n--- 5. Waiting 5.5 seconds (Poll 3 - Next Window) ---")
-    time.sleep(5.5)
+    print(f"\n--- 5. Waiting {rotation + 0.5} seconds (Poll 3 - Next Window) ---")
+    time.sleep(rotation + 0.5)
     qr3 = get_qr()
     nonce3 = qr3.get("current_nonce") or qr3.get("nonce")
     print("Poll 3 Nonce:", nonce3)
 
-    assert nonce1 != nonce3, "❌ FAILED: Nonce did NOT rotate after 5+ seconds!"
+    assert nonce1 != nonce3, f"❌ FAILED: Nonce did NOT rotate after {rotation}+ seconds!"
     print("✅ PASSED: Nonce successfully rotated across windows.")
 
 

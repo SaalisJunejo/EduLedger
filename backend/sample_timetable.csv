@@ -2,3 +2,4 @@ course_code,faculty_employee_id,room,day_of_week,start_time,end_time
 BSCS-401,EMP-WORKLOAD-DEMO,A-101,Monday,09:00,10:00
 BSCS-402,EMP-WORKLOAD-SUB,B-204,Tuesday,10:00,11:00
 MSCS-501,EMP-WORKLOAD-OVERDUE,D-202,Wednesday,11:00,12:00
+MSCS-502,EMP-WORKLOAD-DEMO,C-101,Thursday,00:00,01:00

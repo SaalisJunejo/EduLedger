@@ -37,8 +37,11 @@ class AttendanceSession(db.Model):
     nonce_expires_at = db.Column(db.DateTime, nullable=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
 
-    def rotate_nonce(self, now=None, ttl_seconds: int = 5) -> None:
-        """Replace the nonce and extend its expiry by `ttl_seconds`."""
+    def rotate_nonce(self, now=None, *, ttl_seconds: int) -> None:
+        """Replace the nonce and extend its expiry by `ttl_seconds`.
+
+        Callers pass ATTENDANCE_ROTATION_SECONDS; there is no built-in default.
+        """
         now = now or utcnow()
         self.current_nonce = generate_nonce(now.timestamp())
         self.nonce_expires_at = now + timedelta(seconds=ttl_seconds)

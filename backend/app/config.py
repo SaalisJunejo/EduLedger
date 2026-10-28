@@ -32,8 +32,9 @@ class BaseConfig:
     DB_URL = os.getenv("DB_URL", "sqlite:///eduledger.db")
 
     # -- Attendance sessions -------------------------------------------------
-    # How often the background job rotates the QR nonce of active sessions.
-    NONCE_ROTATION_SECONDS = int(os.getenv("NONCE_ROTATION_SECONDS", "5"))
+    # Rotation window of the QR nonce (and the numeric code derived from it)
+    # of active sessions; the background job runs on the same interval.
+    ATTENDANCE_ROTATION_SECONDS = int(os.getenv("ATTENDANCE_ROTATION_SECONDS", "10"))
     SESSION_START_GRACE_MINUTES = int(os.getenv("SESSION_START_GRACE_MINUTES", "5"))
     TIMETABLE_TIMEZONE = os.getenv("TIMETABLE_TIMEZONE", "Asia/Karachi")
     # Set to false to skip starting the background scheduler (tests, scripts).

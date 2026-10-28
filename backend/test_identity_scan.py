@@ -61,7 +61,7 @@ AUTH = {
     "faculty_token": None,
     "student_token": None,
 }
-STATE = {"session_id": None, "token": None}
+STATE = {"session_id": None, "token": None, "rotation_seconds": None}
 
 
 # --------------------------------------------------------------------------
@@ -333,6 +333,9 @@ def step_start_session():
     session = payload["session"]
     assert session["is_active"] is True, f"new session is not active: {session}"
     STATE["session_id"] = session["id"]
+    rotation = payload.get("rotation_seconds")
+    assert isinstance(rotation, int) and rotation > 0, f"bad rotation_seconds: {payload}"
+    STATE["rotation_seconds"] = rotation
     print(
         f"   session={session['id']} class={session['class_id']!r} "
         f"rotation={payload['rotation_seconds']}s qr_poll_url={payload['qr_poll_url']}"
@@ -375,7 +378,7 @@ def step_aged_nonce_blocked():
     token = verification_token()
     aged = fresh_nonce()
     print(f"   captured nonce {aged[:22]}... - waiting out the rotation window")
-    time.sleep(6)  # NONCE_ROTATION_SECONDS is 5
+    time.sleep(STATE["rotation_seconds"] + 1)  # rotation window from session/start
     status, payload = scan(token, VALID_DEVICE, aged)
     assert status == 400, f"aged nonce must be rejected with 400, got {status}: {payload}"
     assert payload.get("check") == "session_nonce", f"unexpected check: {payload}"
