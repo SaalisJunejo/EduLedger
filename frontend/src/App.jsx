@@ -9,7 +9,9 @@ import StudentPage from './pages/StudentPage';
 import InstructorPage from './pages/InstructorPage';
 import HodPage from './pages/HodPage';
 import AdminPage from './pages/AdminPage';
-import LoginPage from './pages/LoginPage';  
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+import SetupPage from './pages/SetupPage';
 
 function ProtectedRoutes() {
   const navigate = useNavigate();
@@ -78,6 +80,11 @@ function App() {
     <Routes>
       <Route path="/" element={<Navigate to="/login" replace />} />
       <Route path="/login" element={<LoginPage />} />
+      {/* Public, outside the route guard: nobody holds a token before these run. */}
+      <Route path="/register/hod" element={<RegisterPage role="hod" />} />
+      <Route path="/register/faculty" element={<RegisterPage role="faculty" />} />
+      <Route path="/register/student" element={<RegisterPage role="student" />} />
+      <Route path="/setup" element={<SetupPage />} />
       <Route element={<ProtectedRoutes />}>
         <Route path="/student" element={<RoleRoute role="STUDENT"><StudentPage /></RoleRoute>} />
         <Route path="/instructor" element={<RoleRoute role="FACULTY"><InstructorPage /></RoleRoute>} />
