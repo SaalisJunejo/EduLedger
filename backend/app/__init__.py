@@ -16,7 +16,7 @@ from flask import Flask
 from flask_cors import CORS
 
 from .config import CONFIG_BY_NAME
-from .extensions import db
+from .extensions import db, socketio
 
 __version__ = "0.1.0"
 
@@ -53,6 +53,18 @@ def create_app(config_name: str | None = None) -> Flask:
     from .api import api_v1
 
     app.register_blueprint(api_v1)
+
+    # -- WebSocket (live attendance, Phase 1.2a) ----------------------------
+    # The Redis message queue lets several server processes share the
+    # session rooms; with REDIS_URL empty, events stay process-local.
+    socketio.init_app(
+        app,
+        message_queue=app.config.get("REDIS_URL") or None,
+        cors_allowed_origins=app.config["CORS_ORIGINS"],
+    )
+
+    # Imported for its side effect: the @socketio.on handlers register here.
+    from . import sockets  # noqa: F401
 
     # -- Background jobs ----------------------------------------------------
     # Rotates attendance QR nonces for active sessions (see app/scheduler.py).

@@ -125,7 +125,7 @@ export default function InstructorPage() {
           <StatusBanner tone={endedNote.reason === "closed" ? "warning" : "info"} title="Session ended">
             {endedNote.reason === "closed"
               ? "This session was closed or replaced on the backend — the QR feed stopped. Start a new session to project a fresh code."
-              : "Session closed on this projector. The backend has no end-session endpoint yet, so the session stays live server-side until a new one starts for the same class."}
+              : "This session is closed on the backend — rotation stopped and later scans are rejected. Attendance already locked on-chain is unaffected. Start a new session to project a fresh code."}
           </StatusBanner>
         ) : null}
 

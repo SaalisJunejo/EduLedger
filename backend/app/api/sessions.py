@@ -1,8 +1,12 @@
 """Attendance session endpoints (Module 1 - Zero-Proxy Attendance Engine).
 
-- POST /api/v1/session/start       - instructor opens a session for a class
-- GET  /api/v1/session/<id>/qr     - projector-facing QR (rotating nonce)
+- POST /api/v1/session/start            - instructor opens a session for a class
+- GET  /api/v1/session/<id>/qr          - projector-facing QR (rotating nonce)
   plus the 6-digit numeric code derived from the same nonce
+- POST /api/v1/session/<id>/end         - the conductor closes the session
+  (no more scans, no more rotation) and the live panel is told
+- GET  /api/v1/session/<id>/attendees   - the roster so far, for page load
+  and socket reconnect (conductor, HOD or ADMIN)
 
 The QR endpoint is designed to be polled every 1-2 seconds: responses carry
 `Cache-Control: no-store`, always reflect the latest nonce, and include the
@@ -21,6 +25,8 @@ from ..models import AttendanceSession, ScheduledClass
 from ..services.attendance_code import current_code
 from ..services.auth import require_auth
 from ..services.timetable import start_gate
+from ..services import live_attendance
+from ..sockets import emit_session_ended
 from ..util import iso_z, utcnow
 from . import api_v1
 from .errors import api_error
@@ -141,3 +147,73 @@ def session_qr(session_id):
     # nonce that is live *right now*.
     response.headers["Cache-Control"] = "no-store, max-age=0"
     return response
+
+
+@api_v1.post("/session/<int:session_id>/end")
+@require_auth(roles=["FACULTY"])
+def end_session(session_id):
+    """Close a live session: no more scans, no more nonce rotation.
+
+    Only the conductor may end their own session (the substitute, when one
+    redeemed a token for the class). Clearing `is_active` is what stops the
+    rotation - both the background job and the lazy QR refresh only touch
+    active sessions - and `ended_at` makes the closure deliberate, so later
+    scans fail with {check: "session", error: "session_ended"} instead of
+    the generic "session_inactive". Idempotent: ending twice is a no-op.
+    """
+    session = db.session.get(AttendanceSession, session_id)
+    if session is None:
+        return api_error("session", "session_not_found", f"session {session_id} does not exist", 404)
+    if live_attendance.conductor_id(session) != g.user_id:
+        return api_error(
+            "conductor",
+            "not_session_conductor",
+            f"session {session_id} is not conducted by the authenticated faculty",
+            403,
+        )
+
+    if session.ended_at is None:
+        session.end()
+        db.session.commit()
+
+    count = live_attendance.check_in_count(session.id)
+    emit_session_ended(session.id, count)
+
+    return jsonify(
+        {
+            "session": session.to_dict(),
+            "count": count,
+            "ended_at": iso_z(session.ended_at),
+        }
+    )
+
+
+@api_v1.get("/session/<int:session_id>/attendees")
+@require_auth(roles=["FACULTY", "HOD", "ADMIN"])
+def session_attendees(session_id):
+    """Everyone who has checked in to a session, oldest first.
+
+    The live panel calls this on page load and after a socket reconnect; the
+    entries carry the same fields as the "student_checked_in" event. Faculty
+    see only the sessions they conduct; HOD and ADMIN observe any session.
+    """
+    session = db.session.get(AttendanceSession, session_id)
+    if session is None:
+        return api_error("session", "session_not_found", f"session {session_id} does not exist", 404)
+    if g.role == "FACULTY" and live_attendance.conductor_id(session) != g.user_id:
+        return api_error(
+            "conductor",
+            "not_session_conductor",
+            f"session {session_id} is not conducted by the authenticated faculty",
+            403,
+        )
+
+    attendees = live_attendance.attendees(session.id)
+    return jsonify(
+        {
+            "session_id": session.id,
+            "is_active": session.is_active,
+            "count": len(attendees),
+            "attendees": attendees,
+        }
+    )

@@ -13,7 +13,7 @@ from flask import current_app, g, jsonify, request
 
 from ..extensions import db
 from ..models import AttendanceSession, Student
-from ..services import attendance_code, blockchain
+from ..services import attendance_code, blockchain, live_attendance
 from ..services.auth import require_auth
 from ..services.face_embedding import (
     EmbeddingMismatchError,
@@ -23,6 +23,7 @@ from ..services.face_embedding import (
 )
 from ..services.verification_token import VerificationTokenError, mint, verify
 from ..services.webauthn import WebAuthnError, verify_assertion
+from ..sockets import emit_checked_in
 from .errors import api_error
 from . import api_v1
 
@@ -146,12 +147,16 @@ def scan():
                              current rotating nonce and is unexpired; or the
                              numeric code matches that nonce (wrong/expired
                              -> code_mismatch; after MAX_WRONG_CODE_ATTEMPTS
-                             wrong codes -> 429 rate_limit/too_many_attempts)
+                             wrong codes -> 429 rate_limit/too_many_attempts).
+                             A session the conductor ended fails earlier, as
+                             {check: "session", error: "session_ended"}
     (c) device_match       - device_id matches the student's registered device
     (d) onchain_lock       - AttendanceLedger.isLocked() is still false
 
     If everything passes, AttendanceLedger.lockAttendance() is sent from the
-    backend signer and the response carries the transaction hash.
+    backend signer and the response carries the transaction hash. The
+    check-in is then mirrored locally and pushed to the instructor's live
+    panel over the session room (Phase 1.2a).
     """
     body = request.get_json(silent=True) or {}
     token = body.get("verification_token")
@@ -212,6 +217,13 @@ def scan():
     if session is None:
         return api_error(
             "session_nonce", "session_not_found", f"session {session_id} does not exist", 404
+        )
+    if session.ended_at is not None:
+        return api_error(
+            "session",
+            "session_ended",
+            f"session {session_id} was ended by the instructor",
+            409,
         )
     if not session.is_active:
         return api_error(
@@ -289,6 +301,28 @@ def scan():
     except blockchain.BlockchainError as exc:
         status = 409 if exc.code == "attendance_already_locked" else 502
         return api_error("onchain_lock", exc.code, exc.message, status)
+
+    # Mirror the lock locally and push it to the instructor's live panel.
+    # Attendance is already anchored on-chain at this point, so neither step
+    # may break (or slow down) the response - the emit helper never raises
+    # and a failed mirror write is logged and dropped.
+    try:
+        check_in = live_attendance.record_check_in(
+            session.id, student_id, result["transaction_hash"]
+        )
+        emit_checked_in(
+            session.id,
+            live_attendance.check_in_payload(
+                check_in, live_attendance.check_in_count(session.id)
+            ),
+        )
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception(
+            "live attendance mirror failed for student %s in session %s",
+            student_id,
+            session_id,
+        )
 
     return jsonify(
         {

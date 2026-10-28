@@ -4,6 +4,11 @@ One row per live class session. The rotating `current_nonce` is the
 projector-side secret: the QR code encodes it together with the session id,
 and the background job in `app/scheduler.py` replaces it every few seconds so
 a screenshot of the QR cannot be replayed later.
+
+`AttendanceCheckIn` is the local mirror of the on-chain locks of a session -
+written after AttendanceLedger.lockAttendance() succeeds (chain first, then
+the DB, like every other module). It is what lets the live panel show a
+running roster without replaying chain events (Phase 1.2a).
 """
 
 import secrets
@@ -36,6 +41,19 @@ class AttendanceSession(db.Model):
     current_nonce = db.Column(db.String(128), nullable=False)
     nonce_expires_at = db.Column(db.DateTime, nullable=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
+    # Set only when the conductor explicitly ended the session (Phase 1.2a).
+    # Sessions deactivated because a newer one replaced them keep it null, so
+    # the two cases stay distinguishable to /attendance/scan.
+    ended_at = db.Column(db.DateTime, nullable=True)
+
+    def end(self, now=None) -> None:
+        """Close the session for good: no more scans, no more rotation.
+
+        The rotation job and the lazy QR refresh both skip inactive
+        sessions, so clearing `is_active` is what stops the nonce.
+        """
+        self.is_active = False
+        self.ended_at = now or utcnow()
 
     def rotate_nonce(self, now=None, *, ttl_seconds: int) -> None:
         """Replace the nonce and extend its expiry by `ttl_seconds`.
@@ -59,4 +77,51 @@ class AttendanceSession(db.Model):
             "current_nonce": self.current_nonce,
             "nonce_expires_at": iso_z(self.nonce_expires_at),
             "is_active": self.is_active,
+            "ended_at": iso_z(self.ended_at) if self.ended_at else None,
+        }
+
+
+class AttendanceCheckIn(db.Model):
+    """One student's successful, on-chain-locked check-in to a session."""
+
+    __tablename__ = "attendance_check_ins"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # ON DELETE CASCADE so deleting a session (what the test scripts do when
+    # they clean up after themselves) takes its mirrored check-ins with it.
+    session_id = db.Column(
+        db.Integer,
+        db.ForeignKey(
+            "attendance_sessions.id",
+            name="fk_attendance_check_ins_session",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    # Student.id == User.id by convention (no FK), like everywhere else.
+    student_id = db.Column(db.Integer, nullable=False, index=True)
+
+    checked_in_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+    # Hash of the AttendanceLedger.lockAttendance() transaction that is the
+    # real record; this row is only the fast local view of it.
+    onchain_tx_hash = db.Column(db.String(66), nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "session_id", "student_id", name="uq_attendance_check_ins_session_student"
+        ),
+    )
+
+    def to_dict(self) -> dict:
+        """JSON-friendly view of the check-in."""
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "student_id": self.student_id,
+            "checked_in_at": iso_z(self.checked_in_at),
+            "onchain_tx_hash": self.onchain_tx_hash,
         }

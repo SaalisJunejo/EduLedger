@@ -1,4 +1,5 @@
 import { api } from "./api.js";
+import { disconnectSocket } from "./socket.js";
 
 const TOKEN_KEY = "eduledger.auth_token";
 const ROLE_PATHS = new Map([
@@ -32,6 +33,9 @@ function storeToken(token) {
 }
 
 export function logout() {
+  // The live attendance socket authenticates with this token — drop it
+  // with the session instead of leaving an authenticated socket open.
+  disconnectSocket();
   sessionToken = null;
   try {
     window.localStorage.removeItem(TOKEN_KEY);

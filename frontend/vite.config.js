@@ -14,6 +14,13 @@ export default defineConfig({
         target: "http://localhost:5000",
         changeOrigin: true,
       },
+      // Live attendance Socket.IO (phase 1.2b). ws:true upgrades the
+      // handshake, so the panel talks WebSocket same-origin in dev.
+      "/socket.io": {
+        target: "http://127.0.0.1:5000",
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
 });

@@ -20,3 +20,12 @@ argon2-cffi>=23.1.0
 # Timetable XLSX ingestion and IANA timezone data on Windows
 openpyxl>=3.1,<4.0
 tzdata>=2024.1
+# Live attendance WebSocket (Phase 1.2a). async_mode="threading" on purpose:
+# simple-websocket serves the WS transport, so no eventlet/gevent monkey
+# patching (which would break psycopg2, web3 and APScheduler).
+flask-socketio>=5.3,<6.0
+simple-websocket>=1.0,<2.0
+# Redis: SocketIO message queue + wrong-code attempt counters
+redis>=5.0,<7.0
+# Socket.IO client - used by backend/test_socket.py
+python-socketio[client]>=5.11,<6.0

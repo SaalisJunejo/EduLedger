@@ -92,7 +92,7 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
         <StatusBanner tone={endedNote.reason === "closed" ? "warning" : "info"} title="Session ended">
           {endedNote.reason === "closed"
             ? "This session was closed or replaced on the backend — the QR feed stopped. A substitute redeeming a key for this class replaces the live session; start a new one to project a fresh code."
-            : "Session closed on this projector. The class stays live server-side — a student scan or zero-attendance declaration can still conclude it, or start a new session for the same class."}
+            : "The attendance session is closed on the backend — no more check-ins. The class itself still needs its outcome: a student scan already locked counts, otherwise declare zero attendance or start a new session for the same class."}
         </StatusBanner>
       ) : null}
 

@@ -9,4 +9,6 @@ Modules:
 - `workload`           - WorkloadLedger on-chain client (web3, backend signer)
 - `substitute_token`   - short-lived substitute authorization JWTs
 - `ipfs`               - evidence upload to IPFS (local daemon + Web3.Storage)
+- `attendance_code`    - rolling 6-digit attendance code + brute-force guard
+- `live_attendance`    - live check-in roster and session conductor lookup
 """

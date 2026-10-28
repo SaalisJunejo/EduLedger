@@ -12,11 +12,12 @@ from .auth import (
     UserRole,
 )
 from .proposal import Proposal
-from .session import AttendanceSession, generate_nonce
+from .session import AttendanceCheckIn, AttendanceSession, generate_nonce
 from .student import Student
 from .workload import ScheduledClass, SessionLog, SubstituteToken, WorkloadSession
 
 __all__ = [
+    "AttendanceCheckIn",
     "AttendanceSession",
     "FacultyProfile",
     "InstitutionWhitelist",

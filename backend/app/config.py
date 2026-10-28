@@ -31,6 +31,13 @@ class BaseConfig:
     # -- Database ----------------------------------------------------------
     DB_URL = os.getenv("DB_URL", "sqlite:///eduledger.db")
 
+    # -- Redis (Phase 1.2a) --------------------------------------------------
+    # Backs the SocketIO message queue (so live attendance events survive
+    # more than one server process) and the wrong-code attempt counters.
+    # Both degrade gracefully when Redis is down: events stay process-local
+    # and the counter falls back to process memory.
+    REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+
     # -- Attendance sessions -------------------------------------------------
     # Rotation window of the QR nonce (and the numeric code derived from it)
     # of active sessions; the background job runs on the same interval.

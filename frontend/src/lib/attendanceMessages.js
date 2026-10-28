@@ -39,6 +39,14 @@ const MESSAGES = {
   "session_nonce/session_inactive":
     "This attendance session has ended — a newer one may have started. Scan the latest QR.",
 
+  // Session lifecycle — check "session" (ended by the conductor, phase 1.2)
+  "session/session_ended":
+    "Your instructor ended this session — check-ins are closed. Ask them to start a new one.",
+  "session/session_not_found":
+    "This attendance session doesn't exist (anymore) on the backend.",
+  "conductor/not_session_conductor":
+    "You're not the conductor of this session — only the colleague conducting it (or a redeemed substitute) can end it or read its attendees.",
+
   // Device binding (check c)
   "device_match/device_mismatch":
     "This device doesn't match the device registered for you. If you changed devices, an admin has to rebind it.",
