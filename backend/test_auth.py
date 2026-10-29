@@ -7,15 +7,21 @@ Tests the full auth lifecycle against the live running server:
 - Login: valid credentials for HOD, Faculty, Student; wrong password and unknown email rejection.
 - /auth/me: missing token, malformed token, expired token, valid profile returns for all roles.
 - require_auth(roles=[...]): blocking wrong-role tokens with 403 and allowing matching role.
+- Profile metadata (Phase 1.6, D7): registrations return an IPFS CID, /auth/me repeats it,
+  and the pinned document carries the name but never the email.
 
 Every run uses unique IDs and emails (random suffix). Cleanup removes only rows
 created during the run and preserves pre-seeded demo whitelist entries.
 
 Run against a live stack (from backend/):
     .\\venv\\Scripts\\python.exe test_auth.py
+
+The profile-metadata steps also need the local IPFS daemon (`ipfs daemon`),
+since they read the pinned document back through the Kubo RPC.
 """
 
 import os
+import re
 import secrets
 import sys
 import time
@@ -62,6 +68,16 @@ TOKENS = {
     "student": None,
 }
 
+# IPFS CIDs of the profile metadata pinned at registration (Phase 1.6, D7).
+PROFILE_CIDS = {
+    "hod": None,
+    "faculty": None,
+    "student": None,
+}
+
+# CIDv0 (Qm..., base58) or CIDv1 (b..., base32) - guards the `ipfs cat` call.
+CID_PATTERN = re.compile(r"[A-Za-z0-9]{46,120}")
+
 # Local app instance for DB operations & role gate unit verification.
 db_app = create_app()
 
@@ -87,6 +103,19 @@ def api(method: str, path: str, **kwargs) -> tuple[int, dict]:
     except ValueError:
         payload = {"raw_body": response.text}
     return response.status_code, payload
+
+
+def ipfs_cat(cid: str) -> str:
+    """Read a pinned document back from the local IPFS daemon (`ipfs cat`)."""
+    url = f"{db_app.config['IPFS_API_URL']}/api/v0/cat"
+    try:
+        response = requests.post(url, params={"arg": cid}, timeout=20)
+    except requests.RequestException as exc:
+        raise AssertionError(f"IPFS daemon unreachable at {url} ({exc}) - start `ipfs daemon`")
+    assert response.status_code == 200, (
+        f"ipfs cat {cid} returned {response.status_code}: {response.text[:200]}"
+    )
+    return response.text
 
 
 def cleanup() -> None:
@@ -170,6 +199,7 @@ def step_hod_whitelisted_accepted():
     assert status == 201, f"Expected 201 for whitelisted HOD, got {status}: {payload}"
     assert payload.get("user", {}).get("role") == "HOD", f"Expected role HOD: {payload}"
     assert payload.get("user", {}).get("email") == HOD_EMAIL, f"Email mismatch: {payload}"
+    PROFILE_CIDS["hod"] = payload.get("profile_cid")
 
 
 def step_hod_duplicate_rejected():
@@ -220,6 +250,7 @@ def step_faculty_valid_accepted():
     assert status == 201, f"Expected 201 for valid faculty, got {status}: {payload}"
     assert payload.get("user", {}).get("role") == "FACULTY", f"Role mismatch: {payload}"
     assert payload.get("profile", {}).get("employeeId") == FACULTY_EMP_ID, f"Profile mismatch: {payload}"
+    PROFILE_CIDS["faculty"] = payload.get("profile_cid")
 
 
 def step_faculty_duplicate_emp_id_rejected():
@@ -288,6 +319,7 @@ def step_student_valid_accepted():
     assert status == 201, f"Expected 201 for valid student, got {status}: {payload}"
     assert payload.get("user", {}).get("role") == "STUDENT", f"Role mismatch: {payload}"
     assert payload.get("profile", {}).get("rollNumber") == STUDENT_ROLL, f"Roll mismatch: {payload}"
+    PROFILE_CIDS["student"] = payload.get("profile_cid")
 
 
 def step_student_duplicate_roll_rejected():
@@ -455,6 +487,45 @@ def step_me_student_success():
     assert payload.get("profile", {}).get("rollNumber") == STUDENT_ROLL, f"Profile mismatch: {payload}"
 
 
+def step_registration_returns_profile_cid():
+    for role in ("hod", "faculty", "student"):
+        cid = PROFILE_CIDS[role]
+        assert cid, f"Registration response for {role} carried no profile_cid: {PROFILE_CIDS}"
+        assert CID_PATTERN.fullmatch(cid), f"profile_cid for {role} is not a CID: {cid!r}"
+
+    # /auth/me must echo the very same CID that registration returned.
+    for role in ("hod", "faculty", "student"):
+        status, payload = api(
+            "GET",
+            "/auth/me",
+            headers={"Authorization": f"Bearer {TOKENS[role]}"},
+        )
+        assert status == 200, f"Expected 200 for {role} /auth/me, got {status}: {payload}"
+        assert payload.get("profile_cid") == PROFILE_CIDS[role], (
+            f"/auth/me profile_cid mismatch for {role}: {payload}"
+        )
+
+
+def step_profile_metadata_has_name_without_email():
+    cases = (
+        ("hod", f"Dr. HOD {RUN_ID}", HOD_EMAIL, HOD_PASS, HOD_EMP_ID),
+        ("faculty", f"Prof. Faculty {RUN_ID}", FACULTY_EMAIL, FACULTY_PASS, FACULTY_EMP_ID),
+        ("student", f"Student {RUN_ID}", STUDENT_EMAIL, STUDENT_PASS, STUDENT_ROLL),
+    )
+    for role, full_name, email, password, identifier in cases:
+        document = ipfs_cat(PROFILE_CIDS[role])
+        assert full_name in document, f"{role} profile document lacks the name: {document}"
+        assert identifier in document, f"{role} profile document lacks its identifier: {document}"
+        assert email not in document, f"{role} profile document leaks the email: {document}"
+        assert password not in document, f"{role} profile document leaks the password: {document}"
+        assert "password" not in document.lower(), (
+            f"{role} profile document mentions a password field: {document}"
+        )
+        assert "email" not in document.lower(), (
+            f"{role} profile document mentions an email field: {document}"
+        )
+
+
 def step_require_auth_student_blocked():
     resp = role_gate_client.get(
         "/hod-only",
@@ -508,6 +579,8 @@ STEPS = [
     ("/auth/me: valid HOD token returns user info (200)", step_me_hod_success),
     ("/auth/me: valid Faculty token returns user + profile (200)", step_me_faculty_success),
     ("/auth/me: valid Student token returns user + profile (200)", step_me_student_success),
+    ("IPFS profile: registration + /auth/me return a profile_cid", step_registration_returns_profile_cid),
+    ("IPFS profile: pinned document has the name, never the email", step_profile_metadata_has_name_without_email),
     ("require_auth(roles): wrong-role STUDENT blocked (403)", step_require_auth_student_blocked),
     ("require_auth(roles): wrong-role FACULTY blocked (403)", step_require_auth_faculty_blocked),
     ("require_auth(roles): matching-role HOD accepted (200)", step_require_auth_hod_accepted),

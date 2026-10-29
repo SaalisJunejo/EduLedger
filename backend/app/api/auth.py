@@ -5,12 +5,19 @@
 - POST /api/v1/auth/register/student - registers a student (domain + roll_number uniqueness)
 - POST /api/v1/auth/login            - logs in with email + password, issues an 8-hour JWT
 - GET  /api/v1/auth/me               - returns the current user profile (requires JWT)
+
+Every successful registration pins a non-sensitive profile document to IPFS
+(Phase 1.6, decision D7) and stores its CID in ``profile_cid`` - on the role
+profile for faculty and students, on the User row for an HOD (no profile
+row exists). A pin failure never fails the registration: the CID stays null
+and ``backfill_profile_cids.py`` fills it in later.
 """
 
 import time
 
 import jwt
 from flask import current_app, g, jsonify, request
+from sqlalchemy.exc import SQLAlchemyError
 
 from ..extensions import db
 from ..models import (
@@ -20,6 +27,7 @@ from ..models import (
     User,
     UserRole,
 )
+from ..services import profile_metadata
 from ..services.auth import hash_password, require_auth, verify_password
 from . import api_v1
 from .errors import api_error
@@ -37,6 +45,31 @@ def _validate_institution_email(email: str) -> tuple[bool, str]:
     return False, domain
 
 
+def _store_profile_cid(user: User, profile, document: dict) -> str | None:
+    """Pin ``document`` and persist the CID; None when IPFS or the write fails.
+
+    The account row is already committed, so neither an unreachable IPFS nor a
+    failed CID write may fail the registration - both leave ``profile_cid``
+    null for ``backfill_profile_cids.py`` to pick up.
+    """
+    cid = profile_metadata.pin(user, document)
+    if cid is None:
+        return None
+
+    # Faculty / students keep the CID on their profile row; an HOD has none.
+    target = profile if profile is not None else user
+    target.profile_cid = cid
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        current_app.logger.warning(
+            "profile CID %s could not be stored for user %s", cid, user.id
+        )
+        return None
+    return cid
+
+
 @api_v1.post("/auth/register/hod")
 def register_hod():
     """Register an HOD user after auto-verifying against InstitutionWhitelist.
@@ -49,7 +82,7 @@ def register_hod():
         password (str): Plain text password to hash
 
     Returns:
-        201: {"message": str, "user": dict, "verified": bool}
+        201: {"message": str, "user": dict, "verified": bool, "profile_cid": str | None}
         400: Missing or invalid request fields
         403: Not on institutional whitelist ({check: "whitelist", error: "not_whitelisted"})
         409: User already registered
@@ -102,12 +135,18 @@ def register_hod():
     db.session.add(user)
     db.session.commit()
 
+    # 4. Pin the non-sensitive profile metadata (D7); an HOD has no profile row.
+    profile_cid = _store_profile_cid(
+        user, None, profile_metadata.build_document(user, employee_id=employee_id)
+    )
+
     return (
         jsonify(
             {
                 "message": "HOD registered and auto-verified successfully",
                 "user": user.to_dict(),
                 "verified": True,
+                "profile_cid": profile_cid,
             }
         ),
         201,
@@ -126,7 +165,7 @@ def register_faculty():
         password (str): Plain text password to hash
 
     Returns:
-        201: {"message": str, "user": dict, "profile": dict}
+        201: {"message": str, "user": dict, "profile": dict, "profile_cid": str | None}
         400: Missing fields or invalid institutional email domain
         409: Email or employee_id already registered
     """
@@ -192,12 +231,18 @@ def register_faculty():
     db.session.add(faculty_profile)
     db.session.commit()
 
+    # 5. Pin the non-sensitive profile metadata (D7).
+    profile_cid = _store_profile_cid(
+        user, faculty_profile, profile_metadata.build_document(user, employee_id=employee_id)
+    )
+
     return (
         jsonify(
             {
                 "message": "Faculty registered successfully",
                 "user": user.to_dict(),
                 "profile": faculty_profile.to_dict(),
+                "profile_cid": profile_cid,
             }
         ),
         201,
@@ -217,7 +262,7 @@ def register_student():
         password (str): Plain text password to hash
 
     Returns:
-        201: {"message": str, "user": dict, "profile": dict}
+        201: {"message": str, "user": dict, "profile": dict, "profile_cid": str | None}
         400: Missing fields or invalid institutional email domain
         409: Email or roll_number already registered
     """
@@ -285,12 +330,20 @@ def register_student():
     db.session.add(student_profile)
     db.session.commit()
 
+    # 5. Pin the non-sensitive profile metadata (D7).
+    profile_cid = _store_profile_cid(
+        user,
+        student_profile,
+        profile_metadata.build_document(user, roll_number=roll_number, batch=batch),
+    )
+
     return (
         jsonify(
             {
                 "message": "Student registered successfully",
                 "user": user.to_dict(),
                 "profile": student_profile.to_dict(),
+                "profile_cid": profile_cid,
             }
         ),
         201,
@@ -376,7 +429,7 @@ def get_current_user():
         Authorization: Bearer <token>
 
     Returns:
-        200: {"user": dict, "profile": dict | None}
+        200: {"user": dict, "profile": dict | None, "profile_cid": str | None}
         401: Missing, invalid, or expired token
         404: User not found in database
     """
@@ -390,11 +443,15 @@ def get_current_user():
     elif user.role == UserRole.STUDENT and user.student_profile:
         profile_data = user.student_profile.to_dict()
 
+    # The role profile owns the CID when there is one; otherwise the User row.
+    profile_cid = profile_data["profileCid"] if profile_data else user.profile_cid
+
     return (
         jsonify(
             {
                 "user": user.to_dict(),
                 "profile": profile_data,
+                "profile_cid": profile_cid,
             }
         ),
         200,

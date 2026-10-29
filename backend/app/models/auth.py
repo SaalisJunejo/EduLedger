@@ -13,6 +13,11 @@ Four tables back the authentication and role-governance module:
 
 Roles mirror the institutional governance hierarchy (VC, HOD, FACULTY, STUDENT).
 `to_dict()` emits camelCase keys, following the existing codebase convention.
+
+Phase 1.6 (decision D7) adds the nullable ``profile_cid`` column holding the
+IPFS CID of the non-sensitive profile metadata pinned at registration. It
+lives on the role profile for faculty and students; HOD accounts have no
+profile row, so their CID is stored on ``User`` instead.
 """
 
 import enum
@@ -93,6 +98,10 @@ class User(db.Model):
     # Default True; can be flagged False (e.g. anti-spam account block).
     is_active = db.Column(db.Boolean, nullable=False, default=True)
 
+    # IPFS CID of the pinned profile metadata (D7). Used for roles without a
+    # profile row (HOD); null when IPFS was unreachable at registration.
+    profile_cid = db.Column(db.String(128), nullable=True)
+
     # 1-to-1 relationships to role-specific profile tables
     faculty_profile = db.relationship(
         "FacultyProfile",
@@ -135,12 +144,16 @@ class FacultyProfile(db.Model):
     # Official employee ID (unique across all faculty profiles).
     employee_id = db.Column(db.String(64), nullable=False, unique=True, index=True)
 
+    # IPFS CID of the pinned profile metadata (D7); null when IPFS was down.
+    profile_cid = db.Column(db.String(128), nullable=True)
+
     def to_dict(self) -> dict:
         """JSON-friendly view of the faculty profile."""
         return {
             "id": self.id,
             "userId": self.user_id,
             "employeeId": self.employee_id,
+            "profileCid": self.profile_cid,
         }
 
 
@@ -162,6 +175,9 @@ class StudentProfile(db.Model):
     # Academic batch/cohort (e.g., "2022-2026" or "Fall 2022").
     batch = db.Column(db.String(32), nullable=False)
 
+    # IPFS CID of the pinned profile metadata (D7); null when IPFS was down.
+    profile_cid = db.Column(db.String(128), nullable=True)
+
     def to_dict(self) -> dict:
         """JSON-friendly view of the student profile."""
         return {
@@ -169,4 +185,5 @@ class StudentProfile(db.Model):
             "userId": self.user_id,
             "rollNumber": self.roll_number,
             "batch": self.batch,
+            "profileCid": self.profile_cid,
         }
