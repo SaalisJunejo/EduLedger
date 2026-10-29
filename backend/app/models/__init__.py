@@ -11,6 +11,7 @@ from .auth import (
     User,
     UserRole,
 )
+from .grade import Grade
 from .proposal import Proposal
 from .session import AttendanceCheckIn, AttendanceSession, generate_nonce
 from .student import Student
@@ -20,6 +21,7 @@ __all__ = [
     "AttendanceCheckIn",
     "AttendanceSession",
     "FacultyProfile",
+    "Grade",
     "InstitutionWhitelist",
     "Proposal",
     "ScheduledClass",

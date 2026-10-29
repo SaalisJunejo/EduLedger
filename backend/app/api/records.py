@@ -2,8 +2,8 @@
 
 - POST /api/v1/records/propose        - instructor proposes a change; anchored
   on-chain (proposeChange) and mirrored into the local Proposal table
-- POST /api/v1/records/<id>/approve   - HOD / Exam Controller co-signs; the
-  second signature auto-executes the change (RecordUpdated event)
+- POST /api/v1/records/<id>/approve   - HOD co-signs (HOD only, decision
+  D2); the second signature auto-executes the change (RecordUpdated event)
 - GET  /api/v1/records/<id>           - proposal details read straight from
   the contract (the chain is the source of truth, not the local mirror)
 - GET  /api/v1/records/pending        - locally mirrored Pending proposals
@@ -27,7 +27,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..extensions import db
 from ..models import Proposal
-from ..models.proposal import STATUS_PENDING
+from ..models.proposal import STATUS_PENDING, STATUS_REJECTED
 from ..services import audit_trail
 from ..services.auth import require_auth
 from ..util import utcnow
@@ -93,6 +93,13 @@ def propose():
         )
 
     field = field.strip()
+    # Course-specific grades must use the row-locking correction flow.
+    # Other generic fields (including legacy opaque "grade") are unchanged.
+    if field.startswith("grade:"):
+        return api_error(
+            "request", "use_grade_corrections",
+            "course-specific grades must be proposed via /grades/corrections",
+        )
     ipfs_cid = ipfs_cid.strip()
     old_value = str(old_value)
     new_value = str(new_value)
@@ -161,19 +168,42 @@ def propose():
 
 
 @api_v1.post("/records/<int:proposal_id>/approve")
-@require_auth(roles=["HOD", "ADMIN"])
+@require_auth(roles=["HOD"])
 def approve(proposal_id: int):
-    """Co-sign using the authenticated HOD or ADMIN user's signer.
+    """Co-sign using the authenticated HOD user's signer.
 
-    The body is ignored: HOD maps to "hod" and ADMIN temporarily maps to
-    "exam_controller". When the signature count reaches 2, the unchanged
+    Only HOD may approve (decision D2); ADMIN is rejected with 403 by the
+    auth gate. The body is ignored: the signer role comes from the token
+    (HOD maps to "hod"). When the signature count reaches 2, the unchanged
     contract auto-executes the change and emits RecordUpdated. The local
     Proposal mirror's status is synced to the on-chain result.
 
     Note the URL carries the ON-CHAIN proposal id (getProposal's id), not the
     local Proposal.id primary key.
     """
-    role = {"HOD": "hod", "ADMIN": "exam_controller"}[g.role]
+    role = {"HOD": "hod"}[g.role]
+
+    # The generic route must not bypass a rejected grade correction or
+    # execute one without applying its Grade row and releasing its lock.
+    # Inspect chain-only proposals too, retaining the generic 404 behavior.
+    mirror = Proposal.query.filter_by(onchain_proposal_id=proposal_id).first()
+    if mirror is None:
+        try:
+            field = audit_trail.get_proposal(proposal_id)["field"]
+        except audit_trail.AuditTrailError as exc:
+            return _audit_error(exc)
+    else:
+        field = mirror.field
+    if field.startswith("grade:"):
+        if mirror is not None and mirror.status == STATUS_REJECTED:
+            return api_error(
+                "proposal", "correction_rejected",
+                "this grade correction was rejected and cannot be approved", 409,
+            )
+        return api_error(
+            "request", "use_grade_corrections",
+            "grade corrections must be approved via /grades/corrections/<id>/approve",
+        )
 
     try:
         result = audit_trail.approve_proposal(proposal_id, role)
@@ -181,7 +211,6 @@ def approve(proposal_id: int):
         return _audit_error(exc)
 
     # Keep the local mirror in step with the on-chain result.
-    mirror = Proposal.query.filter_by(onchain_proposal_id=proposal_id).first()
     if mirror is not None:
         mirror.status = result["status"]
         try:

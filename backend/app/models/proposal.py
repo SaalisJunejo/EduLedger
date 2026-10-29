@@ -5,7 +5,10 @@ remains the source of truth (`app/services/audit_trail.py` reads state
 straight from the contract); this table exists so the HOD / Exam Controller
 dashboard can list pending proposals without scanning chain history. Rows
 are created by POST /api/v1/records/propose and their status is synced by
-POST /api/v1/records/<id>/approve.
+POST /api/v1/records/<id>/approve. Grade corrections (Phase 1.4a,
+app/api/grades.py) use the same table with field "grade:<course_code>" and
+additionally record the proposing user, the justification text and - for
+the off-chain reject - the rejection reason.
 
 Columns follow the codebase snake_case convention; `to_dict()` emits the
 camelCase names of the on-chain Proposal struct (studentId, oldValue, ...)
@@ -19,6 +22,9 @@ from ..util import iso_z, utcnow
 # enum verbatim, so local rows compare equal with on-chain state.
 STATUS_PENDING = "Pending"
 STATUS_EXECUTED = "Executed"
+# Local-only state (decision D3): an HOD rejected a grade correction off-chain.
+# The contract has no reject, so the on-chain proposal stays Pending.
+STATUS_REJECTED = "Rejected"
 
 
 class Proposal(db.Model):
@@ -48,10 +54,18 @@ class Proposal(db.Model):
     # 1-based proposal id on RecordAuditTrail - the join key to chain state.
     onchain_proposal_id = db.Column(db.Integer, nullable=False, unique=True, index=True)
 
-    # STATUS_PENDING or STATUS_EXECUTED, synced from the contract.
+    # STATUS_PENDING or STATUS_EXECUTED, synced from the contract, or the
+    # local-only STATUS_REJECTED (grade corrections).
     status = db.Column(db.String(16), nullable=False, default=STATUS_PENDING)
 
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+    # Grade corrections only (null for /records proposals): the FACULTY user
+    # who proposed, their justification (also pinned on IPFS as ipfs_cid),
+    # and the HOD's reason when the correction was rejected.
+    proposer_id = db.Column(db.Integer, nullable=True, index=True)
+    justification = db.Column(db.Text, nullable=True)
+    rejection_reason = db.Column(db.Text, nullable=True)
 
     def to_dict(self) -> dict:
         """JSON-friendly view of the proposal (camelCase, like the contract)."""

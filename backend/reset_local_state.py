@@ -26,6 +26,8 @@ this after every fresh `npm run deploy:audit-trail` /
 
 What it does
 ------------
+- empties the `grades` table (Phase 1.4a current grades and proposal locks)
+  before proposals and students, resetting its id sequence
 - empties the `proposals` table (Module 2 mirror) and resets its id
   sequence (Postgres: TRUNCATE ... RESTART IDENTITY; SQLite: a plain
   DELETE - INTEGER PRIMARY KEY ids start from 1 again once the table is
@@ -53,6 +55,7 @@ from sqlalchemy import text  # noqa: E402 (import after the env tweak)
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
+    Grade,
     Proposal,
     ScheduledClass,
     SessionLog,
@@ -65,6 +68,7 @@ from app.models import (  # noqa: E402
 # dialects that enforce them (Postgres truncates the whole set in one
 # statement instead, which is FK-safe by definition).
 _TABLES = [
+    (Grade.__tablename__, Grade),
     (Proposal.__tablename__, Proposal),
     (SessionLog.__tablename__, SessionLog),
     (SubstituteToken.__tablename__, SubstituteToken),
@@ -75,7 +79,7 @@ _TABLES = [
 
 
 def main() -> int:
-    """Truncate the proposal mirror and workload tables, reset sequences."""
+    """Clear grades, proposals, workload tables and students; reset sequences."""
     # Windows consoles often default to a legacy code page (cp1252); force
     # UTF-8 so output never dies on a print (same guard as the test scripts).
     if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
@@ -106,7 +110,7 @@ def main() -> int:
             assert remaining == 0, f"{table} was not cleared"
 
         print("  identity sequences  : restarted (next local id = 1)")
-        print("[OK] proposals + workload tables + students cleared - safe to test against the fresh deploy")
+        print("[OK] grades + proposals + workload tables + students cleared - safe to test against the fresh deploy")
     return 0
 
 

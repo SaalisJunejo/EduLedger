@@ -22,13 +22,17 @@ exceptions):
      4. approve as HOD         - 200: Executed, real tx hash + RecordUpdated
                                   event data
      5. re-read from chain     - GET /records/<id>: Executed, 2 signatures
-     6. ADMIN approval         - executed proposal rejected 409; fresh proposal
-                                  executes via exam_controller, ignoring body role
+     6. ADMIN approval         - re-approving the executed proposal is rejected
+                                  409; ADMIN approving a fresh proposal is
+                                  rejected 403 insufficient_role [auth] and the
+                                  proposal stays Pending with 1 signature
+                                  (Phase 1.4a: only HOD may approve, D2)
      7. FACULTY approval       - rejected 403 insufficient_role      [auth]
      8. unknown proposal       - rejected 404 proposal_not_found     [proposal]
      9. propose (leave open)   - 201: another proposal stays Pending
     10. pending list           - GET /records/pending contains the open
-                                  proposal and excludes the executed one
+                                  proposals (incl. the one ADMIN could not
+                                  approve) and excludes the executed one
 
 API contract notes (aligned with app/api/records.py):
     - proposal ids in URLs are the ON-CHAIN ids (getProposal's id), not the
@@ -72,7 +76,7 @@ EXAM_CONTROLLER_ADDRESS = "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
 
 # Shared state between steps (filled in as the run progresses).
 STATE = {
-    "executed_id": None, "pending_id": None, "admin_executed_id": None,
+    "executed_id": None, "pending_id": None, "admin_blocked_id": None,
     "db_app": None, "fixture_emails": [], "whitelist_email": None,
 }
 AUTH = {}
@@ -326,32 +330,33 @@ def step_read_executed_from_chain():
 
 
 def step_second_approval_blocked():
-    """ADMIN cannot re-approve an executed proposal, but can execute a fresh one."""
+    """Re-approval of an executed proposal is blocked; ADMIN cannot approve at all.
+
+    Phase 1.4a removed the temporary ADMIN -> exam_controller mapping: only
+    HOD may approve (decision D2). This is the one deliberate assertion
+    change in this script - ADMIN used to execute the fresh proposal.
+    """
     proposal_id = STATE["executed_id"]
-    status, payload = approve(proposal_id, "admin", "hod")
+    # ADMIN can no longer reach the proposal-state gate, so the HOD proves it.
+    status, payload = approve(proposal_id, "hod", "exam_controller")
     assert status == 409, f"second approval must be rejected with 409, got {status}: {payload}"
     assert payload.get("error") == "proposal_not_pending", f"unexpected error: {payload}"
     assert payload.get("check") == "proposal", f"unexpected check: {payload}"
     print(f"   rejected at check '{payload['check']}': {payload['message']}")
 
+    # A fresh Pending proposal, so the 403 cannot come from a later gate.
     status, payload = propose("grade", "C", "B", CID_GRADE)
     assert status == 201, f"ADMIN-path proposal returned {status}: {payload}"
     admin_proposal_id = payload["onchain_proposal_id"]
-    STATE["admin_executed_id"] = admin_proposal_id
+    STATE["admin_blocked_id"] = admin_proposal_id
     status, payload = approve(admin_proposal_id, "admin", "hod")
-    assert status == 200, f"ADMIN approval returned {status}: {payload}"
-    assert payload.get("role") == "exam_controller", f"ADMIN body role was trusted: {payload}"
-    assert str(payload.get("signer", "")).lower() == EXAM_CONTROLLER_ADDRESS.lower(), (
-        f"ADMIN must use the exam-controller signer: {payload}"
-    )
-    assert payload.get("status") == "Executed", f"ADMIN proposal did not execute: {payload}"
-    assert payload.get("signature_count") == 2, f"expected 2 signatures: {payload}"
-    assert payload.get("record_updated") is True, f"RecordUpdated missing: {payload}"
-    assert str(payload.get("transaction_hash", "")).startswith("0x"), f"bad tx hash: {payload}"
+    assert status == 403, f"ADMIN approval must be rejected with 403, got {status}: {payload}"
+    assert payload.get("error") == "insufficient_role", f"unexpected error: {payload}"
+    assert payload.get("check") == "auth", f"unexpected check: {payload}"
     status, chain = get_proposal(admin_proposal_id)
-    assert status == 200 and chain.get("status") == "Executed", f"ADMIN chain state: {chain}"
-    assert chain.get("signatureCount") == 2, f"ADMIN chain signatures: {chain}"
-    print(f"   ADMIN executed proposal {admin_proposal_id} via exam_controller (body role ignored)")
+    assert status == 200 and chain.get("status") == "Pending", f"ADMIN chain state: {chain}"
+    assert chain.get("signatureCount") == 1, f"ADMIN must not have signed: {chain}"
+    print(f"   ADMIN rejected at check 'auth'; proposal {admin_proposal_id} still Pending, 1 signature")
 
 
 def step_invalid_role_blocked():
@@ -390,11 +395,11 @@ def step_pending_list():
         assert status == 200, f"{role} GET /records/pending returned {status}: {payload}"
         entries = payload.get("pending") or []
         ids = [entry.get("onchainProposalId") for entry in entries]
-        assert STATE["pending_id"] in ids, (
-            f"open proposal {STATE['pending_id']} missing from /records/pending: {ids}"
+        for open_id in (STATE["pending_id"], STATE["admin_blocked_id"]):
+            assert open_id in ids, f"open proposal {open_id} missing from /records/pending: {ids}"
+        assert STATE["executed_id"] not in ids, (
+            f"executed proposal {STATE['executed_id']} listed as pending: {ids}"
         )
-        for executed_id in (STATE["executed_id"], STATE["admin_executed_id"]):
-            assert executed_id not in ids, f"executed proposal {executed_id} listed as pending: {ids}"
         for entry in entries:
             assert entry.get("status") == "Pending", f"non-Pending row in the pending list: {entry}"
         assert payload.get("count") == len(entries), f"count mismatch: {payload}"
@@ -411,7 +416,7 @@ STEPS = [
     ("Read proposal from chain -> Pending, 1 signature", step_read_pending_from_chain),
     ("Approve as HOD -> Executed + RecordUpdated event", step_approve_as_hod),
     ("Re-read from chain -> Executed, 2 signatures", step_read_executed_from_chain),
-    ("ADMIN: re-approval blocked; fresh proposal executes via exam_controller", step_second_approval_blocked),
+    ("ADMIN: re-approval blocked; ADMIN approval -> 403, proposal untouched", step_second_approval_blocked),
     ("FACULTY spoofing HOD role -> blocked with 403", step_invalid_role_blocked),
     ("Unknown proposal id -> blocked", step_unknown_proposal_blocked),
     ("Propose a second change (left Pending)", step_propose_second_left_pending),
