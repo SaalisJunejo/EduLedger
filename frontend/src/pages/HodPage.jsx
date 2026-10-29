@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import PageLayout from "../components/PageLayout.jsx";
 import Button from "../components/ui/Button.jsx";
+import { InstitutionExportCard } from "../components/ExportReportCard.jsx";
 import PendingApprovalsCard from "../components/hod/PendingApprovalsCard.jsx";
 import RecordHistoryCard from "../components/hod/RecordHistoryCard.jsx";
 import Card from "../components/ui/Card.jsx";
@@ -157,6 +158,7 @@ export default function HodPage() {
       description="Co-sign academic record changes so no single actor can alter them alone."
     >
       <TimetableUploadCard />
+      <InstitutionExportCard />
       <div role="tablist" aria-label="Audit trail sections" className="flex flex-wrap gap-2">
         {TABS.map((entry) => (
           <Button

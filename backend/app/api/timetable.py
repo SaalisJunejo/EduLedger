@@ -1,4 +1,11 @@
-"""HOD-only timetable ingestion from a multipart CSV or XLSX file."""
+"""Timetable endpoints.
+
+- POST /api/v1/hod/timetable/upload - HOD-only ingestion of dated class
+  occurrences from a multipart CSV or XLSX file.
+- GET  /api/v1/timetable/classes    - HOD/ADMIN read-only listing of every
+  scheduled occurrence (the institution-wide counterpart of the faculty's
+  own GET /api/v1/faculty/classes).
+"""
 
 import csv
 import io
@@ -10,6 +17,7 @@ from openpyxl import load_workbook
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..extensions import db
+from ..models import ScheduledClass, User
 from ..services.auth import require_auth
 from ..services.timetable import COLUMNS, timetable_timezone, validate_row
 from ..util import utcnow
@@ -19,6 +27,8 @@ from .errors import api_error
 _MAX_BYTES = 10 * 1024 * 1024
 _MAX_ROWS = 5000
 _MAX_XLSX_EXPANDED_BYTES = 50 * 1024 * 1024
+# Cap on the read-only listing below (newest occurrences first).
+_MAX_LISTED_CLASSES = 500
 
 
 def _read_table(data: bytes, suffix: str) -> tuple[list[str], list[tuple[int, list]]]:
@@ -105,3 +115,47 @@ def upload_timetable():
         "classes": [scheduled_class.to_dict() for scheduled_class in created],
         "timezone": current_app.config["TIMETABLE_TIMEZONE"],
     }), 201 if created else 200
+
+
+@api_v1.get("/timetable/classes")
+@require_auth(roles=["HOD", "ADMIN"])
+def list_timetable_classes():
+    """Every scheduled occurrence, newest start time first (at most 500).
+
+    Query: optional ``professor_id`` to limit the list to one professor's
+    occurrences. Each entry carries the scheduled professor's name so the
+    HOD/Admin surfaces can offer a faculty filter without a second call.
+    Faculty department restriction is intentionally not enforced pending
+    policy, the same as the upload above.
+    """
+    professor_id = None
+    raw_professor_id = (request.args.get("professor_id") or "").strip()
+    if raw_professor_id:
+        if not (
+            raw_professor_id.isascii()
+            and raw_professor_id.isdigit()
+            and len(raw_professor_id) <= 10
+            and 0 < int(raw_professor_id) <= 2147483647
+        ):
+            return api_error(
+                "request", "invalid_professor_id", "professor_id must be a positive user id", 400
+            )
+        professor_id = int(raw_professor_id)
+
+    query = db.session.query(ScheduledClass, User).outerjoin(
+        User, User.id == ScheduledClass.professor_id
+    )
+    if professor_id is not None:
+        query = query.filter(ScheduledClass.professor_id == professor_id)
+    rows = query.order_by(
+        ScheduledClass.start_time.desc(), ScheduledClass.id.desc(),
+    ).limit(_MAX_LISTED_CLASSES).all()
+
+    fields = ("id", "courseCode", "room", "professorId", "dayOfWeek", "startTime", "endTime")
+    entries = []
+    for scheduled_class, professor in rows:
+        serialized = scheduled_class.to_dict()
+        entry = {field: serialized[field] for field in fields}
+        entry["professorName"] = professor.full_name if professor is not None else None
+        entries.append(entry)
+    return jsonify({"classes": entries, "count": len(entries), "limit": _MAX_LISTED_CLASSES})

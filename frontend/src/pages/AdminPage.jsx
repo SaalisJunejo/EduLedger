@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import PageLayout from "../components/PageLayout.jsx";
+import { InstitutionExportCard } from "../components/ExportReportCard.jsx";
 import WorkloadAuditLogCard from "../components/admin/WorkloadAuditLogCard.jsx";
 import Button from "../components/ui/Button.jsx";
 import Card from "../components/ui/Card.jsx";
@@ -74,6 +75,7 @@ export default function AdminPage() {
       description="The system-wide record of every class outcome anchored on the faculty workload ledger — student scans, zero-attendance declarations, substitute coverage and automatic un-conducted flags, each tied to its on-chain transaction."
     >
       <GovernanceStatusCard />
+      <InstitutionExportCard />
       <WorkloadAuditLogCard />
     </PageLayout>
   );

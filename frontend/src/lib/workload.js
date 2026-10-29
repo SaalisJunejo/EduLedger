@@ -10,6 +10,14 @@ export async function loadFacultyClasses() {
   return data.classes;
 }
 
+// Institution-wide class list for the HOD / Admin surfaces (HOD and ADMIN
+// only). Unlike loadFacultyClasses() each row also names its professor.
+export async function loadTimetableClasses(professorId) {
+  const query = professorId ? `?professor_id=${encodeURIComponent(professorId)}` : "";
+  const data = await api(`/timetable/classes${query}`);
+  return data.classes;
+}
+
 // The API exposes IDs, not a faculty directory. Never attach mock names.
 export function professorLabel(id) {
   return id == null ? "Not available" : `Faculty #${id}`;

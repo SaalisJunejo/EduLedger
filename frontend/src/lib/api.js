@@ -60,3 +60,44 @@ export async function api(path, { method = "GET", body } = {}) {
   }
   return payload;
 }
+
+/**
+ * Authenticated GET of a file (the bearer token can't ride on a plain
+ * <a href>). Resolves to { blob, filename } with the server's
+ * Content-Disposition filename, or `fallbackName` when it is missing.
+ * Errors throw the same ApiError as api().
+ */
+export async function apiDownload(path, fallbackName) {
+  const headers = {};
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  let response;
+  try {
+    response = await fetch(`${BASE}${path}`, { headers });
+  } catch {
+    throw new ApiError(0, {
+      error: "network_error",
+      message: "Cannot reach the backend — is Flask running on port 5000?",
+    });
+  }
+
+  if (!response.ok) {
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      /* non-JSON error body */
+    }
+    if (response.status === 401) {
+      logout();
+      window.location.replace("/login");
+    }
+    throw new ApiError(response.status, payload);
+  }
+
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  const filename = match ? decodeURIComponent(match[1].trim()) : fallbackName;
+  return { blob: await response.blob(), filename };
+}

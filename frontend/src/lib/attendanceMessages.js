@@ -76,6 +76,23 @@ const MESSAGES = {
   "device_binding/student_not_found":
     "Student profile not found — this device will be registered automatically once your face is enrolled.",
 
+  // Monthly export (GET /attendance/export). The class/professor/auth keys
+  // are shared with /session/start, so their wording stays neutral.
+  "request/invalid_month": "Pick a valid month to export.",
+  "request/invalid_format": "Choose Excel (.xlsx) or CSV (.csv) as the export format.",
+  "request/invalid_class_id": "That class selection isn't valid — pick a class from the list or All my classes.",
+  "request/invalid_professor_id":
+    "That faculty member doesn't exist on the backend (anymore) — reload the page and pick another one.",
+  "request/class_professor_mismatch":
+    "The selected class belongs to a different faculty member — pick one of their classes, or switch to All classes.",
+  "class/class_not_found":
+    "This class doesn't exist on the backend (anymore) — reload the page and pick another one.",
+  "professor/not_class_professor":
+    "That class is scheduled for a different professor — you can only use your own classes.",
+  "auth/insufficient_role": "Your account's role isn't allowed to do this.",
+  "export/invalid_configuration":
+    "The backend's TIMETABLE_TIMEZONE setting is invalid — fix it in backend/.env and restart Flask.",
+
   // Generic fallbacks
   network_error: "Cannot reach the backend — is Flask running on port 5000?",
   missing_fields: "Some required fields were missing — please retry.",

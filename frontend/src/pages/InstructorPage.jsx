@@ -5,6 +5,7 @@ import Button from "../components/ui/Button.jsx";
 import Card from "../components/ui/Card.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import LiveSessionCard from "../components/instructor/LiveSessionCard.jsx";
+import ExportReportCard from "../components/ExportReportCard.jsx";
 import ProposeChangeCard from "../components/instructor/ProposeChangeCard.jsx";
 import WorkloadTab from "../components/instructor/WorkloadTab.jsx";
 import { api } from "../lib/api.js";
@@ -170,6 +171,10 @@ export default function InstructorPage() {
             ) : null}
           </Card>
         )}
+
+        <div className="mt-6">
+          <ExportReportCard classes={classes} />
+        </div>
       </div>
 
       {/* Module 3 — faculty workload ledger: today's classes, live QR
