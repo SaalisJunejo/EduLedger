@@ -6,7 +6,7 @@ import Card from "../components/ui/Card.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import LiveSessionCard from "../components/instructor/LiveSessionCard.jsx";
 import ExportReportCard from "../components/ExportReportCard.jsx";
-import ProposeChangeCard from "../components/instructor/ProposeChangeCard.jsx";
+import GradeCorrectionRequestCard from "../components/instructor/GradeCorrectionRequestCard.jsx";
 import WorkloadTab from "../components/instructor/WorkloadTab.jsx";
 import { api } from "../lib/api.js";
 import { describeApiError } from "../lib/attendanceMessages.js";
@@ -23,7 +23,7 @@ const CLASSES_POLL_MS = 5000;
 const TABS = [
   { id: "attendance", label: "Attendance Session" },
   { id: "workload", label: "My Classes · Workload" },
-  { id: "propose", label: "Propose Change" },
+  { id: "grades", label: "Grade corrections" },
 ];
 
 export default function InstructorPage() {
@@ -96,7 +96,7 @@ export default function InstructorPage() {
       role="Instructor"
       title="Instructor Dashboard"
       wide
-      description="One dashboard, three modules: project the rotating attendance QR (students verify, scan, and attendance locks on-chain); run today's classes on the workload ledger — sessions, substitute keys and zero-attendance declarations; and propose record changes with IPFS evidence, executed once the HOD or Exam Controller co-signs."
+      description="Manage live attendance and faculty workload, and request grade corrections with IPFS justification evidence. Only the HOD can approve or reject a grade correction."
     >
       <div role="tablist" aria-label="Instructor dashboard sections" className="flex flex-wrap gap-2">
         {TABS.map((entry) => (
@@ -183,9 +183,9 @@ export default function InstructorPage() {
         <WorkloadTab user={user} classes={classes} onRefresh={refreshClasses} />
       </div>
 
-      {/* Module 2 — record-change proposals (multi-signature audit trail). */}
-      <div role="tabpanel" hidden={tab !== "propose"}>
-        <ProposeChangeCard />
+      {/* Grade corrections and this instructor's requests. */}
+      <div role="tabpanel" hidden={tab !== "grades"}>
+        <GradeCorrectionRequestCard />
       </div>
     </PageLayout>
   );

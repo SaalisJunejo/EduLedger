@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import PageLayout from "../components/PageLayout.jsx";
 import { InstitutionExportCard } from "../components/ExportReportCard.jsx";
 import WorkloadAuditLogCard from "../components/admin/WorkloadAuditLogCard.jsx";
+import GradeCorrectionsCard from "../components/GradeCorrectionsCard.jsx";
 import Button from "../components/ui/Button.jsx";
 import Card from "../components/ui/Card.jsx";
 import Spinner from "../components/ui/Spinner.jsx";
@@ -72,10 +73,11 @@ export default function AdminPage() {
     <PageLayout
       role="Admin"
       title="Admin Dashboard"
-      description="The system-wide record of every class outcome anchored on the faculty workload ledger — student scans, zero-attendance declarations, substitute coverage and automatic un-conducted flags, each tied to its on-chain transaction."
+      description="Read-only grade correction oversight and the system-wide faculty workload audit log. Grade correction decisions are reserved for the HOD."
     >
       <GovernanceStatusCard />
       <InstitutionExportCard />
+      <GradeCorrectionsCard />
       <WorkloadAuditLogCard />
     </PageLayout>
   );

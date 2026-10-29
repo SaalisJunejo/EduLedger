@@ -57,13 +57,13 @@ const MESSAGES = {
   "request/empty_field": "The record field can't be empty.",
   "request/empty_ipfs_cid": "The evidence CID is missing — upload the evidence file again.",
   "role/not_instructor":
-    "The backend's instructor signer isn't authorized to propose changes — check the INSTRUCTOR_ROLE grant on the audit-trail contract.",
+    "The backend's instructor signer isn't authorized to request grade corrections — check the INSTRUCTOR_ROLE grant on the audit-trail contract.",
   "role/not_an_approver":
-    "This signer isn't authorized to approve changes — check the HOD / EXAM_CONTROLLER role grants on the audit-trail contract.",
+    "This signer isn't authorized to approve grade corrections — check the HOD role grant on the audit-trail contract.",
   "role/invalid_role": "Invalid approver role.",
-  "proposal/proposal_not_found": "That proposal doesn't exist on-chain (anymore).",
-  "proposal/proposal_not_pending": "This proposal was already executed — it can't be signed again.",
-  "proposal/already_signed": "This role already signed the proposal — the other approver's signature is still needed.",
+  "proposal/proposal_not_found": "That grade correction doesn't exist on-chain (anymore).",
+  "proposal/proposal_not_pending": "This grade correction is no longer pending — it can't be signed again.",
+  "proposal/already_signed": "This role already signed the grade correction. Refresh its status; only the HOD may approve it.",
   "audit_trail/blockchain_unavailable":
     "The blockchain node couldn't be reached — check that the Hardhat node is running, then retry.",
   "audit_trail/audit_trail_not_configured":

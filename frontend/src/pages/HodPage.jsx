@@ -2,18 +2,11 @@ import { useRef, useState } from "react";
 import PageLayout from "../components/PageLayout.jsx";
 import Button from "../components/ui/Button.jsx";
 import { InstitutionExportCard } from "../components/ExportReportCard.jsx";
-import PendingApprovalsCard from "../components/hod/PendingApprovalsCard.jsx";
-import RecordHistoryCard from "../components/hod/RecordHistoryCard.jsx";
+import GradeCorrectionsCard from "../components/GradeCorrectionsCard.jsx";
 import Card from "../components/ui/Card.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import { api } from "../lib/api.js";
 import { formatDateTime, professorLabel } from "../lib/workload.js";
-
-// Dashboard sections as tabs on this route (no new routes — see App.jsx).
-const TABS = [
-  { id: "pending", label: "Pending Approvals" },
-  { id: "history", label: "Record History" },
-];
 
 function TimetableUploadCard() {
   const inputRef = useRef(null);
@@ -137,47 +130,17 @@ function TimetableUploadCard() {
   );
 }
 
-/**
- * HOD dashboard (Module 2 audit trail): co-sign pending record-change
- * proposals — the second of the two signatures that executes them on-chain —
- * and review the executed audit trail. Executions witnessed here are lifted
- * into page-level state so the Record History tab survives tab switches.
- */
+/** HOD dashboard: timetable tools and grade correction decisions. */
 export default function HodPage() {
-  const [tab, setTab] = useState("pending");
-  const [executedEntries, setExecutedEntries] = useState([]);
-
-  function handleExecuted(entry) {
-    setExecutedEntries((prev) => [entry, ...prev]);
-  }
-
   return (
     <PageLayout
       role="HOD"
       title="HOD Dashboard"
-      description="Co-sign academic record changes so no single actor can alter them alone."
+      description="Review grade corrections with their justification and IPFS evidence. Approve to apply the new grade, or reject with a reason to release the lock."
     >
       <TimetableUploadCard />
       <InstitutionExportCard />
-      <div role="tablist" aria-label="Audit trail sections" className="flex flex-wrap gap-2">
-        {TABS.map((entry) => (
-          <Button
-            key={entry.id}
-            variant={tab === entry.id ? "primary" : "secondary"}
-            role="tab"
-            aria-selected={tab === entry.id}
-            onClick={() => setTab(entry.id)}
-          >
-            {entry.label}
-          </Button>
-        ))}
-      </div>
-
-      {tab === "pending" ? (
-        <PendingApprovalsCard onExecuted={handleExecuted} />
-      ) : (
-        <RecordHistoryCard entries={executedEntries} />
-      )}
+      <GradeCorrectionsCard canReview />
     </PageLayout>
   );
 }
