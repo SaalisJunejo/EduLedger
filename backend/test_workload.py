@@ -35,8 +35,8 @@ exceptions):
     13. issue (happy)          - 201: 30-minute JWT for one named substitute
     14. redeem (wrong sub)     - rejected 403 substitute_mismatch   [substitute]
     15. redeem (happy)         - 201: substitute starts the session
-    16. scan (sub's session)   - 201: CONDUCTED credited to the SUBSTITUTE
-                                  (conductedBy != the scheduled professor)
+    16. scan (sub's session)   - 201: CONDUCTED credited to the PRIMARY
+                                  professor; conductedBy is the substitute
     17. redeem again           - rejected 409 token_already_redeemed
     18. expired token          - rejected 401 token_expired         [substitute_token]
     19. malformed token        - rejected 401 token_invalid         [substitute_token]
@@ -46,7 +46,11 @@ exceptions):
                                   to 1 for this run; the overdue class gets
                                   UNCONDUCTED anchored on-chain automatically
     21. logs listing           - GET /faculty/logs shows every outcome with
-                                  its class details and tx hash
+                                  its class details and tx hash, primary
+                                  credit and named substitute conductor
+    22. colleagues             - same-department FACULTY only; no self,
+                                  students, HOD or other department; STUDENT 403
+    23. issue to self          - primary professor cannot delegate to themselves
 
 Design notes:
     - The test mixes HTTP calls (the real server) with a few in-process
@@ -81,7 +85,7 @@ import requests  # noqa: E402 (imported after the env tweak, like reset_local_st
 
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
-from app.models import InstitutionWhitelist, ScheduledClass, Student  # noqa: E402
+from app.models import InstitutionWhitelist, ScheduledClass, SessionLog, Student, User, UserRole  # noqa: E402
 from app.scheduler import flag_unconducted_classes  # noqa: E402
 from app.services import substitute_token, workload  # noqa: E402
 from app.util import utcnow  # noqa: E402
@@ -219,11 +223,13 @@ def setup_auth():
     domain = APP.config.get("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk").strip().lower()
     password = "WorkloadTestPassword123!"
     accounts = {}
-    for persona in ("professor", "substitute", "stranger", "student", "hod"):
+    for persona in ("professor", "substitute", "stranger", "student", "hod", "other_department"):
         account = {
             "email": f"workload.{persona}.{RUN_ID}@{domain}", "password": password,
             "full_name": f"Workload Test {persona.title()}", "department": "Computer Science",
         }
+        if persona == "other_department":
+            account["department"] = "Mathematics"
         if persona == "student":
             account.update(roll_number=f"WL-STUDENT-{RUN_ID}", batch="2022-2026")
         else:
@@ -249,6 +255,7 @@ def setup_auth():
         assert payload.get("token"), f"{persona} login returned no token: {payload}"
         AUTH[f"{persona}_token"] = payload["token"]
         AUTH[f"{persona}_id"] = payload["user"]["id"]
+        AUTH[f"{persona}_full_name"] = account["full_name"]
         if role == "faculty":
             AUTH["faculty_tokens"][payload["user"]["id"]] = payload["token"]
     PROFESSOR_ID = AUTH["professor_id"]
@@ -518,6 +525,11 @@ def step_redeem_happy():
     assert status == 201, f"redeem returned {status}: {payload}"
     assert payload.get("status") == "redeemed", f"unexpected status: {payload}"
     assert payload.get("substitute_id") == SUBSTITUTE_ID, f"wrong substitute: {payload}"
+    assert payload.get("courseCode") == "BSCS-404", f"wrong covered course: {payload}"
+    assert payload.get("room") == "Room 204", f"wrong covered room: {payload}"
+    assert payload.get("primaryProfessorName") == AUTH["professor_full_name"], (
+        f"wrong primary professor name: {payload}"
+    )
 
     session = payload.get("session") or {}
     workload_session = payload.get("workload_session") or {}
@@ -538,28 +550,34 @@ def step_redeem_happy():
 
 
 def step_scan_substitute_session():
-    """The substitute's class is CONDUCTED with credit to the SUBSTITUTE."""
+    """D1: PRIMARY professor credited; substitute recorded as conductor."""
     status, payload = scan(STATE["sub_session_id"], current_nonce(STATE["sub_session_id"]))
     assert status == 201, f"scan returned {status}: {payload}"
     assert payload.get("status") == "conducted", f"unexpected status: {payload}"
 
     session_log = payload.get("session_log") or {}
     assert session_log.get("status") == "CONDUCTED", f"session_log status wrong: {session_log}"
-    # The core substitute assertion: workload credit goes to the substitute,
-    # NOT the originally scheduled professor.
-    assert session_log.get("conductedBy") == SUBSTITUTE_ID, (
-        f"workload credited to {session_log.get('conductedBy')}, expected the substitute {SUBSTITUTE_ID}"
+    # D1 deliberately replaces the old substitute-credit expectation.
+    assert session_log.get("professorId") == PROFESSOR_ID, (
+        f"workload credited to {session_log.get('professorId')}, expected primary professor {PROFESSOR_ID}"
     )
-    assert session_log.get("conductedBy") != PROFESSOR_ID, "workload was credited to the scheduled professor"
+    assert session_log.get("conductedBy") == SUBSTITUTE_ID, (
+        f"conductor is {session_log.get('conductedBy')}, expected substitute {SUBSTITUTE_ID}"
+    )
+    assert session_log.get("conductedBy") != PROFESSOR_ID, "primary professor incorrectly recorded as conductor"
+    with APP.app_context():
+        mirror = SessionLog.query.filter_by(class_id=STATE["sub_class_id"]).one()
+        assert mirror.professor_id == PROFESSOR_ID, f"DB credit wrong: {mirror.to_dict()}"
+        assert mirror.conducted_by == SUBSTITUTE_ID, f"DB conductor wrong: {mirror.to_dict()}"
 
     onchain = onchain_log(STATE["sub_class_id"])
     assert onchain["logged"] is True and onchain["status"] == "CONDUCTED", f"on-chain state wrong: {onchain}"
-    assert onchain["professor_id"] == SUBSTITUTE_ID, (
-        f"on-chain credit went to professor {onchain['professor_id']}, expected substitute {SUBSTITUTE_ID}"
+    assert onchain["professor_id"] == PROFESSOR_ID, (
+        f"on-chain credit went to professor {onchain['professor_id']}, expected primary professor {PROFESSOR_ID}"
     )
     print(
-        f"   CONDUCTED on-chain credited to substitute {SUBSTITUTE_ID} "
-        f"(tx={session_log.get('onchainTxHash')}), not professor {PROFESSOR_ID}"
+        f"   CONDUCTED on-chain credited to primary professor {PROFESSOR_ID}, "
+        f"conducted by substitute {SUBSTITUTE_ID} (tx={session_log.get('onchainTxHash')})"
     )
 
 
@@ -648,6 +666,17 @@ def step_logs_listing():
         assert entry.get("class"), f"no class details on the entry: {entry}"
         assert entry.get("class", {}).get("courseId"), f"no courseId on the class details: {entry}"
 
+    substitute_entry = by_class[STATE["sub_class_id"]]
+    assert substitute_entry.get("professorId") == PROFESSOR_ID, f"substitute class credit wrong: {substitute_entry}"
+    assert substitute_entry.get("conductedBy") == SUBSTITUTE_ID, f"substitute conductor missing: {substitute_entry}"
+    assert substitute_entry.get("conductedByName") == AUTH["substitute_full_name"], (
+        f"substitute conductor name wrong: {substitute_entry}"
+    )
+    assert substitute_entry.get("substituted") is True, f"substituted flag missing: {substitute_entry}"
+    for class_id in (STATE["happy_class_id"], STATE["zero_class_id"], STATE["autoflag_class_id"]):
+        assert by_class[class_id].get("professorId") == PROFESSOR_ID, f"primary credit wrong: {by_class[class_id]}"
+        assert by_class[class_id].get("substituted") is False, f"false substitute flag: {by_class[class_id]}"
+
     # The never-started class (used for negatives) must NOT have an entry.
     assert STATE["no_start_class_id"] not in by_class, (
         f"no-start class was logged unexpectedly: {by_class.get(STATE['no_start_class_id'])}"
@@ -664,6 +693,51 @@ def step_logs_listing():
             )
         )
     )
+
+
+def step_colleagues():
+    """The caller sees only other FACULTY users in their own department."""
+    status, payload = api("GET", "/faculty/colleagues", token=AUTH["professor_token"])
+    assert status == 200, f"GET /faculty/colleagues returned {status}: {payload}"
+    colleagues = payload.get("colleagues")
+    assert isinstance(colleagues, list), f"colleagues list missing: {payload}"
+    assert payload.get("count") == len(colleagues), f"colleagues count mismatch: {payload}"
+    ids = [entry["id"] for entry in colleagues]
+    assert len(ids) == len(set(ids)), f"duplicate colleagues: {colleagues}"
+    assert {SUBSTITUTE_ID, STRANGER_ID}.issubset(ids), f"same-department faculty missing: {colleagues}"
+    assert not {PROFESSOR_ID, AUTH["student_id"], AUTH["hod_id"], AUTH["other_department_id"]}.intersection(ids), (
+        f"self, student, HOD or other-department user leaked into colleagues: {colleagues}"
+    )
+    # Verify all results, not only the seeded users, against the source rows.
+    with APP.app_context():
+        caller = db.session.get(User, PROFESSOR_ID)
+        expected = {
+            user.id: user
+            for user in User.query.filter_by(department=caller.department).all()
+            if user.role == UserRole.FACULTY and user.id != PROFESSOR_ID
+        }
+        assert set(ids) == set(expected), f"colleagues ids {ids}, expected {sorted(expected)}"
+        for entry in colleagues:
+            assert set(entry) == {"id", "full_name", "employee_id"}, f"wrong colleague fields: {entry}"
+            user = expected[entry["id"]]
+            assert entry["full_name"] == user.full_name, f"wrong colleague name: {entry}"
+            employee_id = user.faculty_profile.employee_id if user.faculty_profile else None
+            assert entry["employee_id"] == employee_id, f"wrong colleague employee id: {entry}"
+
+    status, denied = api("GET", "/faculty/colleagues", token=AUTH["student_token"])
+    assert status == 403, f"STUDENT colleagues request allowed: {denied}"
+    assert denied.get("check") == "auth", f"wrong colleagues auth check: {denied}"
+    assert denied.get("error") == "insufficient_role", f"wrong colleagues role error: {denied}"
+    print(f"   {len(colleagues)} other same-department faculty; STUDENT rejected with 403")
+
+
+def step_issue_self():
+    """The issuer is the primary professor; neither can be the substitute."""
+    status, denied = issue_token(PROFESSOR_ID, STATE["no_start_class_id"], PROFESSOR_ID)
+    assert status == 400, f"self/primary delegation allowed: {denied}"
+    assert denied.get("check") == "request", f"wrong self-delegation check: {denied}"
+    assert denied.get("error") == "invalid_substitute", f"wrong self-delegation error: {denied}"
+    print("   self/primary-professor delegation rejected with 400 request/invalid_substitute")
 
 
 # --------------------------------------------------------------------------
@@ -686,12 +760,14 @@ STEPS = [
     ("Validate FACULTY substitute + issue 30-min signed JWT", step_issue_happy),
     ("Redeem by the wrong substitute -> blocked", step_redeem_wrong_substitute),
     ("Redeem token -> substitute starts the session", step_redeem_happy),
-    ("Scan the substitute's session -> credit to the SUBSTITUTE", step_scan_substitute_session),
+    ("Scan the substitute's session -> PRIMARY credit, substitute conductor", step_scan_substitute_session),
     ("Redeem the same token again -> blocked", step_redeem_twice),
     ("Expired substitute token -> blocked", step_expired_token),
     ("Malformed substitute token -> blocked", step_malformed_token),
     ("Auto-flag job (manual call, 1-min threshold) -> UNCONDUCTED on-chain", step_autoflag),
     ("Logs listing: every outcome with class details", step_logs_listing),
+    ("Colleagues: same department only; STUDENT -> 403", step_colleagues),
+    ("Substitute token issued to self/primary professor -> blocked", step_issue_self),
 ]
 
 

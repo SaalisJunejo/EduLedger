@@ -22,7 +22,7 @@ const CLASSES_POLL_MS = 5000;
 // mid-session.
 const TABS = [
   { id: "attendance", label: "Attendance Session" },
-  { id: "workload", label: "My Classes · Workload" },
+  { id: "workload", label: "My Classes · Substitute" },
   { id: "grades", label: "Grade corrections" },
 ];
 
@@ -96,7 +96,7 @@ export default function InstructorPage() {
       role="Instructor"
       title="Instructor Dashboard"
       wide
-      description="Manage live attendance and faculty workload, and request grade corrections with IPFS justification evidence. Only the HOD can approve or reject a grade correction."
+      description="Manage live attendance, delegate classes to colleagues or cover a class with a substitute key. Primary professors keep the workload credit. Request grade corrections with IPFS justification evidence; only the HOD can approve or reject them."
     >
       <div role="tablist" aria-label="Instructor dashboard sections" className="flex flex-wrap gap-2">
         {TABS.map((entry) => (

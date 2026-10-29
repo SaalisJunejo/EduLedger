@@ -3,6 +3,7 @@ import PageLayout from "../components/PageLayout.jsx";
 import Button from "../components/ui/Button.jsx";
 import { InstitutionExportCard } from "../components/ExportReportCard.jsx";
 import GradeCorrectionsCard from "../components/GradeCorrectionsCard.jsx";
+import WorkloadAuditLogCard from "../components/admin/WorkloadAuditLogCard.jsx";
 import Card from "../components/ui/Card.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import { api } from "../lib/api.js";
@@ -141,6 +142,7 @@ export default function HodPage() {
       <TimetableUploadCard />
       <InstitutionExportCard />
       <GradeCorrectionsCard canReview />
+      <WorkloadAuditLogCard />
     </PageLayout>
   );
 }

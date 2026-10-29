@@ -65,16 +65,15 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
   }
 
   function handleRedeemed(data) {
-    const scheduledClass = classes?.find((entry) => entry.id === data.class_id);
-    const label = scheduledClass
-      ? `${scheduledClass.courseCode} · Room ${scheduledClass.room}`
-      : `Scheduled class #${data.class_id}`;
+    // The redeem response only supplies the covered class ID. The owned
+    // class list cannot resolve another professor's course or room.
+    const label = `Scheduled class #${data.class_id}`;
     setEndedNote(null);
     setLiveSession({
       classId: data.class_id,
       classLabel: label,
-      scheduledProfessorId: scheduledClass ? user.id : null,
-      conductorId: data.substitute_id,
+      scheduledProfessorId: null,
+      conductorId: data.workload_session.conductorId,
       substitute: true,
       session: { ...data.session, class_id: label, rotation_seconds: data.rotation_seconds },
     });
@@ -88,6 +87,8 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
 
   return (
     <div className="flex flex-col gap-5">
+      <RedeemSubstituteCard user={user} classes={classes} onRedeemed={handleRedeemed} />
+
       {endedNote ? (
         <StatusBanner tone={endedNote.reason === "closed" ? "warning" : "info"} title="Session ended">
           {endedNote.reason === "closed"
@@ -114,8 +115,8 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
                 {liveSession.scheduledProfessorId
                   ? professorLabel(liveSession.scheduledProfessorId)
                   : "the scheduled professor"}
-                . When the class concludes, the workload entry credits you — not the scheduled
-                professor.
+                . Workload is credited to the primary professor; you are recorded as conductor.
+                Course and room details are not included in the current redeem response.
               </StatusBanner>
             ) : null}
 
@@ -124,7 +125,7 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
             {liveSession.substitute ? (
               <Card
                 title="Conclude the covered class"
-                description="A student scan of the projected QR concludes this class automatically. If nobody scans, declare zero attendance as the covering substitute — the on-chain entry still credits you."
+                description="A student scan records the workload outcome. Keep taking attendance until you end the session. If nobody scans, declare zero attendance as the covering substitute — credit stays with the primary professor."
               >
                 <ZeroAttendanceAction
                   classId={liveSession.classId}
@@ -165,7 +166,6 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
         </div>
       </section>
 
-      <RedeemSubstituteCard user={user} onRedeemed={handleRedeemed} />
     </div>
   );
 }
@@ -178,8 +178,8 @@ export default function WorkloadTab({ user, classes, onRefresh }) {
  */
 function ConductedOutcomeCard({ classLabel, scheduledProfessorId, outcome, log, onBack }) {
   const meta = statusMeta(outcome);
-  const substituteCovered =
-    Boolean(log && scheduledProfessorId) && log.conductedBy !== scheduledProfessorId;
+  const creditedProfessorId = log?.professorId ?? scheduledProfessorId;
+  const conductor = log?.conductedByName || professorLabel(log?.conductedBy);
 
   return (
     <Card>
@@ -190,8 +190,8 @@ function ConductedOutcomeCard({ classLabel, scheduledProfessorId, outcome, log, 
           <p className="mt-1 text-sm leading-relaxed text-ink-muted">
             {meta.label} — anchored on the workload ledger.
             {log ? (
-              <> Workload credited to <span className="font-semibold text-ink">{professorLabel(log.conductedBy)}</span>
-                {substituteCovered ? " (substitute)" : ""}.</>
+              <> Credited to <span className="font-semibold text-ink">{professorLabel(creditedProfessorId)}</span>,
+                {" "}conducted by <span className="font-semibold text-ink">{conductor}</span>.</>
             ) : null}
           </p>
         </div>

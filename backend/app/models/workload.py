@@ -105,8 +105,8 @@ class WorkloadSession(db.Model):
         db.Integer, db.ForeignKey("attendance_sessions.id"), nullable=False, index=True
     )
 
-    # Professor (or substitute) currently conducting the class - the person
-    # a later SessionLog credits the workload to.
+    # Professor (or substitute) currently conducting the class. Workload
+    # credit goes to ScheduledClass.professor_id, not necessarily this user.
     conductor_id = db.Column(db.Integer, nullable=False)
 
     started_at = db.Column(db.DateTime, nullable=False, default=utcnow)
@@ -138,8 +138,12 @@ class SessionLog(db.Model):
     # STATUS_CONDUCTED / STATUS_CONDUCTED_ZERO_STUDENTS / STATUS_UNCONDUCTED.
     status = db.Column(db.String(32), nullable=False)
 
-    # Professor (or substitute) the workload is credited to - the WorkloadSession
-    # conductor at the time the outcome was recorded.
+    # Credited professor at anchor time (D1: the class's primary professor).
+    # Nullable for pre-1.5a logs, whose credit was the conductor's user id.
+    professor_id = db.Column(db.Integer, nullable=True)
+
+    # Actual WorkloadSession conductor, independently of workload credit.
+    # UNCONDUCTED retains the existing scheduled-professor placeholder.
     conducted_by = db.Column(db.Integer, nullable=False)
 
     timestamp = db.Column(db.DateTime, nullable=False, default=utcnow)
@@ -156,7 +160,14 @@ class SessionLog(db.Model):
             "id": self.id,
             "classId": self.class_id,
             "status": self.status,
+            # Preserve immutable legacy credit; never relabel old chain entries.
+            "professorId": self.professor_id if self.professor_id is not None else self.conducted_by,
             "conductedBy": self.conducted_by,
+            "substituted": (
+                self.status != STATUS_UNCONDUCTED
+                and self.scheduled_class is not None
+                and self.conducted_by != self.scheduled_class.professor_id
+            ),
             "timestamp": iso_z(self.timestamp),
             "onchainTxHash": self.onchain_tx_hash,
         }

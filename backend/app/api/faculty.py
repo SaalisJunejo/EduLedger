@@ -9,7 +9,9 @@
 - POST /api/v1/faculty/substitute/issue       - professor mints a
   short-lived signed token authorizing a named substitute for one class
 - POST /api/v1/faculty/substitute/redeem      - substitute redeems the
-  token and starts the session (workload credits the substitute)
+  token and starts the session (primary credited, substitute conducts)
+- GET  /api/v1/faculty/colleagues              - other FACULTY users in the
+  caller's department (faculty only)
 - GET  /api/v1/faculty/classes                - the caller's scheduled
   classes and final outcomes (faculty only)
 - GET  /api/v1/faculty/logs                   - every SessionLog entry
@@ -39,6 +41,7 @@ from flask import current_app, g, jsonify, request
 from ..extensions import db
 from ..models import (
     AttendanceSession,
+    FacultyProfile,
     ScheduledClass,
     SessionLog,
     Student,
@@ -128,10 +131,12 @@ def _anchor_session_log(scheduled_class: ScheduledClass, conductor_id: int, stat
     never leave a local row behind. Returns (session_log, chain_result).
     Callers commit.
     """
-    result = workload.log_workload(scheduled_class.id, conductor_id, status)
+    credited_professor_id = scheduled_class.professor_id
+    result = workload.log_workload(scheduled_class.id, credited_professor_id, status)
     session_log = SessionLog(
         class_id=scheduled_class.id,
         status=status,
+        professor_id=credited_professor_id,
         conducted_by=conductor_id,
         timestamp=utcnow(),
         onchain_tx_hash=result["transaction_hash"],
@@ -218,8 +223,9 @@ def faculty_scan():
     (c) scanned nonce matches the current rotating nonce, (d) nonce not
     expired, (e) the QR belongs to a faculty workload session. Then, if
     the class has no SessionLog yet, WorkloadLedger.logWorkload() is sent
-    from the backend signer with status CONDUCTED, credited to the session's
-    conductor. A scan for an already-logged class is an idempotent no-op
+    from the backend signer with status CONDUCTED, credited to the class's
+    primary professor; the session's conductor is recorded separately (D1).
+    A scan for an already-logged class is an idempotent no-op
     (200) - only the first scan needs to succeed.
     """
     student_id = g.user_id
@@ -327,8 +333,8 @@ def zero_attendance():
     professor ids. Only allowed when a session was properly started for the
     class (the professor - or a
     substitute covering it - is its live conductor); the class is then
-    anchored on-chain as CONDUCTED_ZERO_STUDENTS, still crediting the
-    conductor's workload.
+    anchored on-chain as CONDUCTED_ZERO_STUDENTS, crediting the primary
+    professor and recording the conductor separately (D1).
     """
     body = request.get_json(silent=True) or {}
     professor_id = g.user_id
@@ -408,7 +414,9 @@ def issue_substitute():
 
     Body: ``{"class_id": 7, "substitute_id": <faculty user id>}``.
     The issuer is g.user_id; any body professor_id is ignored. The named
-    substitute must exist as a FACULTY user.
+    substitute must exist as a FACULTY user and cannot be the issuer.
+    Since only the primary professor can issue, the self-issuance gate also
+    rejects naming the class's primary professor as its substitute.
     The token is an HS256 JWT valid for SUBSTITUTE_TOKEN_MINUTES
     (default 30 minutes) that only the named substitute can redeem, for
     this one class only. The SubstituteToken row tracks its redemption.
@@ -487,9 +495,8 @@ def redeem_substitute():
     ignoring body substitute ids. The token must be valid, unexpired, issued
     for this substitute, and not redeemed before;
     the class must not be concluded yet. On success the live session starts
-    with the substitute as conductor - so the workload (SessionLog's
-    conductedBy) is later credited to the substitute, not the scheduled
-    professor.
+    with the substitute as conductor (SessionLog's conductedBy), while
+    workload credit goes to the scheduled primary professor (D1).
     """
     body = request.get_json(silent=True) or {}
     token = body.get("token")
@@ -553,12 +560,17 @@ def redeem_substitute():
     attendance_session, workload_session = _start_live_session(scheduled_class, substitute_id)
     db.session.commit()
 
+    primary_professor = db.session.get(User, scheduled_class.professor_id)
+
     return (
         jsonify(
             {
                 "status": "redeemed",
                 "substitute_id": substitute_id,
                 "class_id": scheduled_class.id,
+                "courseCode": scheduled_class.course_code,
+                "room": scheduled_class.room,
+                "primaryProfessorName": primary_professor.full_name if primary_professor else None,
                 "session": attendance_session.to_dict(),
                 "workload_session": workload_session.to_dict(),
                 "qr_poll_url": f"/api/v1/session/{attendance_session.id}/qr",
@@ -567,6 +579,36 @@ def redeem_substitute():
         ),
         201,
     )
+
+
+@api_v1.get("/faculty/colleagues")
+@require_auth(roles=["FACULTY"])
+def list_faculty_colleagues():
+    """Other FACULTY users in the caller's department, excluding the caller.
+
+    Department lives on User and may be null. Without a known department,
+    return an empty list rather than treating all unassigned users as peers.
+    """
+    caller = db.session.get(User, g.user_id)
+    if caller is None or not caller.department or not caller.department.strip():
+        return jsonify({"colleagues": [], "count": 0})
+
+    rows = db.session.query(User, FacultyProfile).outerjoin(
+        FacultyProfile, FacultyProfile.user_id == User.id,
+    ).filter(
+        User.role == UserRole.FACULTY,
+        User.department == caller.department,
+        User.id != g.user_id,
+    ).order_by(User.full_name.asc(), User.id.asc()).all()
+    entries = [
+        {
+            "id": user.id,
+            "full_name": user.full_name,
+            "employee_id": profile.employee_id if profile is not None else None,
+        }
+        for user, profile in rows
+    ]
+    return jsonify({"colleagues": entries, "count": len(entries)})
 
 
 @api_v1.get("/faculty/classes")
@@ -605,13 +647,18 @@ def list_faculty_classes():
 def list_logs():
     """Every SessionLog entry, newest first, for the admin / history view.
 
-    Each entry carries the anchored outcome, the credited conductor, the
-    on-chain transaction hash and the scheduled class it belongs to.
+    professorId is the credited user; conductedBy remains the conductor's
+    user id, with their full name in conductedByName. substituted indicates
+    coverage by someone other than the primary professor. Legacy rows keep
+    their original on-chain credit, and UNCONDUCTED is never substituted.
     """
-    logs = SessionLog.query.order_by(SessionLog.timestamp.desc()).all()
+    logs = db.session.query(SessionLog, User).outerjoin(
+        User, User.id == SessionLog.conducted_by,
+    ).order_by(SessionLog.timestamp.desc()).all()
     entries = []
-    for log in logs:
+    for log, conductor in logs:
         entry = log.to_dict()
+        entry["conductedByName"] = conductor.full_name if conductor is not None else None
         entry["class"] = log.scheduled_class.to_dict() if log.scheduled_class else None
         entries.append(entry)
     return jsonify({"logs": entries, "count": len(entries)})

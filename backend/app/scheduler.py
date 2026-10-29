@@ -121,6 +121,7 @@ def flag_unconducted_classes(app) -> int:
                     SessionLog(
                         class_id=scheduled_class.id,
                         status=STATUS_UNCONDUCTED,
+                        professor_id=scheduled_class.professor_id,
                         conducted_by=scheduled_class.professor_id,
                         timestamp=now,
                         onchain_tx_hash=result["transaction_hash"],

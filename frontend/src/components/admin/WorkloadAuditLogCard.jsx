@@ -7,6 +7,7 @@ import { api } from "../../lib/api.js";
 import {
   describeWorkloadError,
   formatDateTime,
+  loadTimetableClasses,
   professorLabel,
   shortHash,
   statusMeta,
@@ -28,13 +29,29 @@ export default function WorkloadAuditLogCard() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
   const [copiedHash, setCopiedHash] = useState(null);
+  const [professorNames, setProfessorNames] = useState(new Map());
+  const [nameError, setNameError] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
     try {
-      const data = await api("/faculty/logs");
-      setLogs(data.logs || []);
+      // The log names the conductor only. Resolve credited professor names
+      // from the existing HOD/ADMIN timetable endpoint without blocking logs.
+      const [logResult, classResult] = await Promise.allSettled([
+        api("/faculty/logs"),
+        loadTimetableClasses(),
+      ]);
+      if (logResult.status === "rejected") throw logResult.reason;
+      setLogs(logResult.value.logs || []);
+      if (classResult.status === "fulfilled") {
+        setProfessorNames(new Map(classResult.value
+          .filter((entry) => entry.professorName)
+          .map((entry) => [entry.professorId, entry.professorName])));
+        setNameError(null);
+      } else {
+        setNameError(classResult.reason);
+      }
     } catch (error) {
       setLoadError(error);
     } finally {
@@ -65,7 +82,7 @@ export default function WorkloadAuditLogCard() {
   return (
     <Card
       title="Workload audit log"
-      description="Every class outcome anchored on the faculty workload ledger, newest first. A professor marked “substitute” covered the class for its scheduled professor — the workload credits whoever actually taught."
+      description="Every class outcome anchored on the faculty workload ledger, newest first. Substitute sessions credit the primary professor and record the covering colleague as conductor. Older entries retain their original on-chain credit."
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-xs font-bold uppercase tracking-wide text-ink-muted">{countLabel}</p>
@@ -112,9 +129,8 @@ export default function WorkloadAuditLogCard() {
               <tbody>
                 {rows.map((log) => {
                   const meta = statusMeta(log.status);
-                  const scheduledProfessorId = log.class ? log.class.professorId : null;
-                  const substituteCovered =
-                    Boolean(scheduledProfessorId) && log.conductedBy !== scheduledProfessorId;
+                  const credited = professorNames.get(log.professorId) || professorLabel(log.professorId);
+                  const conductor = log.conductedByName || professorLabel(log.conductedBy);
                   return (
                     <tr key={log.id} className="border-b border-line last:border-0">
                       <td className={TD_CLASS}>
@@ -126,8 +142,12 @@ export default function WorkloadAuditLogCard() {
                         </p>
                       </td>
                       <td className={TD_CLASS}>
-                        <p className="font-semibold text-ink">{professorLabel(log.conductedBy)}</p>
-                        {substituteCovered ? (
+                        <p className="font-semibold text-ink">
+                          {log.substituted
+                            ? `Credited to ${credited}, conducted by ${conductor}`
+                            : `Credited to ${credited}`}
+                        </p>
+                        {log.substituted ? (
                           <span className="mt-1 inline-flex items-center rounded-full bg-warning-soft px-2.5 py-1 text-xs font-bold text-warning">
                             substitute
                           </span>
@@ -163,6 +183,14 @@ export default function WorkloadAuditLogCard() {
           </div>
         )}
       </div>
+
+      {nameError && logs !== null ? (
+        <div className="mt-4">
+          <StatusBanner tone="warning" title="Professor names unavailable">
+            {describeWorkloadError(nameError)} Credited professors are shown by their user IDs.
+          </StatusBanner>
+        </div>
+      ) : null}
 
       {loadError && logs !== null ? (
         <div className="mt-4">

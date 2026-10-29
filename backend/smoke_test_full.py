@@ -51,7 +51,7 @@ Steps
     M3.3  student scan -> class CONDUCTED on-chain           [tx, faculty credit]
     M3.4  issue a substitute key to the other real faculty account
     M3.5  substitute redeems the key using their own login token
-    M3.6  scan -> CONDUCTED credited to the SUBSTITUTE       [tx, substitute credit]
+    M3.6  scan -> CONDUCTED credited to PRIMARY; substitute conducts [tx]
     M3.7  GET /faculty/logs as HOD shows both entries
     C1    remove this run's fixtures and unpin its evidence
 
@@ -734,7 +734,7 @@ def m3_substitute_redeems() -> str:
             f"#{STATE['substitute_class_id']} (live session #{session['id']})")
 
 
-def m3_scan_credits_substitute() -> str:
+def m3_scan_credits_primary() -> str:
     session_id = STATE["substitute_session_id"]
     status, payload = _scan_with_live_nonce(
         lambda nonce: faculty_scan(session_id, nonce), session_id,
@@ -743,16 +743,27 @@ def m3_scan_credits_substitute() -> str:
     assert status == 201, f"faculty scan returned {status}: {payload}"
     assert payload.get("status") == "conducted", f"unexpected status: {payload}"
     session_log = payload.get("session_log") or {}
+    # D1 deliberately replaces M3.6's old substitute-credit expectation.
+    assert session_log.get("professorId") == PROFESSOR_ID, (
+        f"workload credited to {session_log.get('professorId')}, not primary "
+        f"Prof. {PROFESSOR_ID}: {payload}"
+    )
     assert session_log.get("conductedBy") == SUBSTITUTE_ID, (
-        f"workload credited to {session_log.get('conductedBy')}, not the substitute "
+        f"conductor is {session_log.get('conductedBy')}, not substitute "
         f"Prof. {SUBSTITUTE_ID}: {payload}"
     )
+    from app.services import workload
+
+    with APP.app_context():
+        onchain = workload.get_workload_log(STATE["substitute_class_id"])
+    assert onchain["logged"] is True and onchain["status"] == "CONDUCTED", f"on-chain state wrong: {onchain}"
+    assert onchain["professor_id"] == PROFESSOR_ID, f"on-chain primary credit wrong: {onchain}"
     tx = note_tx(
-        f"M3 class #{STATE['substitute_class_id']} CONDUCTED - credited to substitute Prof. {SUBSTITUTE_ID}",
+        f"M3 class #{STATE['substitute_class_id']} CONDUCTED - credited to primary Prof. {PROFESSOR_ID}",
         payload["transaction_hash"],
     )
     return (f"class #{STATE['substitute_class_id']} CONDUCTED on-chain, "
-            f"credit substitute Prof. {SUBSTITUTE_ID}: {tx}")
+            f"credit primary Prof. {PROFESSOR_ID}, conductor substitute Prof. {SUBSTITUTE_ID}: {tx}")
 
 
 def m3_logs_show_both() -> str:
@@ -982,7 +993,7 @@ def main() -> int:
         module3.step("M3.3", "student scan -> CONDUCTED on-chain", m3_scan_conducted)
         module3.step("M3.4", "issue substitute key to real faculty", m3_issue_substitute_key)
         module3.step("M3.5", "substitute redeems key, starts covering", m3_substitute_redeems)
-        module3.step("M3.6", "scan -> workload credited to the substitute", m3_scan_credits_substitute)
+        module3.step("M3.6", "scan -> PRIMARY credit, substitute conductor", m3_scan_credits_primary)
         module3.step("M3.7", "workload audit log shows both entries", m3_logs_show_both)
     except Exception as exc:
         detail = _reason(exc)

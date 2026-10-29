@@ -18,7 +18,12 @@ export async function loadTimetableClasses(professorId) {
   return data.classes;
 }
 
-// The API exposes IDs, not a faculty directory. Never attach mock names.
+export async function loadFacultyColleagues() {
+  const data = await api("/faculty/colleagues");
+  return data.colleagues || [];
+}
+
+// Use returned names when available, and a real user ID as the fallback.
 export function professorLabel(id) {
   return id == null ? "Not available" : `Faculty #${id}`;
 }
@@ -71,7 +76,7 @@ export function formatDateTime(iso) {
 // message still shows as the banner's detail line, so contract reverts stay
 // debuggable during demos.
 const MESSAGES = {
-  "schedule/too_early": "This class hasn't reached its start time yet.",
+  "schedule/too_early": "It's too early to start this class. Wait until the scheduled start window, then try again.",
 
   // Input validation — check "request"
   "request/missing_fields": "Some required information is missing — check the fields and retry.",
@@ -109,13 +114,19 @@ const MESSAGES = {
   "substitute_token/substitute_token_expired":
     "This substitute key expired (30-minute lifetime). Ask the professor to issue a fresh one.",
   "substitute_token/token_not_found":
-    "This key wasn't issued by the API — only keys from “Issue Substitute Key” can be redeemed.",
+    "This key wasn't issued by the API — ask the primary professor to issue a key from the Substitute card.",
+  "substitute_token/substitute_token_wrong_purpose":
+    "This isn't a substitute key. Ask the primary professor for the full key from the Substitute card.",
   "substitute_token/token_already_redeemed":
     "This key was already redeemed — each key starts the class exactly once.",
 
   // Substitute identity — check "substitute"
   "substitute/substitute_mismatch":
-    "This key authorizes a different substitute — redeem it while acting as the professor it was issued for.",
+    "This key was issued to a different colleague. Ask the primary professor for a key issued to your account.",
+  "substitute/substitute_not_found":
+    "That colleague no longer exists. Refresh the page and select another colleague.",
+  "substitute/substitute_not_faculty":
+    "Only a faculty colleague can cover this class. Refresh the page and select another colleague.",
 
   // On-chain anchoring — check "workload_ledger"
   "workload_ledger/blockchain_unavailable":

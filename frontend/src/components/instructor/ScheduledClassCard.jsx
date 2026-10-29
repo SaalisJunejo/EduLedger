@@ -9,11 +9,8 @@ import {
   formatDateTime,
   professorLabel,
   shortHash,
-  shortToken,
   statusMeta,
 } from "../../lib/workload.js";
-
-const LABEL_CLASS = "text-xs font-bold uppercase tracking-wide text-ink-muted";
 
 /**
  * One scheduled class of the professor's day (Module 3 — My Classes).
@@ -36,12 +33,6 @@ export default function ScheduledClassCard({
 }) {
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState(null);
-  const [issueOpen, setIssueOpen] = useState(false);
-  const [issueSubstituteId, setIssueSubstituteId] = useState("");
-  const [issuing, setIssuing] = useState(false);
-  const [issueError, setIssueError] = useState(null);
-  const [issued, setIssued] = useState(null); // issue response (token + expiry)
-  const [copied, setCopied] = useState(false);
 
   // The badge mirrors the on-chain outcome; while a session runs but
   // hasn't concluded yet, a "live" chip makes the started state obvious
@@ -55,9 +46,8 @@ export default function ScheduledClassCard({
         ? { label: "Session live", chip: "bg-primary-soft text-primary-strong" }
         : { label: "Live · substitute covering", chip: "bg-primary-soft text-primary-strong" }
       : { label: "Awaiting session", chip: "bg-surface-muted text-ink-muted" };
-  // The workload credits whoever conducted the class — when that isn't the
-  // scheduled professor, a substitute covered it.
-  const substituteCovered = Boolean(log && log.conductedBy !== facultyId);
+  const creditedProfessorId = log?.professorId ?? facultyId;
+  const conductor = log?.conductedByName || professorLabel(log?.conductedBy);
 
   async function startSession() {
     setStarting(true);
@@ -73,47 +63,6 @@ export default function ScheduledClassCard({
     } finally {
       setStarting(false);
     }
-  }
-
-  async function issueKey() {
-    const substituteId = Number(issueSubstituteId);
-    if (!Number.isSafeInteger(substituteId) || substituteId <= 0 || substituteId === facultyId) {
-      setIssueError({ message: "Enter another faculty member's real user ID (a positive integer)." });
-      return;
-    }
-    setIssuing(true);
-    setIssueError(null);
-    try {
-      const data = await api("/faculty/substitute/issue", {
-        method: "POST",
-        body: {
-          class_id: scheduledClass.id,
-          substitute_id: substituteId,
-        },
-      });
-      setIssued(data);
-      setCopied(false);
-    } catch (error) {
-      setIssueError(error);
-    } finally {
-      setIssuing(false);
-    }
-  }
-
-  async function copyToken() {
-    try {
-      await navigator.clipboard.writeText(issued.substitute_token);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* clipboard unavailable — the full key stays selectable in its block */
-    }
-  }
-
-  function toggleIssueForm() {
-    setIssueOpen((open) => !open);
-    setIssued(null);
-    setIssueError(null);
   }
 
   return (
@@ -139,8 +88,8 @@ export default function ScheduledClassCard({
         <p className="mt-3 text-xs leading-relaxed text-ink-muted">
           Final outcome recorded on the workload ledger.
           {log ? (
-            <> {formatDateTime(log.timestamp)} (Asia/Karachi) · workload credited to{" "}
-              {professorLabel(log.conductedBy)}{substituteCovered ? " (substitute)" : ""} · tx{" "}
+            <> {formatDateTime(log.timestamp)} (Asia/Karachi) · Credited to{" "}
+              {professorLabel(creditedProfessorId)}, conducted by {conductor} · tx{" "}
               <span className="font-mono">{shortHash(log.onchainTxHash)}</span>
             </>
           ) : null}
@@ -165,9 +114,6 @@ export default function ScheduledClassCard({
               onDeclared={onWorkloadRecorded}
             />
 
-            <Button variant="secondary" onClick={toggleIssueForm}>
-              {issueOpen ? "Hide Substitute Key" : "Issue Substitute Key"}
-            </Button>
           </div>
 
           {startError ? (
@@ -182,77 +128,6 @@ export default function ScheduledClassCard({
             </div>
           ) : null}
 
-          {issueOpen && !issued ? (
-            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-4">
-              <label
-                htmlFor={`substitute-select-${scheduledClass.id}`}
-                className={LABEL_CLASS}
-              >
-                Substitute faculty user ID
-              </label>
-              <div className="mt-1.5 flex flex-col gap-3 sm:flex-row">
-                <input
-                  id={`substitute-select-${scheduledClass.id}`}
-                  type="number"
-                  min="1"
-                  step="1"
-                  placeholder="Colleague's faculty user ID"
-                  value={issueSubstituteId}
-                  onChange={(event) => setIssueSubstituteId(event.target.value)}
-                  disabled={issuing}
-                  className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-sm text-ink focus:outline-2 focus:outline-primary disabled:opacity-60 sm:flex-1"
-                />
-                <Button onClick={issueKey} loading={issuing} className="sm:w-32">
-                  Issue Key
-                </Button>
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-ink-muted">
-                No faculty directory endpoint is available: enter the colleague's actual user ID.
-                The key is a signed token valid for 30 minutes and redeemable exactly once —
-                only by the selected professor. Redeeming starts the class session with the
-                workload credited to them as substitute.
-              </p>
-
-              {issueError ? (
-                <div className="mt-3">
-                  <StatusBanner
-                    tone="error"
-                    title="Couldn't issue the substitute key"
-                    detail={issueError.status ? issueError.message : undefined}
-                  >
-                    {describeWorkloadError(issueError)}
-                  </StatusBanner>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-
-          {issued ? (
-            <div className="mt-4 rounded-lg border border-success/30 bg-success-soft p-4">
-              <p className="text-sm font-semibold text-success">
-                Substitute key issued — {professorLabel(issued.substitute_id)}
-              </p>
-              <p className="mt-0.5 text-xs leading-relaxed text-success">
-                Valid until {formatDateTime(issued.expires_at)} (Asia/Karachi; {issued.expires_in_minutes}{" "}
-                minutes). Give the code below to your substitute — they redeem it from their own
-                dashboard&apos;s &quot;Redeem Substitute Key&quot;.
-              </p>
-              <p className="mt-2 text-center font-mono text-sm font-bold text-ink">
-                {shortToken(issued.substitute_token)}
-              </p>
-              <p className="mt-2 break-all rounded-lg bg-surface px-3 py-2 font-mono text-xs text-ink">
-                {issued.substitute_token}
-              </p>
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <Button variant="secondary" onClick={copyToken}>
-                  {copied ? "Copied ✓" : "Copy full key"}
-                </Button>
-                <Button variant="secondary" onClick={toggleIssueForm}>
-                  Done
-                </Button>
-              </div>
-            </div>
-          ) : null}
         </>
       )}
     </Card>

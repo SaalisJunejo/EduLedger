@@ -51,7 +51,9 @@ export async function api(path, { method = "GET", body } = {}) {
   }
 
   if (!response.ok) {
-    if (response.status === 401) {
+    // An expired/invalid substitute key is a domain error, not a failed
+    // bearer login. Keep the session so the card can show the key error.
+    if (response.status === 401 && payload?.check !== "substitute_token") {
       logout();
       // Keep login failures on the form so its backend message remains visible.
       if (window.location.pathname !== "/login") window.location.replace("/login");
