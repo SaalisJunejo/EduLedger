@@ -1,8 +1,10 @@
 """Student model (Module 1 - Zero-Proxy Attendance Engine).
 
 A student's identity is anchored to one registered device (`device_id`,
-bound via POST /api/v1/student/register-device) and optional biometric
-embeddings: the face embedding backs POST /api/v1/attendance/verify-identity,
+bound via POST /api/v1/student/register-device) plus the device-bound HMAC
+secret issued by POST /api/v1/students/device/enroll (`device_secret`,
+Phase 1.7a / decision D4) and optional biometric embeddings: the face
+embedding backs POST /api/v1/attendance/verify-identity,
 and the periocular (eye-region) embedding is reserved for the PRD's
 anti-spoofing future scope.
 
@@ -26,6 +28,13 @@ class Student(db.Model):
     # (one student identity per device). Null until first binding.
     device_id = db.Column(db.String(255), nullable=True, unique=True, index=True)
 
+    # Device-bound HMAC secret (Phase 1.7a, decision D4): base64url of 32
+    # random bytes, issued ONCE by POST /api/v1/students/device/enroll and
+    # held by the phone's OS behind a biometric prompt. The server verifies a
+    # challenge-response with it (POST /students/verify-identity-device) and
+    # clears it on an admin rebind. Stored in plain form - FYP simplification.
+    device_secret = db.Column(db.String(64), nullable=True)
+
     # Face embedding dict (see module docstring); null until enrolled.
     face_embedding = db.Column(db.JSON, nullable=True)
 
@@ -38,6 +47,7 @@ class Student(db.Model):
             "id": self.id,
             "name": self.name,
             "device_id": self.device_id,
+            "has_device_secret": bool(self.device_secret),
             "has_face_embedding": bool(self.face_embedding),
             "has_periocular_embedding": bool(self.periocular_embedding),
         }

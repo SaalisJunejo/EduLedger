@@ -65,6 +65,10 @@ class BaseConfig:
     FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.85"))
     # Lifetime of the short-lived verification token issued by verify-identity.
     VERIFICATION_TOKEN_SECONDS = int(os.getenv("VERIFICATION_TOKEN_SECONDS", "30"))
+    # Lifetime of a single-use identity challenge (Phase 1.7a, decision D4):
+    # GET /students/identity/challenge -> POST /students/verify-identity-device.
+    # Tests may lower it (e.g. 5) to exercise expiry without waiting 30 s.
+    IDENTITY_CHALLENGE_TTL_SECONDS = int(os.getenv("IDENTITY_CHALLENGE_TTL_SECONDS", "30"))
     # Face embedding provider: "auto" (face_recognition when installed, else
     # the built-in demo embedder), "demo", or "face_recognition".
     FACE_EMBEDDING_PROVIDER = os.getenv("FACE_EMBEDDING_PROVIDER", "auto")

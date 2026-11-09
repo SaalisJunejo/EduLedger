@@ -22,7 +22,9 @@ def rebind_device():
 
     Body: ``{"student_id": 2024001, "device_id": "<new device id>"}``.
     Replaces any existing binding - this is the only path that may do so
-    (students cannot rebind themselves via /student/register-device).
+    (students cannot rebind themselves via /student/register-device). The
+    old phone's device secret (Phase 1.7a, D4) is cleared with the binding,
+    so the new phone must enroll again via POST /students/device/enroll.
     """
     body = request.get_json(silent=True) or {}
     student_id = body.get("student_id")
@@ -51,13 +53,17 @@ def rebind_device():
         )
 
     previous_device_id = student.device_id
+    # The lost phone's HMAC secret must not survive its binding (D4).
+    secret_cleared = student.device_secret is not None
     student.device_id = device_id
+    student.device_secret = None
     db.session.commit()
 
     return jsonify(
         {
             "student": student.to_dict(),
             "previous_device_id": previous_device_id,
+            "device_secret_cleared": secret_cleared,
             "note": "admin rebind stub - authentication not enforced yet",
         }
     )
