@@ -44,12 +44,16 @@ class BaseConfig:
     ATTENDANCE_ROTATION_SECONDS = int(os.getenv("ATTENDANCE_ROTATION_SECONDS", "10"))
     SESSION_START_GRACE_MINUTES = int(os.getenv("SESSION_START_GRACE_MINUTES", "5"))
     TIMETABLE_TIMEZONE = os.getenv("TIMETABLE_TIMEZONE", "Asia/Karachi")
+    # A session starting more than this many minutes after the scheduled start
+    # is shown as late (D18); derived off-chain only, never written on-chain.
+    LATE_AFTER_MINUTES = int(os.getenv("LATE_AFTER_MINUTES", "10"))
     # Set to false to skip starting the background scheduler (tests, scripts).
     SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 
     # -- Faculty workload ledger (Module 3) ----------------------------------
     # Minutes after a ScheduledClass's startTime with no SessionLog before the
-    # background job auto-flags the class UNCONDUCTED on-chain. The default
+    # background job auto-flags the class UNCONDUCTED on-chain. Applies only to
+    # rows with a null end_time; rows with an end_time wait for it (D19). The default
     # follows the PRD's 15-minute grace period; tests set it to 1 (or pass an
     # in-process override) so the auto-flag can be exercised without waiting.
     UNCONDUCTED_THRESHOLD_MINUTES = int(os.getenv("UNCONDUCTED_THRESHOLD_MINUTES", "15"))

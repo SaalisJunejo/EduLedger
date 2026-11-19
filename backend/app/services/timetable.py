@@ -13,7 +13,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask import current_app
 
 from ..extensions import db
-from ..models import FacultyProfile, ScheduledClass, User, UserRole
+from ..models import (
+    AttendanceSession, FacultyProfile, ScheduledClass, User, UserRole, WorkloadSession,
+)
 from ..util import utcnow
 
 COLUMNS = (
@@ -127,7 +129,9 @@ def start_gate(scheduled_class: ScheduledClass):
 
     Null-weekday legacy rows retain absolute UTC semantics. Uploaded rows have
     already had their local weekday/time resolved to an absolute UTC occurrence.
-    No end-time/late-start cutoff is introduced by this lower-bound gate.
+    D19: a row with an end_time may start until that end_time, then too_late;
+    a null end_time keeps the lower bound only. The same gate serves attendance
+    start, workload start and substitute redeem.
     """
     from ..api.errors import api_error
 
@@ -143,4 +147,57 @@ def start_gate(scheduled_class: ScheduledClass):
             return api_error("schedule", "invalid_schedule", "scheduled weekday does not match the dated local start", 400)
     if _utc(utcnow()) < _utc(scheduled_class.start_time) - timedelta(minutes=grace):
         return api_error("schedule", "too_early", f"session may start only within {grace} minutes before the scheduled start", 403)
+    if scheduled_class.end_time is not None and _utc(utcnow()) > _utc(scheduled_class.end_time):
+        return api_error("schedule", "too_late", "the scheduled class has already ended; a session can no longer be started", 403)
     return None
+
+
+def first_session_starts(classes) -> dict[int, datetime]:
+    """Earliest real UTC start of any session opened for each class (R4.8.4).
+
+    Both start paths record it already: WorkloadSession.started_at (workload
+    start and substitute redeem) and AttendanceSession.start_time (attendance
+    start, class_id = str(ScheduledClass.id)). Attendance rows survive cold
+    resets, so a row only counts from the class's own start gate onwards -
+    a re-issued class id never inherits an old lifecycle's session.
+    """
+    classes = list(classes)
+    if not classes:
+        return {}
+    grace = timedelta(minutes=current_app.config["SESSION_START_GRACE_MINUTES"])
+    by_id = {scheduled_class.id: scheduled_class for scheduled_class in classes}
+    starts: dict[int, datetime] = {}
+
+    def keep(class_id: int, started: datetime | None) -> None:
+        if started is not None and (class_id not in starts or started < starts[class_id]):
+            starts[class_id] = started
+
+    for class_id, started in db.session.query(
+        WorkloadSession.class_id, db.func.min(WorkloadSession.started_at),
+    ).filter(WorkloadSession.class_id.in_(list(by_id))).group_by(WorkloadSession.class_id):
+        keep(class_id, started)
+
+    names = {str(class_id): class_id for class_id in by_id}
+    for name, started in db.session.query(
+        AttendanceSession.class_id, AttendanceSession.start_time,
+    ).filter(AttendanceSession.class_id.in_(list(names))):
+        class_id = names[name]
+        if started >= by_id[class_id].start_time - grace:
+            keep(class_id, started)
+    return starts
+
+
+def lateness(scheduled_start: datetime, actual_start: datetime) -> tuple[bool, int]:
+    """(late, lateMinutes) of an actual start against the scheduled start (D18).
+
+    Both instants are compared in TIMETABLE_TIMEZONE. lateMinutes is the whole
+    minutes after the scheduled start (0 for an early or on-time start); late
+    means strictly more than LATE_AFTER_MINUTES after it.
+    """
+    late_after = current_app.config["LATE_AFTER_MINUTES"]
+    if not isinstance(late_after, int) or late_after < 0:
+        raise ValueError("LATE_AFTER_MINUTES must be nonnegative")
+    zone = timetable_timezone()
+    delta = _utc(actual_start).astimezone(zone) - _utc(scheduled_start).astimezone(zone)
+    minutes = max(0, int(delta.total_seconds() // 60))
+    return delta > timedelta(minutes=late_after), minutes

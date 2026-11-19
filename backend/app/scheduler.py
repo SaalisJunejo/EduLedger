@@ -14,10 +14,12 @@ Jobs:
   `app/api/sessions.py`) without fighting the scheduler. Faculty workload
   sessions (Module 3) are plain AttendanceSession rows, so they rotate here
   too with zero extra code.
-- `flag_unconducted_classes` (every minute) - the Module 3 auto-flag: any
-  ScheduledClass whose startTime + UNCONDUCTED_THRESHOLD_MINUTES (default
-  15) has passed with no SessionLog yet is anchored on-chain as
-  UNCONDUCTED via WorkloadLedger.logWorkload().
+- `flag_unconducted_classes` (every minute) - the Module 3 auto-flag: a
+  ScheduledClass with a null end_time whose startTime +
+  UNCONDUCTED_THRESHOLD_MINUTES (default 15) has passed with no SessionLog
+  yet, or one with an end_time that has passed with no SessionLog and no
+  session ever started (D19), is anchored on-chain as UNCONDUCTED via
+  WorkloadLedger.logWorkload().
 """
 
 import atexit
@@ -30,6 +32,7 @@ from .extensions import db
 from .models import AttendanceSession, ScheduledClass, SessionLog
 from .models.workload import STATUS_UNCONDUCTED
 from .services import workload
+from .services.timetable import first_session_starts
 from .util import utcnow
 
 logger = logging.getLogger(__name__)
@@ -69,14 +72,41 @@ def rotate_expired_nonces(app) -> int:
             return 0
 
 
+def overdue_classes(app, now) -> list[ScheduledClass]:
+    """The classes the auto-flag would anchor as UNCONDUCTED at `now`.
+
+    Null end_time: unchanged threshold rule - startTime lies more than
+    UNCONDUCTED_THRESHOLD_MINUTES before `now` and there is no SessionLog.
+    Non-null end_time (D19): end_time has passed, there is no SessionLog
+    and no session was ever started for the class, so a late start is never
+    pre-empted by a permanent UNCONDUCTED entry. Read-only; needs an app
+    context.
+    """
+    threshold = timedelta(minutes=app.config["UNCONDUCTED_THRESHOLD_MINUTES"])
+    legacy = ScheduledClass.query.filter(
+        ScheduledClass.end_time.is_(None),
+        ScheduledClass.start_time <= now - threshold,
+        ~ScheduledClass.session_logs.any(),
+    ).all()
+    ended = ScheduledClass.query.filter(
+        ScheduledClass.end_time.isnot(None),
+        ScheduledClass.end_time < now,
+        ~ScheduledClass.session_logs.any(),
+    ).all()
+    started = first_session_starts(ended)
+    return legacy + [scheduled_class for scheduled_class in ended if scheduled_class.id not in started]
+
+
 def flag_unconducted_classes(app) -> int:
     """Auto-flag overdue un-conducted classes on-chain (Module 3).
 
-    A class is overdue when its startTime lies more than
-    UNCONDUCTED_THRESHOLD_MINUTES in the past (read from `app.config` at
-    call time, so tests can override it in-process) and it still has no
-    SessionLog - meaning no student scanned, nobody declared zero
-    attendance, and no substitute redeemed a session. Each overdue class is
+    A class is overdue as decided by `overdue_classes`: with a null
+    end_time, when its startTime lies more than UNCONDUCTED_THRESHOLD_MINUTES
+    in the past (read from `app.config` at call time, so tests can override
+    it in-process) and it still has no SessionLog - meaning no student
+    scanned, nobody declared zero attendance, and no substitute redeemed a
+    session; with an end_time, only once that end_time has passed with no
+    session at all. Each overdue class is
     anchored on-chain as UNCONDUCTED (credited to the scheduled professor)
     and a local SessionLog row records the transaction hash.
 
@@ -91,17 +121,7 @@ def flag_unconducted_classes(app) -> int:
     with app.app_context():
         try:
             now = utcnow()
-            threshold = timedelta(minutes=app.config["UNCONDUCTED_THRESHOLD_MINUTES"])
-            cutoff = now - threshold
-
-            # Classes past the grace window that never produced a SessionLog.
-            overdue = (
-                ScheduledClass.query.filter(
-                    ScheduledClass.start_time <= cutoff,
-                    ~ScheduledClass.session_logs.any(),
-                )
-                .all()
-            )
+            overdue = overdue_classes(app, now)
 
             flagged = 0
             for scheduled_class in overdue:

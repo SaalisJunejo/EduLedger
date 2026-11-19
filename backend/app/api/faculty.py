@@ -53,7 +53,7 @@ from ..models import (
 from ..models.workload import STATUS_CONDUCTED, STATUS_CONDUCTED_ZERO_STUDENTS
 from ..services import workload
 from ..services.auth import require_auth
-from ..services.timetable import start_gate
+from ..services.timetable import first_session_starts, lateness, start_gate
 from ..services.substitute_token import (
     SubstituteTokenError,
     mint as mint_substitute_token,
@@ -651,14 +651,32 @@ def list_logs():
     user id, with their full name in conductedByName. substituted indicates
     coverage by someone other than the primary professor. Legacy rows keep
     their original on-chain credit, and UNCONDUCTED is never substituted.
+    CONDUCTED and CONDUCTED_ZERO_STUDENTS entries also carry late and
+    lateMinutes: the class's first real session start versus its scheduled
+    start, in TIMETABLE_TIMEZONE (both null if no session start is on record).
     """
     logs = db.session.query(SessionLog, User).outerjoin(
         User, User.id == SessionLog.conducted_by,
     ).order_by(SessionLog.timestamp.desc()).all()
+    conducted = (STATUS_CONDUCTED, STATUS_CONDUCTED_ZERO_STUDENTS)
+    starts = first_session_starts({
+        log.class_id: log.scheduled_class for log, _conductor in logs
+        if log.status in conducted and log.scheduled_class is not None
+    }.values())
     entries = []
     for log, conductor in logs:
         entry = log.to_dict()
         entry["conductedByName"] = conductor.full_name if conductor is not None else None
         entry["class"] = log.scheduled_class.to_dict() if log.scheduled_class else None
+        if log.status in conducted:
+            actual_start = starts.get(log.class_id)
+            entry["late"] = entry["lateMinutes"] = None
+            if actual_start is not None:
+                try:
+                    entry["late"], entry["lateMinutes"] = lateness(
+                        log.scheduled_class.start_time, actual_start,
+                    )
+                except ValueError as exc:
+                    return api_error("schedule", "invalid_configuration", str(exc), 500)
         entries.append(entry)
     return jsonify({"logs": entries, "count": len(entries)})

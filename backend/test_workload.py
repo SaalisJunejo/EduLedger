@@ -297,13 +297,13 @@ def step_preflight():
 def step_seed_classes():
     """One faculty-owned absolute-time ScheduledClass per scenario."""
     with APP.app_context():
-        def seed(professor_id: int, minutes_from_now: float, course: str) -> int:
+        def seed(professor_id: int, minutes_from_now: float, course: str, with_end_time: bool = True) -> int:
             start = utcnow() + timedelta(minutes=minutes_from_now) - timedelta(seconds=5)
             scheduled_class = ScheduledClass(
                 professor_id=professor_id,
                 room="Room 204",
                 start_time=start,
-                end_time=start + timedelta(hours=1),
+                end_time=start + timedelta(hours=1) if with_end_time else None,
                 day_of_week=None,
                 course_code=course,
             )
@@ -317,7 +317,8 @@ def step_seed_classes():
         STATE["sub_class_id"] = seed(PROFESSOR_ID, 0, "BSCS-404")
         # 3 minutes in the past: past the test's 1-minute threshold, but
         # inside the live server's 15-minute default (see module docstring).
-        STATE["autoflag_class_id"] = seed(PROFESSOR_ID, -3, "BSCS-405")
+        # No end_time: under D19 only null-end_time rows use that threshold.
+        STATE["autoflag_class_id"] = seed(PROFESSOR_ID, -3, "BSCS-405", with_end_time=False)
 
     print(
         f"   classes seeded: happy={STATE['happy_class_id']} zero={STATE['zero_class_id']} "
