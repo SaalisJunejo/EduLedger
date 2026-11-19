@@ -4,7 +4,9 @@
 - GET  /api/v1/session/<id>/qr          - projector-facing QR (rotating nonce)
   plus the 6-digit numeric code derived from the same nonce
 - POST /api/v1/session/<id>/end         - the conductor closes the session
-  (no more scans, no more rotation) and the live panel is told
+  (no more scans, no more rotation) and the live panel is told; the class
+  is then resolved from its attendance evidence: CONDUCTED with at least one
+  check-in (Phase 2.1e), zero-student when it captured nobody (Phase 2.1c)
 - GET  /api/v1/session/<id>/attendees   - the roster so far, for page load
   and socket reconnect (conductor, HOD or ADMIN)
 
@@ -25,11 +27,12 @@ from ..models import AttendanceSession, ScheduledClass
 from ..services.attendance_code import current_code
 from ..services.auth import require_auth
 from ..services.timetable import start_gate
-from ..services import live_attendance
+from ..services import live_attendance, workload
 from ..sockets import emit_session_ended
 from ..util import iso_z, utcnow
 from . import api_v1
 from .errors import api_error
+from .faculty import _workload_error
 
 
 def _qr_png_data_uri(payload: str) -> str:
@@ -160,6 +163,13 @@ def end_session(session_id):
     active sessions - and `ended_at` makes the closure deliberate, so later
     scans fail with {check: "session", error: "session_ended"} instead of
     the generic "session_inactive". Idempotent: ending twice is a no-op.
+
+    Phase 2.1c/2.1e: the session's ScheduledClass is then resolved through
+    workload.resolve_ended_session, the single outcome entry point: with at
+    least one verified capture across its sessions it is anchored CONDUCTED,
+    with none (and no session still live) CONDUCTED_ZERO_STUDENTS, each once.
+    If that chain write fails the session stays ended and the workload error
+    is returned; ending again retries the anchor.
     """
     session = db.session.get(AttendanceSession, session_id)
     if session is None:
@@ -178,6 +188,12 @@ def end_session(session_id):
 
     count = live_attendance.check_in_count(session.id)
     emit_session_ended(session.id, count)
+
+    try:
+        if workload.resolve_ended_session(session) is not None:
+            db.session.commit()
+    except workload.WorkloadError as exc:
+        return _workload_error(exc)
 
     return jsonify(
         {

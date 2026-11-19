@@ -73,6 +73,7 @@ from app.models import (
     FacultyProfile,
     InstitutionWhitelist,
     ScheduledClass,
+    SessionLog,
     StudentProfile,
     User,
     generate_nonce,
@@ -638,6 +639,11 @@ def cleanup() -> str:
             synchronize_session=False,
         )
         removed += AttendanceSession.query.filter(AttendanceSession.id.in_(session_ids)).delete(
+            synchronize_session=False,
+        )
+        # The workload sweep may resolve these ended classes from their
+        # check-ins (Phase 2.1e); its SessionLog rows reference the classes.
+        removed += SessionLog.query.filter(SessionLog.class_id.in_(class_ids)).delete(
             synchronize_session=False,
         )
         removed += ScheduledClass.query.filter(ScheduledClass.id.in_(class_ids)).delete(

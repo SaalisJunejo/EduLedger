@@ -47,8 +47,11 @@ class BaseConfig:
     # A session starting more than this many minutes after the scheduled start
     # is shown as late (D18); derived off-chain only, never written on-chain.
     LATE_AFTER_MINUTES = int(os.getenv("LATE_AFTER_MINUTES", "10"))
-    # Set to false to skip starting the background scheduler (tests, scripts).
+    # Set to false to start no background job at all (tests, scripts); tests
+    # then call the job functions in app/scheduler.py explicitly.
     SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+    # Seconds between runs of the workload auto-flag / outcome sweep.
+    SCHEDULER_INTERVAL_SECONDS = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60"))
 
     # -- Faculty workload ledger (Module 3) ----------------------------------
     # Minutes after a ScheduledClass's startTime with no SessionLog before the

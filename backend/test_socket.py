@@ -56,6 +56,7 @@ from app.models import (
     AttendanceSession,
     FacultyProfile,
     ScheduledClass,
+    SessionLog,
     Student,
     StudentProfile,
     User,
@@ -514,6 +515,11 @@ def cleanup() -> str:
         removed += AttendanceSession.query.filter(
             AttendanceSession.id.in_(session_ids),
         ).delete(synchronize_session=False)
+        # Ending a session writes the class's SessionLog (Phase 2.1e), which
+        # references the class; the on-chain entry itself is permanent.
+        removed += SessionLog.query.filter(SessionLog.class_id.in_(class_ids)).delete(
+            synchronize_session=False,
+        )
         removed += ScheduledClass.query.filter(ScheduledClass.id.in_(class_ids)).delete(
             synchronize_session=False,
         )

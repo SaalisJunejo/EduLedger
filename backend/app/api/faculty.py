@@ -127,22 +127,11 @@ def _start_live_session(scheduled_class: ScheduledClass, conductor_id: int):
 def _anchor_session_log(scheduled_class: ScheduledClass, conductor_id: int, status: str) -> tuple[SessionLog, dict]:
     """Log the class outcome on-chain first, then persist the local row.
 
-    Same order as the Module 2 propose endpoint: a failed transaction must
-    never leave a local row behind. Returns (session_log, chain_result).
-    Callers commit.
+    The shared helper lives in services/workload.py (Phase 2.1e), so the
+    attendance-derived outcome uses exactly the same credit rules.
+    Returns (session_log, chain_result). Callers commit.
     """
-    credited_professor_id = scheduled_class.professor_id
-    result = workload.log_workload(scheduled_class.id, credited_professor_id, status)
-    session_log = SessionLog(
-        class_id=scheduled_class.id,
-        status=status,
-        professor_id=credited_professor_id,
-        conducted_by=conductor_id,
-        timestamp=utcnow(),
-        onchain_tx_hash=result["transaction_hash"],
-    )
-    db.session.add(session_log)
-    return session_log, result
+    return workload.anchor_session_log(scheduled_class, conductor_id, status)
 
 
 @api_v1.post("/faculty/session/start")

@@ -14,12 +14,21 @@ Jobs:
   `app/api/sessions.py`) without fighting the scheduler. Faculty workload
   sessions (Module 3) are plain AttendanceSession rows, so they rotate here
   too with zero extra code.
-- `flag_unconducted_classes` (every minute) - the Module 3 auto-flag: a
+- `flag_unconducted_classes` (every SCHEDULER_INTERVAL_SECONDS, default 60) -
+  the Module 3 auto-flag: a
   ScheduledClass with a null end_time whose startTime +
   UNCONDUCTED_THRESHOLD_MINUTES (default 15) has passed with no SessionLog
   yet, or one with an end_time that has passed with no SessionLog and no
   session ever started (D19), is anchored on-chain as UNCONDUCTED via
-  WorkloadLedger.logWorkload().
+  WorkloadLedger.logWorkload(). In the same sweep, a class with an end_time
+  that has passed, a started session and no SessionLog is resolved from its
+  attendance evidence (Phase 2.1e): CONDUCTED with check-ins,
+  CONDUCTED_ZERO_STUDENTS without, so a session nobody ended still resolves.
+  Any session still live on such a class is closed first, in the same
+  transaction (Phase 2.1f), so no scan can land after the outcome.
+
+With SCHEDULER_ENABLED false no job is scheduled at all; tests call the job
+functions directly instead.
 """
 
 import atexit
@@ -29,7 +38,7 @@ from datetime import timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .extensions import db
-from .models import AttendanceSession, ScheduledClass, SessionLog
+from .models import AttendanceSession, ScheduledClass, SessionLog, WorkloadSession
 from .models.workload import STATUS_UNCONDUCTED
 from .services import workload
 from .services.timetable import first_session_starts
@@ -97,6 +106,46 @@ def overdue_classes(app, now) -> list[ScheduledClass]:
     return legacy + [scheduled_class for scheduled_class in ended if scheduled_class.id not in started]
 
 
+def unresolved_started_classes(app, now) -> list[ScheduledClass]:
+    """Classes whose end_time passed with a session started but no SessionLog.
+
+    The complement of the D19 half of `overdue_classes`: these are never
+    flagged UNCONDUCTED; the sweep resolves them from attendance evidence
+    instead (Phase 2.1e). Read-only; needs an app context.
+    """
+    ended = ScheduledClass.query.filter(
+        ScheduledClass.end_time.isnot(None),
+        ScheduledClass.end_time < now,
+        ~ScheduledClass.session_logs.any(),
+    ).all()
+    started = first_session_starts(ended)
+    return [scheduled_class for scheduled_class in ended if scheduled_class.id in started]
+
+
+def close_live_sessions(scheduled_class: ScheduledClass, now) -> int:
+    """End every still-active session of a class whose end_time has passed.
+
+    Attendance sessions get is_active=false and ended_at (so /attendance/scan
+    refuses them as session_ended); their WorkloadSession rows, which have no
+    ended_at column, get is_active=false. Not committed here - the caller
+    commits it together with the outcome. Returns the rows closed.
+    """
+    session_ids = workload.class_session_ids(scheduled_class)
+    if not session_ids:
+        return 0
+    live = AttendanceSession.query.filter(
+        AttendanceSession.id.in_(session_ids),
+        AttendanceSession.is_active.is_(True),
+    ).all()
+    for session in live:
+        session.end(now=now)
+    closed_workload = WorkloadSession.query.filter(
+        WorkloadSession.class_id == scheduled_class.id,
+        WorkloadSession.is_active.is_(True),
+    ).update({WorkloadSession.is_active: False}, synchronize_session=False)
+    return len(live) + closed_workload
+
+
 def flag_unconducted_classes(app) -> int:
     """Auto-flag overdue un-conducted classes on-chain (Module 3).
 
@@ -116,7 +165,16 @@ def flag_unconducted_classes(app) -> int:
     by a race) is skipped with a warning and retried on the next tick if
     applicable; one bad class never blocks the others.
 
-    Returns the number of classes flagged (0 when there is nothing to do).
+    Then every class from `unresolved_started_classes` has its still-live
+    sessions closed (`close_live_sessions`) and goes through
+    workload.resolve_class_outcome (the same entry point as
+    POST /session/<id>/end): CONDUCTED when check-ins exist,
+    CONDUCTED_ZERO_STUDENTS otherwise. Closing and outcome commit together;
+    a failed chain write is skipped the same way (the closure is still
+    committed, and the outcome is retried on the next tick).
+
+    Returns the number of classes flagged UNCONDUCTED (0 when there is
+    nothing to do); resolved classes are logged, not counted.
     """
     with app.app_context():
         try:
@@ -149,9 +207,26 @@ def flag_unconducted_classes(app) -> int:
                 )
                 flagged += 1
 
-            if flagged:
+            resolved = 0
+            closed = 0
+            for scheduled_class in unresolved_started_classes(app, now):
+                closed += close_live_sessions(scheduled_class, now)
+                try:
+                    if workload.resolve_class_outcome(scheduled_class, require_closed=False) is not None:
+                        resolved += 1
+                except workload.WorkloadError as exc:
+                    logger.warning(
+                        "Outcome resolve skipped class %s: %s", scheduled_class.id, exc.message
+                    )
+
+            if flagged or resolved or closed:
                 db.session.commit()
+            if flagged:
                 logger.info("Auto-flagged %d un-conducted class(es) on-chain", flagged)
+            if closed:
+                logger.info("Closed %d live session row(s) past their class end_time", closed)
+            if resolved:
+                logger.info("Resolved %d started class(es) from attendance evidence", resolved)
             return flagged
         except Exception:
             db.session.rollback()
@@ -184,7 +259,7 @@ def init_scheduler(app) -> BackgroundScheduler | None:
     scheduler.add_job(
         flag_unconducted_classes,
         trigger="interval",
-        seconds=60,  # every minute, per the Module 3 spec
+        seconds=app.config["SCHEDULER_INTERVAL_SECONDS"],  # default 60, per the Module 3 spec
         args=[app],
         id=AUTOFLAG_JOB_ID,
         max_instances=1,
@@ -197,8 +272,9 @@ def init_scheduler(app) -> BackgroundScheduler | None:
     app.extensions["scheduler"] = scheduler
     logger.info(
         "Background jobs started: attendance nonce rotation (every %ss), "
-        "un-conducted auto-flag (every 60s, threshold %s min)",
+        "un-conducted auto-flag (every %ss, threshold %s min)",
         app.config["ATTENDANCE_ROTATION_SECONDS"],
+        app.config["SCHEDULER_INTERVAL_SECONDS"],
         app.config["UNCONDUCTED_THRESHOLD_MINUTES"],
     )
     return scheduler

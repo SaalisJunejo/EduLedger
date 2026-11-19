@@ -16,13 +16,16 @@ import {
 const TH_CLASS =
   "px-3 py-2 text-left text-xs font-bold uppercase tracking-wide text-ink-muted first:pl-0 last:pr-0";
 const TD_CLASS = "px-3 py-3 align-top first:pl-0 last:pr-0";
+const CHIP_CLASS = "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold";
 
 /**
  * Admin "Workload Audit Log" (Module 3): every SessionLog entry, newest
  * first, straight from GET /faculty/logs — student scans, zero-attendance
  * declarations, substitute coverage and the background auto-flag, each tied
  * to the on-chain transaction that anchored it. Tx hashes render short and
- * mono; hovering shows the full hash and clicking copies it.
+ * mono; hovering shows the full hash and clicking copies it. Conducted
+ * entries started late carry a "Late Nm" chip; a zero-student entry is shown
+ * as Conducted with a "0 present" chip (D9, display only).
  */
 export default function WorkloadAuditLogCard() {
   const [logs, setLogs] = useState(null); // null = not loaded yet
@@ -128,7 +131,9 @@ export default function WorkloadAuditLogCard() {
               </thead>
               <tbody>
                 {rows.map((log) => {
-                  const meta = statusMeta(log.status);
+                  const isZero = log.status === "CONDUCTED_ZERO_STUDENTS";
+                  const isConducted = isZero || log.status === "CONDUCTED";
+                  const meta = statusMeta(isZero ? "CONDUCTED" : log.status);
                   const credited = professorNames.get(log.professorId) || professorLabel(log.professorId);
                   const conductor = log.conductedByName || professorLabel(log.conductedBy);
                   return (
@@ -154,11 +159,20 @@ export default function WorkloadAuditLogCard() {
                         ) : null}
                       </td>
                       <td className={TD_CLASS}>
-                        <span
-                          className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ${meta.chip}`}
-                        >
-                          {meta.label}
-                        </span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className={`${CHIP_CLASS} ${meta.chip}`}>{meta.label}</span>
+                          {isConducted && log.late === true ? (
+                            <span
+                              className={`${CHIP_CLASS} bg-warning-soft text-warning`}
+                              title={`Session started ${log.lateMinutes} minutes after the scheduled start`}
+                            >
+                              Late {log.lateMinutes}m
+                            </span>
+                          ) : null}
+                          {isZero ? (
+                            <span className={`${CHIP_CLASS} bg-surface-muted text-ink-muted`}>0 present</span>
+                          ) : null}
+                        </div>
                       </td>
                       <td className={`${TD_CLASS} whitespace-nowrap text-ink-muted`}>
                         {formatDateTime(log.timestamp)}

@@ -16,7 +16,9 @@ Steps:
     1. seed classes       - four absolute-time ScheduledClass rows (see below)
     2. too_late (attendance) - POST /session/start after end_time      -> 403
     3. too_late (workload)   - POST /faculty/session/start after end_time -> 403
+                            too_late (or 409 class_already_logged, see notes)
     4. too_late (substitute) - POST /faculty/substitute/redeem after end_time -> 403
+                            too_late (or 409 class_already_logged, see notes)
     5. late start         - workload start 15 min after start_time, zero-attendance;
                             /faculty/logs -> late=true, lateMinutes 14-16
     6. on-time start      - workload start at start_time, one student scan;
@@ -25,23 +27,53 @@ Steps:
                             selected by the auto-flag job (and is at end_time + 1 min)
     8. ended, no session  - flag_unconducted_classes() called directly ->
                             UNCONDUCTED on-chain + local SessionLog
-    9. ended, started     - a session was started -> not selected, not flagged
+    9. ended, started     - a session was started -> not selected for UNCONDUCTED;
+                            flag_unconducted_classes() resolves it
+                            CONDUCTED_ZERO_STUDENTS, exactly one SessionLog
    10. legacy null end    - end_time=None -> threshold rule still selects and
                             flags it (threshold overridden to 1 min in-process)
+   11. late, ended empty  - workload start 15 min late, POST /session/<id>/end with
+                            zero captures -> CONDUCTED_ZERO_STUDENTS on-chain,
+                            /faculty/logs late=true, lateMinutes 14-16 (Phase 2.1c)
+   12. ended twice        - a second /end writes no second entry
+   13. one capture        - ending sessions that captured someone (a workload scan,
+                            a seeded check-in) writes no zero-student entry;
+                            the check-in class gets exactly one CONDUCTED entry
+   14. attendance only    - POST /session/start, one check-in, /end -> exactly one
+                            CONDUCTED entry on-chain + /faculty/logs with
+                            late/lateMinutes (Phase 2.1e)
+   15. attendance twice   - /end again on that session -> still one entry
+   16. attendance empty   - POST /session/start, zero check-ins, /end ->
+                            CONDUCTED_ZERO_STUDENTS (the 2.1c path)
+   17. already logged     - a check-in + /end on a class the workload scan already
+                            logged -> no second entry
+   18. sweep resolves     - end_time passed, ended attendance session with one
+                            check-in, no SessionLog -> flag_unconducted_classes()
+                            anchors CONDUCTED (not UNCONDUCTED)
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
       never hosts a second scheduler. The auto-flag selection is checked
-      in-process via app.scheduler.overdue_classes(); steps 7 and 9 anchor
-      nothing. Steps 8 and 10 call flag_unconducted_classes() directly, which
-      also flags any other overdue row in the shared DB (as the live job would;
-      in step 10 with the 1-minute threshold, like test_workload.py). If the
-      live job flags the step 8 class first, the outcome asserted is the same.
-    - The too_late class already ended, so the live server's auto-flag job
-      could log it UNCONDUCTED mid-run (and workload start / redeem would then
-      answer class_already_logged instead). It is seeded with one ended
-      attendance session, which D19 counts as "a session was held", so the
-      live job never flags it.
+      in-process via app.scheduler.overdue_classes(); step 7 anchors
+      nothing. Every step that depends on the sweep (8, 9, 10, 18) calls
+      flag_unconducted_classes() directly, which also flags or resolves any
+      other eligible row in the shared DB (as the live job would; in step 10
+      with the 1-minute threshold, like test_workload.py). If the live job
+      gets to one of those classes first, the outcome asserted is the same.
+      For a fully deterministic run, start the server with
+      SCHEDULER_ENABLED=false too.
+    - The too_late class already ended and carries one ended attendance
+      session (zero check-ins), so D19 never flags it UNCONDUCTED - but the
+      live server's sweep resolves it CONDUCTED_ZERO_STUDENTS (Phase 2.1e)
+      once it ticks. Workload start and substitute redeem check the
+      SessionLog before the start gate, so steps 3-4 accept either too_late
+      or class_already_logged; both still mean a refused start.
+    - The step 13 check-in is seeded directly (one AttendanceCheckIn row, as
+      /attendance/scan would mirror it); the face/device scan path is not
+      exercised here. It is deleted in cleanup before its session. Steps
+      14, 17 and 18 seed their check-ins the same way; step 18 writes the
+      class, its ended session and the check-in in one commit, so the live
+      sweep can only ever resolve it as CONDUCTED.
     - Cleanup deletes only this run's rows (users by unique email, their
       classes, sessions, tokens and logs). On-chain entries are append-only
       and stay on the local Hardhat chain.
@@ -60,8 +92,8 @@ import requests  # noqa: E402
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
-    AttendanceSession, FacultyProfile, InstitutionWhitelist, ScheduledClass, SessionLog,
-    Student, StudentProfile, SubstituteToken, User, WorkloadSession,
+    AttendanceCheckIn, AttendanceSession, FacultyProfile, InstitutionWhitelist, ScheduledClass,
+    SessionLog, Student, StudentProfile, SubstituteToken, User, WorkloadSession,
 )
 from app.scheduler import flag_unconducted_classes, overdue_classes  # noqa: E402
 from app.services import workload  # noqa: E402
@@ -91,6 +123,12 @@ STATE = {
     "not_ended_class_id": None,
     "fixture_session_id": None,
     "seeded_session_ids": [],
+    "late_end_class_id": None,
+    "late_end_session_id": None,
+    "late_end_tx_hash": None,
+    "attendance_class_id": None,
+    "attendance_session_id": None,
+    "attendance_tx_hash": None,
     "student_row_owned": False,
 }
 
@@ -119,6 +157,29 @@ def assert_too_late(status: int, payload: dict, route: str) -> None:
         f"{route}: expected too_late (restart Flask to load Phase 2.1?): {payload}"
     )
     print(f"   {route} rejected at check '{payload['check']}': {payload['message']}")
+
+
+def assert_refused_start(status: int, payload: dict, route: str) -> None:
+    """too_late, or class_already_logged if the live sweep resolved the class first."""
+    # Race with the live sweep: it may resolve the ended too_late class as
+    # CONDUCTED_ZERO_STUDENTS mid-run, and these routes check the SessionLog
+    # before the start gate. Either answer is a refused start.
+    if payload.get("error") == "class_already_logged":
+        assert status == 409, f"{route}: class_already_logged must be 409, got {status}: {payload}"
+        assert payload.get("check") == "session_log", f"{route}: unexpected check: {payload}"
+        print(f"   {route} rejected at check '{payload['check']}' (live sweep won the race)")
+        return
+    assert_too_late(status, payload, route)
+
+
+def assert_no_new_session(class_id: int) -> None:
+    """No attendance session (plain or workload) was opened for the class by this run."""
+    with APP.app_context():
+        opened = AttendanceSession.query.filter(
+            AttendanceSession.class_id.in_([str(class_id), f"workload-{class_id}"]),
+            AttendanceSession.start_time >= RUN_STARTED,
+        ).count()
+    assert opened == 0, f"a refused start opened {opened} attendance session(s) for class {class_id}"
 
 
 def log_for(class_id: int) -> dict | None:
@@ -189,6 +250,86 @@ def start_workload(class_id: int) -> dict:
     )
     assert status == 201, f"/faculty/session/start returned {status}: {payload}"
     return payload
+
+
+def end_session(session_id: int) -> dict:
+    """Professor ends a session via POST /session/<id>/end; returns the body."""
+    status, payload = api("POST", f"/session/{session_id}/end", token=AUTH["professor_token"], json={})
+    assert status == 200, f"/session/{session_id}/end returned {status}: {payload}"
+    assert payload["session"]["is_active"] is False, f"session still active after /end: {payload}"
+    return payload
+
+
+def log_count(class_id: int) -> int:
+    """Local SessionLog rows for a class (one entry per class is the rule)."""
+    with APP.app_context():
+        return SessionLog.query.filter_by(class_id=class_id).count()
+
+
+def start_attendance(class_id: int) -> int:
+    """Professor starts a plain attendance session; returns its id."""
+    status, payload = api(
+        "POST", "/session/start", token=AUTH["professor_token"], json={"class_id": class_id},
+    )
+    assert status == 201, f"/session/start returned {status}: {payload}"
+    return payload["session"]["id"]
+
+
+def seed_check_in(session_id: int) -> None:
+    """One verified capture, as /attendance/scan would mirror it locally."""
+    with APP.app_context():
+        db.session.add(AttendanceCheckIn(
+            session_id=session_id, student_id=AUTH["student_id"], onchain_tx_hash="0x" + "0" * 64,
+        ))
+        db.session.commit()
+
+
+def seed_ended_with_check_in(course: str) -> int:
+    """An ended class with one ended attendance session and one check-in.
+
+    All three rows land in one commit, so the live sweep never sees the class
+    with a session but without its capture.
+    """
+    with APP.app_context():
+        now = utcnow()
+        start = now - timedelta(minutes=60)
+        scheduled_class = ScheduledClass(
+            professor_id=AUTH["professor_id"], room="TT2-ROOM", start_time=start,
+            end_time=now - timedelta(seconds=30), day_of_week=None, course_code=course,
+        )
+        db.session.add(scheduled_class)
+        db.session.flush()
+        session = AttendanceSession(
+            class_id=str(scheduled_class.id),
+            start_time=start + timedelta(minutes=2),
+            is_active=False,
+            ended_at=start + timedelta(minutes=30),
+        )
+        session.rotate_nonce(now=now, ttl_seconds=APP.config["ATTENDANCE_ROTATION_SECONDS"])
+        db.session.add(session)
+        db.session.flush()
+        db.session.add(AttendanceCheckIn(
+            session_id=session.id, student_id=AUTH["student_id"], onchain_tx_hash="0x" + "0" * 64,
+        ))
+        db.session.commit()
+        STATE["class_ids"].append(scheduled_class.id)
+        STATE["seeded_session_ids"].append(session.id)
+        return scheduled_class.id
+
+
+def assert_resolved(class_id: int, status: str) -> dict:
+    """`status` locally and on-chain: professor credited, professor conducted."""
+    entry = log_for(class_id)
+    assert entry is not None, f"class {class_id} missing from /faculty/logs"
+    assert entry.get("status") == status, f"expected {status}: {entry}"
+    assert entry.get("professorId") == AUTH["professor_id"], f"credit wrong: {entry}"
+    assert entry.get("conductedBy") == AUTH["professor_id"], f"conductor wrong: {entry}"
+    assert str(entry.get("onchainTxHash", "")).startswith("0x"), f"no tx hash: {entry}"
+    with APP.app_context():
+        onchain = workload.get_workload_log(class_id)
+    assert onchain["logged"] is True and onchain["status"] == status, f"on-chain state wrong: {onchain}"
+    assert onchain["professor_id"] == AUTH["professor_id"], f"on-chain credit wrong: {onchain}"
+    return entry
 
 
 # --------------------------------------------------------------------------
@@ -301,16 +442,17 @@ def step_too_late_attendance():
 
 
 def step_too_late_workload():
-    """POST /faculty/session/start after end_time -> too_late."""
+    """POST /faculty/session/start after end_time -> too_late (or class_already_logged)."""
     status, payload = api(
         "POST", "/faculty/session/start", token=AUTH["professor_token"],
         json={"class_id": STATE["too_late_class_id"]},
     )
-    assert_too_late(status, payload, "/faculty/session/start")
+    assert_refused_start(status, payload, "/faculty/session/start")
+    assert_no_new_session(STATE["too_late_class_id"])
 
 
 def step_too_late_redeem():
-    """A valid substitute token redeemed after end_time -> too_late."""
+    """A valid substitute token redeemed after end_time -> too_late (or class_already_logged)."""
     status, payload = api(
         "POST", "/faculty/substitute/issue", token=AUTH["professor_token"],
         json={"class_id": STATE["too_late_class_id"], "substitute_id": AUTH["substitute_id"]},
@@ -320,11 +462,12 @@ def step_too_late_redeem():
         "POST", "/faculty/substitute/redeem", token=AUTH["substitute_token"],
         json={"token": payload["substitute_token"]},
     )
-    assert_too_late(status, payload, "/faculty/substitute/redeem")
+    assert_refused_start(status, payload, "/faculty/substitute/redeem")
     with APP.app_context():
         assert WorkloadSession.query.filter_by(class_id=STATE["too_late_class_id"]).count() == 0, (
             "a rejected start must not open a workload session"
         )
+    assert_no_new_session(STATE["too_late_class_id"])
 
 
 def step_late_start():
@@ -393,19 +536,18 @@ def step_ended_no_session_flagged():
 
 
 def step_ended_with_session_not_flagged():
-    """end_time passed but a session was started -> not flagged."""
+    """end_time passed but a session was started -> zero-student, not UNCONDUCTED."""
     class_id = seed_class(timedelta(minutes=-60), timedelta(seconds=-30), "TT2-ENDED-STARTED", started=True)
     with APP.app_context():
         selected = {row.id for row in overdue_classes(APP, utcnow())}
     assert class_id not in selected, f"class {class_id} with a started session was selected"
     flag_unconducted_classes(APP)
-    with APP.app_context():
-        assert SessionLog.query.filter_by(class_id=class_id).count() == 0, (
-            f"class {class_id} with a started session got a SessionLog"
-        )
-        onchain = workload.get_workload_log(class_id)
-    assert onchain["logged"] is False, f"class {class_id} with a started session is logged on-chain: {onchain}"
-    print(f"   class {class_id} (ended, session started): not selected, no SessionLog, not on-chain")
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    entry = assert_resolved(class_id, "CONDUCTED_ZERO_STUDENTS")
+    print(
+        f"   class {class_id} (ended, session started): not selected, "
+        f"resolved {entry['status']}, tx={entry['onchainTxHash']}"
+    )
 
 
 def step_legacy_null_end_time_flagged():
@@ -433,6 +575,169 @@ def step_legacy_null_end_time_flagged():
     )
 
 
+def step_late_ended_empty():
+    """Start 15 min late, end with zero captures -> zero-student outcome, late."""
+    class_id = seed_class(timedelta(minutes=-15), timedelta(minutes=35), "TT2-LATE-END")
+    STATE["late_end_class_id"] = class_id
+    session_id = start_workload(class_id)["session"]["id"]
+    STATE["late_end_session_id"] = session_id
+    payload = end_session(session_id)
+    assert payload.get("count") == 0, f"expected zero captures in the /end response: {payload}"
+
+    entry = log_for(class_id)
+    assert entry is not None, f"class {class_id} unresolved after a zero-capture end (no SessionLog)"
+    assert entry.get("status") == "CONDUCTED_ZERO_STUDENTS", f"expected the zero-student variant: {entry}"
+    assert entry.get("professorId") == AUTH["professor_id"], f"credit wrong: {entry}"
+    assert entry.get("conductedBy") == AUTH["professor_id"], f"conductor wrong: {entry}"
+    assert str(entry.get("onchainTxHash", "")).startswith("0x"), f"no tx hash: {entry}"
+    assert entry.get("late") is True, f"expected late=true: {entry}"
+    minutes = entry.get("lateMinutes")
+    assert isinstance(minutes, int) and 14 <= minutes <= 16, f"lateMinutes out of 14-16: {entry}"
+    with APP.app_context():
+        onchain = workload.get_workload_log(class_id)
+    assert onchain["logged"] is True and onchain["status"] == "CONDUCTED_ZERO_STUDENTS", (
+        f"on-chain state wrong: {onchain}"
+    )
+    assert onchain["professor_id"] == AUTH["professor_id"], f"on-chain credit wrong: {onchain}"
+    STATE["late_end_tx_hash"] = entry["onchainTxHash"]
+    print(
+        f"   class {class_id}: status={entry['status']} late={entry['late']} "
+        f"lateMinutes={minutes} tx={entry['onchainTxHash']}"
+    )
+
+
+def step_ended_twice():
+    """A second /end on the same session writes no second entry."""
+    class_id = STATE["late_end_class_id"]
+    end_session(STATE["late_end_session_id"])
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    entry = log_for(class_id)
+    assert entry is not None and entry.get("onchainTxHash") == STATE["late_end_tx_hash"], (
+        f"the entry changed after a second /end: {entry}"
+    )
+    print(f"   class {class_id}: still one entry, tx={entry['onchainTxHash']}")
+
+
+def step_capture_unaffected():
+    """Ending sessions that captured someone writes no zero-student entry."""
+    # (a) The on-time class was concluded by one workload scan (step 6).
+    on_time = STATE["on_time_class_id"]
+    with APP.app_context():
+        workload_session = WorkloadSession.query.filter_by(class_id=on_time).order_by(
+            WorkloadSession.id.desc(),
+        ).first()
+        assert workload_session is not None, f"no workload session for class {on_time}"
+        session_id = workload_session.attendance_session_id
+    end_session(session_id)
+    assert log_count(on_time) == 1, f"class {on_time} has {log_count(on_time)} SessionLog rows, expected 1"
+    entry = log_for(on_time)
+    assert entry is not None and entry.get("status") == "CONDUCTED", f"scanned class changed: {entry}"
+
+    # (b) A plain attendance session with one verified check-in.
+    class_id = seed_class(timedelta(seconds=-5), timedelta(minutes=50), "TT2-CAPTURED")
+    status, payload = api(
+        "POST", "/session/start", token=AUTH["professor_token"], json={"class_id": class_id},
+    )
+    assert status == 201, f"/session/start returned {status}: {payload}"
+    plain_session_id = payload["session"]["id"]
+    with APP.app_context():
+        db.session.add(AttendanceCheckIn(
+            session_id=plain_session_id, student_id=AUTH["student_id"], onchain_tx_hash="0x" + "0" * 64,
+        ))
+        db.session.commit()
+    payload = end_session(plain_session_id)
+    assert payload.get("count") == 1, f"expected one capture in the /end response: {payload}"
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    with APP.app_context():
+        captured_status = SessionLog.query.filter_by(class_id=class_id).one().status
+    assert captured_status == "CONDUCTED", f"class {class_id} with a capture logged {captured_status}"
+    print(
+        f"   class {on_time} (workload scan): still one CONDUCTED entry; "
+        f"class {class_id} (one check-in): exactly one CONDUCTED SessionLog"
+    )
+
+
+def step_attendance_only_conducted():
+    """Attendance route, one check-in, /end -> exactly one CONDUCTED entry."""
+    class_id = seed_class(timedelta(seconds=-5), timedelta(minutes=50), "TT2-ATT-CONDUCTED")
+    STATE["attendance_class_id"] = class_id
+    session_id = start_attendance(class_id)
+    STATE["attendance_session_id"] = session_id
+    seed_check_in(session_id)
+    payload = end_session(session_id)
+    assert payload.get("count") == 1, f"expected one capture in the /end response: {payload}"
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    entry = assert_resolved(class_id, "CONDUCTED")
+    assert entry.get("late") is False, f"expected late=false for an on-time start: {entry}"
+    minutes = entry.get("lateMinutes")
+    assert isinstance(minutes, int) and minutes <= APP.config["LATE_AFTER_MINUTES"], (
+        f"lateMinutes not populated with an on-time value: {entry}"
+    )
+    STATE["attendance_tx_hash"] = entry["onchainTxHash"]
+    print(
+        f"   class {class_id}: status={entry['status']} late={entry['late']} "
+        f"lateMinutes={minutes} tx={entry['onchainTxHash']}"
+    )
+
+
+def step_attendance_ended_twice():
+    """/end again on the attendance-only session -> still exactly one entry."""
+    class_id = STATE["attendance_class_id"]
+    end_session(STATE["attendance_session_id"])
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    entry = log_for(class_id)
+    assert entry is not None and entry.get("onchainTxHash") == STATE["attendance_tx_hash"], (
+        f"the entry changed after a second /end: {entry}"
+    )
+    print(f"   class {class_id}: still one entry, tx={entry['onchainTxHash']}")
+
+
+def step_attendance_only_zero():
+    """Attendance route, zero check-ins, /end -> CONDUCTED_ZERO_STUDENTS."""
+    class_id = seed_class(timedelta(seconds=-5), timedelta(minutes=50), "TT2-ATT-ZERO")
+    session_id = start_attendance(class_id)
+    payload = end_session(session_id)
+    assert payload.get("count") == 0, f"expected zero captures in the /end response: {payload}"
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    entry = assert_resolved(class_id, "CONDUCTED_ZERO_STUDENTS")
+    print(f"   class {class_id}: status={entry['status']} tx={entry['onchainTxHash']}")
+
+
+def step_workload_logged_no_second_entry():
+    """A class already logged by the workload scan gets no second entry."""
+    class_id = STATE["on_time_class_id"]
+    before = log_for(class_id)
+    assert before is not None and before.get("status") == "CONDUCTED", f"step 6 entry missing: {before}"
+    session_id = start_attendance(class_id)
+    seed_check_in(session_id)
+    end_session(session_id)
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    after = log_for(class_id)
+    assert after is not None and after.get("onchainTxHash") == before["onchainTxHash"], (
+        f"the workload-scan entry changed: before={before} after={after}"
+    )
+    print(f"   class {class_id}: still one CONDUCTED entry, tx={after['onchainTxHash']}")
+
+
+def step_sweep_resolves_attendance():
+    """end_time passed, started session + one check-in, no SessionLog -> CONDUCTED."""
+    class_id = seed_ended_with_check_in("TT2-SWEEP-CONDUCTED")
+    with APP.app_context():
+        selected = {row.id for row in overdue_classes(APP, utcnow())}
+    assert class_id not in selected, f"class {class_id} with a started session was selected for UNCONDUCTED"
+    flag_unconducted_classes(APP)
+    assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
+    entry = assert_resolved(class_id, "CONDUCTED")
+    minutes = entry.get("lateMinutes")
+    assert entry.get("late") is False and isinstance(minutes, int) and 1 <= minutes <= 3, (
+        f"late fields wrong for a start 2 min after start_time: {entry}"
+    )
+    print(
+        f"   class {class_id}: status={entry['status']} late={entry['late']} "
+        f"lateMinutes={minutes} tx={entry['onchainTxHash']}"
+    )
+
+
 # --------------------------------------------------------------------------
 # Cleanup - only this run's rows
 # --------------------------------------------------------------------------
@@ -454,6 +759,10 @@ def cleanup() -> str | None:
             session_names += [f"workload-{class_id}" for class_id in class_ids]
             for model in (SessionLog, SubstituteToken, WorkloadSession):
                 model.query.filter(model.class_id.in_(class_ids)).delete(synchronize_session=False)
+            if "student_id" in AUTH:  # the step 13 check-in (this run's unique student)
+                AttendanceCheckIn.query.filter_by(student_id=AUTH["student_id"]).delete(
+                    synchronize_session=False,
+                )
             # Cold resets keep old AttendanceSession rows: only this run's.
             AttendanceSession.query.filter(
                 AttendanceSession.class_id.in_(session_names),
@@ -496,8 +805,16 @@ STEPS = [
     ("On-time start -> late=false", step_on_time_start),
     ("end_time not passed -> not auto-flagged", step_not_auto_flagged),
     ("end_time passed, no session -> UNCONDUCTED on-chain + SessionLog", step_ended_no_session_flagged),
-    ("end_time passed, session started -> not flagged", step_ended_with_session_not_flagged),
+    ("end_time passed, session started -> zero-student, not UNCONDUCTED", step_ended_with_session_not_flagged),
     ("end_time=None -> legacy threshold still flags", step_legacy_null_end_time_flagged),
+    ("Start 15 min late, end with zero captures -> zero-student, late", step_late_ended_empty),
+    ("End the same session again -> no second entry", step_ended_twice),
+    ("End sessions with a capture -> no zero-student entry", step_capture_unaffected),
+    ("Attendance only, one check-in, end -> one CONDUCTED entry", step_attendance_only_conducted),
+    ("Attendance only, end again -> still one entry", step_attendance_ended_twice),
+    ("Attendance only, zero check-ins, end -> zero-student", step_attendance_only_zero),
+    ("Workload-scan class, check-in + end -> no second entry", step_workload_logged_no_second_entry),
+    ("Sweep: ended, started, one check-in -> CONDUCTED", step_sweep_resolves_attendance),
 ]
 
 
