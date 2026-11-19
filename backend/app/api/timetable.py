@@ -20,9 +20,10 @@ from openpyxl import load_workbook
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..extensions import db
-from ..models import Course, Period, Room, ScheduledClass, Section, Term, TermOffering, User, UserRole
+from ..models import Course, DirectoryEntry, Period, Room, ScheduledClass, Section, Term, TermOffering, User, UserRole
 from ..models.timetable import ROOM_TYPES
 from ..services.auth import require_auth
+from ..services.directory import apply_import, plan_import
 from ..services.timetable import COLUMNS, activate_term, timetable_timezone, validate_row
 from ..util import utcnow
 from . import api_v1
@@ -413,3 +414,68 @@ def timetable_offerings():
         query = query.filter(TermOffering.term_id == int(raw_term))
     rows = query.order_by(TermOffering.term_id, TermOffering.section_id).all()
     return jsonify({"offerings": [dict(row.to_dict(), section=row.section.to_dict()) for row in rows], "count": len(rows)})
+
+
+@api_v1.post("/admin/directory/import")
+@require_auth(roles=["ADMIN"])
+def timetable_directory_import():
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return api_error("directory", "missing_file", "multipart file field is required", 400)
+    if Path(uploaded.filename).suffix.lower() != ".csv":
+        return api_error("directory", "unsupported_file_type", "file must be .csv", 400)
+    raw_dry_run = request.args.get("dry_run", request.form.get("dry_run", "false")).strip().lower()
+    if raw_dry_run not in {"true", "false"}:
+        return api_error("directory", "invalid_fields", "dry_run must be true or false", 400)
+    dry_run = raw_dry_run == "true"
+    data = uploaded.stream.read(_MAX_BYTES + 1)
+    if len(data) > _MAX_BYTES:
+        return api_error("directory", "file_too_large", "file must be at most 10 MB", 413)
+    try:
+        report, records, new_sections, existing = plan_import(data, lock=not dry_run)
+        if report["rows_rejected"]:
+            db.session.rollback()
+            return api_error("directory", "invalid_file", "directory rejected; no rows written", 400,
+                             dry_run=dry_run, **report)
+        if dry_run:
+            db.session.rollback()
+        else:
+            apply_import(records, new_sections, existing)
+            db.session.commit()
+    except (ValueError, UnicodeError, csv.Error) as exc:
+        db.session.rollback()
+        return api_error("directory", "invalid_file", str(exc), 400,
+                         rows_rejected=[{"line": 1, "row": 1, "reasons": [str(exc)]}])
+    except IntegrityError:
+        db.session.rollback()
+        return api_error("directory", "master_data_conflict", "concurrent directory/section conflict; no rows written", 409)
+    except SQLAlchemyError:
+        db.session.rollback()
+        current_app.logger.exception("Directory import database failure")
+        return api_error("directory", "database_error", "directory could not be saved; no rows written", 500)
+    return jsonify(dict(report, dry_run=dry_run)), 200
+
+
+@api_v1.get("/admin/directory")
+@require_auth(roles=["ADMIN"])
+def timetable_directory_list():
+    try:
+        page = int(request.args.get("page", "1"))
+        per_page = int(request.args.get("per_page", "50"))
+        if page < 1 or page > 2147483647 or not 1 <= per_page <= 100:
+            raise ValueError
+    except ValueError:
+        return api_error("directory", "invalid_fields", "page must be positive; per_page must be 1-100", 400)
+    query = DirectoryEntry.query
+    search = request.args.get("search", "").strip()
+    if search:
+        # Treat search as text, not as user-supplied SQL wildcard syntax.
+        query = query.filter(db.or_(
+            DirectoryEntry.roll_number.icontains(search, autoescape=True),
+            DirectoryEntry.full_name.icontains(search, autoescape=True),
+            DirectoryEntry.university_email.icontains(search, autoescape=True),
+        ))
+    total = query.count()
+    rows = query.order_by(DirectoryEntry.roll_number, DirectoryEntry.id).offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify({"entries": [row.to_dict() for row in rows], "total": total,
+                    "page": page, "per_page": per_page})

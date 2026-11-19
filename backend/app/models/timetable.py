@@ -19,6 +19,7 @@ camelCase, like every other model.
 """
 
 from ..extensions import db
+from ..util import iso_z, utcnow
 
 ROOM_LECTURE = "LECTURE"
 ROOM_LAB = "LAB"
@@ -207,3 +208,48 @@ class Period(db.Model):
             "endTime": self.end_time.strftime("%H:%M"),
             "isBreak": self.is_break,
         }
+
+
+class DirectoryEntry(db.Model):
+    """Imported identity; importing or editing it never moves a registered student."""
+
+    __tablename__ = "directory_entries"
+
+    id = db.Column(db.Integer, primary_key=True)
+    roll_number = db.Column(db.String(64), nullable=False)
+    full_name = db.Column(db.String(128), nullable=False)
+    university_email = db.Column(db.String(255), nullable=False)
+    programme = db.Column(db.String(64), nullable=False)
+    batch_year = db.Column(db.Integer, nullable=False)
+    section_letter = db.Column(db.String(1), nullable=False)
+    department = db.Column(db.String(128), nullable=False)
+    claimed_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("roll_number", name="uq_directory_entries_roll_number"),
+        db.Index("uq_directory_entries_email_lower", db.func.lower(university_email), unique=True),
+        db.CheckConstraint("batch_year BETWEEN 1900 AND 9999", name="ck_directory_entries_batch_year"),
+        db.CheckConstraint("section_letter BETWEEN 'A' AND 'Z'", name="ck_directory_entries_letter"),
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "rollNumber": self.roll_number, "fullName": self.full_name,
+            "universityEmail": self.university_email, "programme": self.programme,
+            "batchYear": self.batch_year, "sectionLetter": self.section_letter,
+            "department": self.department, "claimedBy": self.claimed_by,
+        }
+
+
+class StudentSection(db.Model):
+    """Permanent membership, keyed by User.id (also the attendance Student.id)."""
+
+    __tablename__ = "student_sections"
+
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), primary_key=True)
+    section_id = db.Column(db.Integer, db.ForeignKey("sections.id"), nullable=False, index=True)
+    since = db.Column(db.DateTime, nullable=False, default=utcnow)
+    section = db.relationship("Section")
+
+    def to_dict(self) -> dict:
+        return {"userId": self.user_id, "sectionId": self.section_id, "since": iso_z(self.since)}

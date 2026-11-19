@@ -155,6 +155,18 @@ class BaseConfig:
     JWT_SECRET = os.getenv("JWT_SECRET", JWT_SECRET_DEFAULT)
     JWT_EXPIRES = timedelta(hours=int(os.getenv("JWT_EXPIRES_HOURS", "12")))
     INSTITUTION_EMAIL_DOMAIN = os.getenv("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk")
+    # Directory-gated registration (Phase 2.3). Redis is required, no fallback.
+    REGISTRATION_CODE_TTL_SECONDS = int(os.getenv("REGISTRATION_CODE_TTL_SECONDS", "600"))
+    REGISTRATION_CODE_MAX_ATTEMPTS = int(os.getenv("REGISTRATION_CODE_MAX_ATTEMPTS", "5"))
+    AUTH_CODE_DELIVERY = os.getenv("AUTH_CODE_DELIVERY", "log").strip().lower()
+    GRANDFATHER_OPEN_REGISTRATION = os.getenv("GRANDFATHER_OPEN_REGISTRATION", "false").strip().lower() in {"1", "true", "yes"}
+    ALLOW_DEV_CODE_ENDPOINT = os.getenv("ALLOW_DEV_CODE_ENDPOINT", "false").strip().lower() in {"1", "true", "yes"}
+    SMTP_HOST = os.getenv("SMTP_HOST", "")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+    SMTP_FROM = os.getenv("SMTP_FROM", "")
+    SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes"}
 
     # -- HTTP -----------------------------------------------------------------
     CORS_ORIGINS = _env_list("CORS_ORIGINS", "http://localhost:5173")

@@ -1,4 +1,4 @@
-"""End-to-end Phase 2.1 workload and Phase 2.2 master-data tests (PRD v2.2).
+"""Phase 2.1 workload, 2.2 master-data and 2.3 directory tests (PRD v2.2).
 
 Run it against a live stack (from backend/), after restarting Flask so it
 serves the Phase 2.2 code (apply the master-data SQL first):
@@ -9,6 +9,9 @@ Prerequisites:
     - Hardhat node running        (contracts/: npm run node)
     - WorkloadLedger deployed     (contracts/: npm run deploy:workload)
     - Flask backend running       (backend/: python run.py)
+    - Phase 2.3 SQL applied and Redis running
+    - Legacy steps 0-23 need GRANDFATHER_OPEN_REGISTRATION=true on the
+      live TEST server; this script does not turn on that flag.
 
 Steps:
     0. preflight          - register + log in unique professor, substitute,
@@ -57,6 +60,12 @@ Steps:
                             403 timetable/out_of_department, unchanged rows
    22. seed periods       - repeated seed creates nothing; exact grid retained
    23. break period       - one 11:10-11:30 break with isBreak=true
+   24-34. directory       - atomic/idempotent import, dry run, scoped listing,
+                            logged code delivery, wrong/expired/rate-limited
+                            codes, permanent membership, claim and dev guards.
+                            These steps use APP.test_client against the same
+                            DB/Redis to capture logs and scope the 1s TTL.
+                            Only IPFS pinning is mocked for these new steps.
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -88,9 +97,14 @@ Notes:
       without creating offerings in it. Periods are shared and left intact.
 """
 
+import csv
+import io
+import logging
 import os
 import sys
+import time
 from datetime import timedelta
+from unittest.mock import patch
 from uuid import uuid4
 
 # Must be set before `app` is imported (the config reads it at import time).
@@ -101,12 +115,13 @@ import requests  # noqa: E402
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
-    AttendanceCheckIn, AttendanceSession, Course, FacultyProfile, InstitutionWhitelist, Period,
-    Room, ScheduledClass, Section, SessionLog, Student, StudentProfile, SubstituteToken, Term,
+    AttendanceCheckIn, AttendanceSession, Course, DirectoryEntry, FacultyProfile, InstitutionWhitelist, Period,
+    Room, ScheduledClass, Section, SessionLog, Student, StudentProfile, StudentSection, SubstituteToken, Term,
     TermOffering, User, UserRole, WorkloadSession,
 )
 from app.scheduler import flag_unconducted_classes, overdue_classes  # noqa: E402
-from app.services import workload  # noqa: E402
+from app.services import registration_code, workload  # noqa: E402
+from app.services.directory import COLUMNS as DIRECTORY_COLUMNS  # noqa: E402
 from app.services.auth import hash_password  # noqa: E402
 from app.services.timetable import seed_periods  # noqa: E402
 from app.util import utcnow  # noqa: E402
@@ -150,6 +165,11 @@ STATE = {
     "term_activation_attempted": False,
     "offering_ids": [],
     "foreign_resources": [],
+    "directory_rows": [],
+    "directory_section_ids": [],
+    "directory_ids": [],
+    "directory_codes": {},
+    "directory_success": None,
 }
 
 
@@ -915,6 +935,261 @@ def step_break_period():
 
 
 # --------------------------------------------------------------------------
+# Phase 2.3 - real DB/Redis, local requests for log capture and scoped config
+# --------------------------------------------------------------------------
+def directory_api(method, path, token=None, **kwargs):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # Do not add an IPFS/network prerequisite to these new off-chain tests.
+    with patch("app.services.profile_metadata.pin", return_value=None):
+        response = APP.test_client().open(f"/api/v1{path}", method=method, headers=headers, **kwargs)
+    return response.status_code, response.get_json()
+
+
+def directory_csv(rows):
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=DIRECTORY_COLUMNS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8")
+
+
+def import_directory(rows, dry_run=False, token=None):
+    return directory_api("POST", "/admin/directory/import", token=token or AUTH["admin_token"],
+                         data={"file": (io.BytesIO(directory_csv(rows)), "directory.csv"),
+                               "dry_run": "true" if dry_run else "false"})
+
+
+def logged_start(index, **extra):
+    row = STATE["directory_rows"][index]
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Capture()
+    old_delivery, old_level = APP.config["AUTH_CODE_DELIVERY"], APP.logger.level
+    APP.config["AUTH_CODE_DELIVERY"] = "log"
+    APP.logger.setLevel(logging.WARNING)
+    APP.logger.addHandler(handler)
+    try:
+        status, payload = directory_api("POST", "/auth/register/student/start",
+                                        json={"roll_number": row["roll_number"], **extra})
+    finally:
+        APP.logger.removeHandler(handler)
+        APP.logger.setLevel(old_level)
+        APP.config["AUTH_CODE_DELIVERY"] = old_delivery
+    assert status == 200, f"start failed: {status}: {payload}"
+    code_records = [record for record in records if record.msg == "Registration code roll=%s recipient=%s code=%s"]
+    assert len(code_records) == 1, f"expected one code delivery, got {len(code_records)}"
+    record = code_records[0]
+    assert record.levelno == logging.WARNING, "code must be logged at WARNING"
+    roll, recipient, code = record.args
+    assert roll == row["roll_number"] and recipient == row["university_email"], "code delivered outside directory"
+    assert len(code) == 6 and code.isascii() and code.isdigit(), "code is not six digits"
+    assert "code" not in payload, "public start response leaked the code"
+    with APP.app_context():
+        stored = registration_code.redis_client().get(registration_code.code_key(roll))
+    assert stored is not None and len(stored) == 64 and stored != code, "Redis must hold only a code hash"
+    STATE["directory_codes"][index] = code
+    return code
+
+
+def verify_directory(index, code, **extra):
+    return directory_api("POST", "/auth/register/student/verify", json={
+        "roll_number": STATE["directory_rows"][index]["roll_number"],
+        "code": code, "password": PASSWORD, **extra,
+    })
+
+
+def assert_directory_error(status, payload, expected_status, check, error):
+    assert status == expected_status, f"expected {expected_status}, got {status}: {payload}"
+    assert payload.get("check") == check and payload.get("error") == error, f"wrong error: {payload}"
+
+
+def step_directory_import():
+    domain = APP.config["INSTITUTION_EMAIL_DOMAIN"].strip().lower()
+    STATE["directory_rows"] = [{
+        "roll_number": f"TT2D-{index}-{RUN_ID}", "full_name": f"Directory Student {index}",
+        "university_email": f"ttv2.directory.{index}.{RUN_ID}@{domain}",
+        "programme": f"TT2D-{RUN_ID}", "batch_year": 2023,
+        "section_letter": "A" if index < 6 else "B", "department": "Computer Science",
+    } for index in range(8)]
+    with APP.app_context():
+        before_rows, before_sections, before_users = DirectoryEntry.query.count(), Section.query.count(), User.query.count()
+    status, dry = import_directory(STATE["directory_rows"], dry_run=True)
+    assert status == 200 and dry["dry_run"] is True, f"dry run failed: {status}: {dry}"
+    assert dry["rows_created"] == 8 and dry["sections_created"] == 2 and not dry["rows_rejected"], f"wrong plan: {dry}"
+    with APP.app_context():
+        assert DirectoryEntry.query.count() == before_rows and Section.query.count() == before_sections, "dry run wrote rows"
+    status, payload = import_directory(STATE["directory_rows"])
+    assert status == 200, f"import failed: {status}: {payload}"
+    assert {k: v for k, v in payload.items() if k != "dry_run"} == {k: v for k, v in dry.items() if k != "dry_run"}, "dry/live reports differ"
+    with APP.app_context():
+        rows = DirectoryEntry.query.filter(DirectoryEntry.roll_number.in_([r["roll_number"] for r in STATE["directory_rows"]])).all()
+        sections = Section.query.filter_by(programme=f"TT2D-{RUN_ID}").all()
+        STATE["directory_ids"] = sorted(row.id for row in rows)
+        STATE["directory_section_ids"] = sorted(section.id for section in sections)
+        assert len(rows) == 8 and len(sections) == 2, "directory/sections missing"
+        assert all(row.claimed_by is None for row in rows), "import claimed a row"
+        assert User.query.count() == before_users, "import created accounts"
+    status, payload = directory_api("GET", f"/admin/directory?search=TT2D-&page=1&per_page=1", token=AUTH["admin_token"])
+    assert status == 200 and len(payload["entries"]) == 1 and payload["total"] >= 8, f"search/paging failed: {payload}"
+    status, payload = directory_api("GET", "/admin/directory", token=AUTH["hod_token"])
+    assert status == 403, f"HOD accessed ADMIN directory: {payload}"
+    status, payload = import_directory(STATE["directory_rows"], token=AUTH["hod_token"])
+    assert status == 403, f"HOD imported ADMIN directory: {payload}"
+
+
+def step_directory_bad_row_atomic():
+    first = dict(STATE["directory_rows"][0], roll_number=f"TT2D-BAD-GOOD-{RUN_ID}",
+                 university_email=f"ttv2.good.{RUN_ID}@{APP.config['INSTITUTION_EMAIL_DOMAIN']}",
+                 programme=f"TT2D-BAD-{RUN_ID}")
+    bad = dict(first, roll_number=f"TT2D-BAD-{RUN_ID}", university_email="invalid@example.org", section_letter="AA")
+    with APP.app_context():
+        before = (DirectoryEntry.query.count(), Section.query.count())
+    for dry_run in (True, False):
+        status, payload = import_directory([first, bad], dry_run=dry_run)
+        assert_directory_error(status, payload, 400, "directory", "invalid_file")
+        assert [row["line"] for row in payload["rows_rejected"]] == [3], f"bad line missing: {payload}"
+        assert len(payload["rows_rejected"][0]["reasons"]) >= 2, "did not report all row violations"
+        with APP.app_context():
+            assert (DirectoryEntry.query.count(), Section.query.count()) == before, "invalid file was partially imported"
+    # Duplicate rolls are reported on both offending lines.
+    status, payload = import_directory([first, dict(first, university_email=STATE["directory_rows"][7]["university_email"])])
+    assert status == 400 and {row["line"] for row in payload["rows_rejected"]} == {2, 3}, f"duplicate roll not reported: {payload}"
+
+
+def step_directory_reimport():
+    status, payload = import_directory(STATE["directory_rows"])
+    assert status == 200, f"reimport failed: {status}: {payload}"
+    assert payload["rows_created"] == payload["rows_updated"] == payload["sections_created"] == 0, f"reimport changed rows: {payload}"
+    assert payload["rows_unchanged"] == 8, f"not eight unchanged rows: {payload}"
+    with APP.app_context():
+        ids = sorted(row.id for row in DirectoryEntry.query.filter(DirectoryEntry.id.in_(STATE["directory_ids"])))
+    assert ids == STATE["directory_ids"], "reimport replaced directory rows"
+
+
+def step_directory_missing_start():
+    status, payload = directory_api("POST", "/auth/register/student/start", json={"roll_number": f"TT2D-MISSING-{RUN_ID}"})
+    assert_directory_error(status, payload, 404, "directory", "directory_row_missing")
+
+
+def step_directory_delivery_bound():
+    attacker = f"ttv2.attacker.{RUN_ID}@{APP.config['INSTITUTION_EMAIL_DOMAIN']}"
+    code = logged_start(0, email=attacker, university_email=attacker)
+    other = logged_start(1)
+    # Independent six-digit codes may collide; reissue rather than make a flaky fixture.
+    for _ in range(3):
+        if other != code:
+            break
+        other = logged_start(1)
+    assert other != code, "could not obtain distinct test codes"
+    status, payload = verify_directory(1, code)
+    assert_directory_error(status, payload, 401, "registration", "code_invalid")
+    status, payload = verify_directory(0, code, email=attacker, full_name="Injected", programme="Injected")
+    assert status == 201 and payload.get("token"), f"logged code did not register its own roll: {status}: {payload}"
+    row = STATE["directory_rows"][0]
+    assert payload["user"]["email"] == row["university_email"] and payload["user"]["fullName"] == row["full_name"], "request overrode directory identity"
+    assert payload["section"]["programme"] == row["programme"], "request overrode programme"
+    with APP.app_context():
+        assert registration_code.redis_client().get(registration_code.code_key(row["roll_number"])) is None, "successful code was not consumed"
+
+
+def step_directory_wrong_code():
+    code = logged_start(2)
+    wrong = "000000" if code != "000000" else "000001"
+    status, payload = verify_directory(2, wrong)
+    assert_directory_error(status, payload, 401, "registration", "code_invalid")
+    with APP.app_context():
+        assert DirectoryEntry.query.filter_by(roll_number=STATE["directory_rows"][2]["roll_number"]).one().claimed_by is None, "wrong code claimed a row"
+
+
+def step_directory_expired_code():
+    old_ttl = APP.config["REGISTRATION_CODE_TTL_SECONDS"]
+    try:
+        APP.config["REGISTRATION_CODE_TTL_SECONDS"] = 1
+        code = logged_start(3)
+        time.sleep(1.2)
+        status, payload = verify_directory(3, code)
+        assert_directory_error(status, payload, 401, "registration", "code_expired")
+    finally:
+        APP.config["REGISTRATION_CODE_TTL_SECONDS"] = old_ttl
+
+
+def step_directory_attempt_limit():
+    old_maximum = APP.config["REGISTRATION_CODE_MAX_ATTEMPTS"]
+    try:
+        APP.config["REGISTRATION_CODE_MAX_ATTEMPTS"] = 5
+        code = logged_start(4)
+        wrong = "000000" if code != "000000" else "000001"
+        for _ in range(5):
+            status, payload = verify_directory(4, wrong)
+            assert_directory_error(status, payload, 401, "registration", "code_invalid")
+        status, payload = verify_directory(4, code)
+        assert_directory_error(status, payload, 429, "rate_limit", "code_attempts_exceeded")
+        code = logged_start(4)
+        status, payload = verify_directory(4, code)
+        assert_directory_error(status, payload, 429, "rate_limit", "code_attempts_exceeded")
+        with APP.app_context():
+            ttl = registration_code.redis_client().ttl(registration_code.attempts_key(STATE["directory_rows"][4]["roll_number"]))
+        assert 0 < ttl <= 900, f"attempt window missing: {ttl}"
+    finally:
+        APP.config["REGISTRATION_CODE_MAX_ATTEMPTS"] = old_maximum
+
+
+def step_directory_section_success():
+    code = STATE["directory_codes"][1]
+    status, payload = verify_directory(1, code)
+    assert status == 201 and payload.get("token") and payload["expiresIn"] == 8 * 3600, f"registration failed: {status}: {payload}"
+    STATE["directory_success"] = payload
+    row = STATE["directory_rows"][1]
+    user_id = payload["user"]["id"]
+    with APP.app_context():
+        entry = DirectoryEntry.query.filter_by(roll_number=row["roll_number"]).one()
+        profile = StudentProfile.query.filter_by(user_id=user_id).one()
+        membership = db.session.get(StudentSection, user_id)
+        section = Section.query.filter_by(programme=row["programme"], batch_year=2023, letter="A").one()
+        assert entry.claimed_by == user_id and membership.section_id == section.id, "claim/membership mismatched"
+        assert StudentSection.query.filter_by(user_id=user_id).count() == 1 and membership.since is not None, "membership is not unique or lacks since"
+        assert profile.batch == "2023" and profile.programme == row["programme"], "directory batch/programme not copied"
+        expected = {"id": section.id, "programme": row["programme"], "batchYear": 2023, "letter": "A"}
+    assert payload["section"] == expected, f"wrong verify section: {payload}"
+    status, me = directory_api("GET", "/auth/me", token=payload["token"])
+    assert status == 200 and me["section"] == expected, f"me section missing: {status}: {me}"
+    status, login = directory_api("POST", "/auth/login", json={"email": row["university_email"], "password": PASSWORD})
+    assert status == 200 and login["section"] == expected, f"login section missing: {status}: {login}"
+    # Re-import may change directory assignment, never permanent membership.
+    changed = dict(row, section_letter="B")
+    status, report = import_directory([changed])
+    assert status == 200 and report["rows_updated"] == 1, f"claimed-row upsert failed: {report}"
+    status, me = directory_api("GET", "/auth/me", token=payload["token"])
+    assert status == 200 and me["section"] == expected, "re-import moved permanent membership"
+
+
+def step_directory_claim_twice():
+    status, payload = verify_directory(1, STATE["directory_codes"][1])
+    assert_directory_error(status, payload, 409, "directory", "directory_already_claimed")
+    status, payload = directory_api("POST", "/auth/register/student/start", json={"roll_number": STATE["directory_rows"][1]["roll_number"]})
+    assert_directory_error(status, payload, 409, "directory", "directory_already_claimed")
+
+
+def step_directory_dev_guard():
+    old_flag = APP.config["ALLOW_DEV_CODE_ENDPOINT"]
+    path = f"/auth/register/student/dev-code/{STATE['directory_rows'][7]['roll_number']}"
+    try:
+        APP.config["ALLOW_DEV_CODE_ENDPOINT"] = False
+        status, payload = directory_api("GET", path)
+        assert_directory_error(status, payload, 404, "auth", "dev_code_endpoint_disabled")
+        APP.config["ALLOW_DEV_CODE_ENDPOINT"] = True
+        code = logged_start(7)
+        status, payload = directory_api("GET", path)
+        assert status == 200 and payload["code"] == code, f"development helper returned wrong code: {payload}"
+    finally:
+        APP.config["ALLOW_DEV_CODE_ENDPOINT"] = old_flag
+
+
+# --------------------------------------------------------------------------
 # Cleanup - only this run's rows
 # --------------------------------------------------------------------------
 def cleanup() -> str | None:
@@ -924,6 +1199,7 @@ def cleanup() -> str | None:
     try:
         with APP.app_context():
             emails = [account["email"] for account in ACCOUNTS.values()]
+            emails += [row["university_email"] for row in STATE["directory_rows"]]
             user_ids = [user.id for user in User.query.filter(User.email.in_(emails)).all()]
             class_ids = set(STATE["class_ids"])
             if user_ids:
@@ -955,6 +1231,10 @@ def cleanup() -> str | None:
             ScheduledClass.query.filter(ScheduledClass.id.in_(class_ids)).delete(synchronize_session=False)
             if STATE["student_row_owned"]:
                 Student.query.filter_by(id=AUTH["student_id"]).delete(synchronize_session=False)
+            DirectoryEntry.query.filter(DirectoryEntry.roll_number.in_(
+                [row["roll_number"] for row in STATE["directory_rows"]],
+            )).delete(synchronize_session=False)
+            StudentSection.query.filter(StudentSection.user_id.in_(user_ids)).delete(synchronize_session=False)
             for model in (FacultyProfile, StudentProfile):
                 model.query.filter(model.user_id.in_(user_ids)).delete(synchronize_session=False)
             User.query.filter(User.email.in_(emails)).delete(synchronize_session=False)
@@ -969,6 +1249,12 @@ def cleanup() -> str | None:
                 TermOffering.term_id == term_id,
                 TermOffering.section_id.in_(STATE["master_section_ids"]),
             )).delete(synchronize_session=False)
+            # Query by our unique programme too, covering a failure immediately
+            # after import but before the returned ids were captured.
+            directory_sections = Section.query.filter_by(programme=f"TT2D-{RUN_ID}").all()
+            directory_section_ids = [row.id for row in directory_sections]
+            TermOffering.query.filter(TermOffering.section_id.in_(directory_section_ids)).delete(synchronize_session=False)
+            Section.query.filter(Section.id.in_(directory_section_ids)).delete(synchronize_session=False)
             Section.query.filter(Section.id.in_(STATE["master_section_ids"])).delete(synchronize_session=False)
             Course.query.filter(Course.id.in_(STATE["master_course_ids"])).delete(synchronize_session=False)
             Room.query.filter(Room.id.in_(STATE["master_room_ids"])).delete(synchronize_session=False)
@@ -983,6 +1269,13 @@ def cleanup() -> str | None:
                     Term.query.filter_by(id=prior_id).update({Term.is_active: True}, synchronize_session=False)
             Term.query.filter_by(id=term_id).delete(synchronize_session=False)
             db.session.commit()
+            if STATE["directory_rows"]:
+                client = registration_code.redis_client()
+                keys = [key for row in STATE["directory_rows"] for key in (
+                    registration_code.code_key(row["roll_number"]),
+                    registration_code.attempts_key(row["roll_number"]),
+                )]
+                client.delete(*keys)
     except Exception as exc:  # a cleanup failure must fail the run, not hide it
         return f"{type(exc).__name__}: {exc}"
     return None
@@ -1016,6 +1309,17 @@ STEPS = [
     ("HOD writes against another department -> 403", step_hod_department_scope),
     ("Period seeding is idempotent; exact grid", step_period_seed_idempotent),
     ("Break period exists and is flagged", step_break_period),
+    ("Directory import creates sections/rows; dry run and ADMIN guards", step_directory_import),
+    ("Bad directory row rejects the whole file with line numbers", step_directory_bad_row_atomic),
+    ("Directory re-import is idempotent", step_directory_reimport),
+    ("Missing directory roll start -> 404", step_directory_missing_start),
+    ("Logged code only to directory email; cross-roll code refused", step_directory_delivery_bound),
+    ("Wrong registration code -> 401", step_directory_wrong_code),
+    ("Expired registration code -> 401 (scoped 1s TTL)", step_directory_expired_code),
+    ("Sixth attempt -> 429; resend does not reset attempts", step_directory_attempt_limit),
+    ("Registration attaches permanent section; login and me return it", step_directory_section_success),
+    ("Same directory roll claimed twice -> 409", step_directory_claim_twice),
+    ("Development code endpoint requires explicit opt-in", step_directory_dev_guard),
 ]
 
 

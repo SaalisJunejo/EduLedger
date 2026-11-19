@@ -2,7 +2,9 @@
 
 - POST /api/v1/auth/register/hod     - registers an HOD against the institutional whitelist
 - POST /api/v1/auth/register/faculty - registers a faculty member (domain + employee_id uniqueness)
-- POST /api/v1/auth/register/student - registers a student (domain + roll_number uniqueness)
+- POST /api/v1/auth/register/student - legacy registration, explicit opt-in only
+- POST /api/v1/auth/register/student/start, /verify - directory-gated registration
+- GET  /api/v1/auth/register/student/dev-code/<roll> - explicit dev opt-in only
 - POST /api/v1/auth/login            - logs in with email + password, issues an 8-hour JWT
 - GET  /api/v1/auth/me               - returns the current user profile (requires JWT)
 
@@ -17,17 +19,20 @@ import time
 
 import jwt
 from flask import current_app, g, jsonify, request
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..extensions import db
 from ..models import (
+    DirectoryEntry,
     FacultyProfile,
     InstitutionWhitelist,
+    Section,
     StudentProfile,
+    StudentSection,
     User,
     UserRole,
 )
-from ..services import profile_metadata
+from ..services import profile_metadata, registration_code
 from ..services.auth import hash_password, require_auth, verify_password
 from . import api_v1
 from .errors import api_error
@@ -266,6 +271,9 @@ def register_student():
         400: Missing fields or invalid institutional email domain
         409: Email or roll_number already registered
     """
+    if not current_app.config.get("GRANDFATHER_OPEN_REGISTRATION", False):
+        return api_error("directory", "open_registration_disabled", "use directory registration start and verify", 403)
+    current_app.logger.warning("Legacy open student registration used (GRANDFATHER_OPEN_REGISTRATION)")
     body = request.get_json(silent=True) or {}
     full_name = str(body.get("full_name") or "").strip()
     roll_number = str(body.get("roll_number") or "").strip()
@@ -353,6 +361,32 @@ def register_student():
 LOGIN_TOKEN_EXPIRY_HOURS = 8
 
 
+def _student_section(user):
+    if user.role != UserRole.STUDENT:
+        return None
+    membership = db.session.get(StudentSection, user.id)
+    if membership is None:
+        return None
+    section = membership.section
+    return {"id": section.id, "programme": section.programme,
+            "batchYear": section.batch_year, "letter": section.letter}
+
+
+def _login_payload(user, message="Login successful"):
+    now = int(time.time())
+    claims = {
+        "sub": str(user.id), "user_id": user.id,
+        "role": user.role.value if hasattr(user.role, "value") else str(user.role),
+        "iat": now, "exp": now + LOGIN_TOKEN_EXPIRY_HOURS * 3600,
+    }
+    result = {"message": message,
+              "token": jwt.encode(claims, current_app.config["JWT_SECRET"], algorithm="HS256"),
+              "user": user.to_dict(), "expiresIn": LOGIN_TOKEN_EXPIRY_HOURS * 3600}
+    if user.role == UserRole.STUDENT:
+        result["section"] = _student_section(user)
+    return result
+
+
 @api_v1.post("/auth/login")
 def login():
     """Authenticate with email and password, returning an 8-hour JWT.
@@ -396,28 +430,7 @@ def login():
             status=403,
         )
 
-    now = int(time.time())
-    expires_at = now + LOGIN_TOKEN_EXPIRY_HOURS * 3600
-    payload = {
-        "sub": str(user.id),
-        "user_id": user.id,
-        "role": user.role.value if hasattr(user.role, "value") else str(user.role),
-        "iat": now,
-        "exp": expires_at,
-    }
-    token = jwt.encode(payload, current_app.config["JWT_SECRET"], algorithm="HS256")
-
-    return (
-        jsonify(
-            {
-                "message": "Login successful",
-                "token": token,
-                "user": user.to_dict(),
-                "expiresIn": LOGIN_TOKEN_EXPIRY_HOURS * 3600,
-            }
-        ),
-        200,
-    )
+    return jsonify(_login_payload(user)), 200
 
 
 @api_v1.get("/auth/me")
@@ -452,9 +465,130 @@ def get_current_user():
                 "user": user.to_dict(),
                 "profile": profile_data,
                 "profile_cid": profile_cid,
+                **({"section": _student_section(user)} if user.role == UserRole.STUDENT else {}),
             }
         ),
         200,
     )
+
+
+def _directory_request():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise ValueError("a JSON object is required")
+    roll = body.get("roll_number")
+    if not isinstance(roll, str) or not roll.strip() or len(roll.strip()) > 64:
+        raise ValueError("roll_number must be nonempty text of at most 64 characters")
+    return body, roll.strip()
+
+
+def _directory_claim_error(entry):
+    if entry is None:
+        return api_error("directory", "directory_row_missing", "roll number is absent from the directory", 404)
+    if entry.claimed_by is not None:
+        return api_error("directory", "directory_already_claimed", "directory roll is already claimed", 409)
+    return None
+
+
+def _registration_error(exc):
+    return api_error(exc.check, exc.code, exc.message, exc.status)
+
+
+@api_v1.post("/auth/register/student/start")
+def register_student_start():
+    try:
+        _, roll = _directory_request()
+    except ValueError as exc:
+        return api_error("request", "missing_fields", str(exc), 400)
+    try:
+        entry = DirectoryEntry.query.filter_by(roll_number=roll).with_for_update().first()
+        error = _directory_claim_error(entry)
+        if error is not None:
+            db.session.rollback()
+            return error
+        ttl = registration_code.issue(entry)
+        db.session.commit()
+    except registration_code.RegistrationCodeError as exc:
+        db.session.rollback()
+        return _registration_error(exc)
+    except SQLAlchemyError:
+        db.session.rollback()
+        return api_error("directory", "database_error", "registration could not be started", 500)
+    return jsonify({"message": "Registration code sent to the directory address", "expiresIn": ttl}), 200
+
+
+@api_v1.post("/auth/register/student/verify")
+def register_student_verify():
+    try:
+        body, roll = _directory_request()
+        password = body.get("password")
+        if not isinstance(password, str) or not password or len(password) > 1024:
+            raise ValueError("password is required and must be at most 1024 characters")
+        if "code" not in body:
+            raise ValueError("code is required")
+    except ValueError as exc:
+        return api_error("request", "missing_fields", str(exc), 400)
+    try:
+        # Serialize claims with imports and other verifiers. Redis consume is
+        # atomic too; only one request can create/claim this identity.
+        entry = DirectoryEntry.query.filter_by(roll_number=roll).with_for_update().first()
+        error = _directory_claim_error(entry)
+        if error is not None:
+            db.session.rollback()
+            return error
+        section = Section.query.filter_by(programme=entry.programme, batch_year=entry.batch_year,
+                                          letter=entry.section_letter).with_for_update().first()
+        if section is None or section.department != entry.department:
+            db.session.rollback()
+            return api_error("directory", "section_not_found", "directory section is missing or inconsistent", 409)
+        if StudentProfile.query.filter_by(roll_number=roll).first():
+            db.session.rollback()
+            return api_error("student", "roll_number_already_registered", "roll number is already registered", 409)
+        if User.query.filter(db.func.lower(User.email) == entry.university_email.lower()).first():
+            db.session.rollback()
+            return api_error("user", "email_already_registered", "directory email is already registered", 409)
+        registration_code.consume(entry, body["code"])
+        user = User(role=UserRole.STUDENT, email=entry.university_email.lower(),
+                    password_hash=hash_password(password), full_name=entry.full_name,
+                    department=entry.department, is_active=True)
+        db.session.add(user)
+        db.session.flush()
+        profile = StudentProfile(user_id=user.id, roll_number=roll,
+                                 batch=str(entry.batch_year), programme=entry.programme)
+        db.session.add(profile)
+        db.session.add(StudentSection(user_id=user.id, section_id=section.id))
+        entry.claimed_by = user.id
+        db.session.commit()
+    except registration_code.RegistrationCodeError as exc:
+        db.session.rollback()
+        return _registration_error(exc)
+    except IntegrityError:
+        db.session.rollback()
+        return api_error("directory", "master_data_conflict", "registration identity already exists; request a new code if needed", 409)
+    except SQLAlchemyError:
+        db.session.rollback()
+        return api_error("directory", "database_error", "registration failed; request a new code", 500)
+    _store_profile_cid(user, profile, profile_metadata.build_document(user, roll_number=roll, batch=profile.batch))
+    return jsonify(_login_payload(user, "Student registered successfully")), 201
+
+
+@api_v1.get("/auth/register/student/dev-code/<roll_number>")
+def register_student_dev_code(roll_number):
+    # Intentionally public only behind this explicit DEVELOPMENT opt-in.
+    current_app.logger.warning("Student dev-code endpoint used roll=%s enabled=%s",
+                               roll_number, current_app.config.get("ALLOW_DEV_CODE_ENDPOINT", False))
+    if not current_app.config.get("ALLOW_DEV_CODE_ENDPOINT", False):
+        return api_error("auth", "dev_code_endpoint_disabled", "development code endpoint is disabled", 404)
+    entry = DirectoryEntry.query.filter_by(roll_number=roll_number).first()
+    error = _directory_claim_error(entry)
+    if error is not None:
+        return error
+    try:
+        code = registration_code.dev_code(entry)
+    except registration_code.RegistrationCodeError as exc:
+        return _registration_error(exc)
+    if code is None:
+        return api_error("registration", "code_expired", "no current code in this development worker", 401)
+    return jsonify({"code": code})
 
 

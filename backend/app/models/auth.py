@@ -174,6 +174,8 @@ class StudentProfile(db.Model):
 
     # Academic batch/cohort (e.g., "2022-2026" or "Fall 2022").
     batch = db.Column(db.String(32), nullable=False)
+    # Directory programme snapshot; null for grandfathered/pre-directory users.
+    programme = db.Column(db.String(64), nullable=True)
 
     # IPFS CID of the pinned profile metadata (D7); null when IPFS was down.
     profile_cid = db.Column(db.String(128), nullable=True)
@@ -185,5 +187,6 @@ class StudentProfile(db.Model):
             "userId": self.user_id,
             "rollNumber": self.roll_number,
             "batch": self.batch,
+            "programme": self.programme,
             "profileCid": self.profile_cid,
         }
