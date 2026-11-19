@@ -1,7 +1,7 @@
-"""End-to-end test of Phase 2.1 late-start handling (PRD v2.2 4.8.3-4.8.6, D18/D19).
+"""End-to-end Phase 2.1 workload and Phase 2.2 master-data tests (PRD v2.2).
 
 Run it against a live stack (from backend/), after restarting Flask so it
-serves the Phase 2.1 code:
+serves the Phase 2.2 code (apply the master-data SQL first):
 
     .\\venv\\Scripts\\python.exe test_timetable_v2.py
 
@@ -50,6 +50,13 @@ Steps:
    18. sweep resolves     - end_time passed, ended attendance session with one
                             check-in, no SessionLog -> flag_unconducted_classes()
                             anchors CONDUCTED (not UNCONDUCTED)
+   19. term activation    - unique ADMIN/master fixtures; activation creates
+                            exactly one blank offering per existing section
+   20. activate twice     - no new offerings, same offering ids
+   21. HOD scope          - cross-department section/course/room writes ->
+                            403 timetable/out_of_department, unchanged rows
+   22. seed periods       - repeated seed creates nothing; exact grid retained
+   23. break period       - one 11:10-11:30 break with isBreak=true
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -76,7 +83,9 @@ Notes:
       sweep can only ever resolve it as CONDUCTED.
     - Cleanup deletes only this run's rows (users by unique email, their
       classes, sessions, tokens and logs). On-chain entries are append-only
-      and stay on the local Hardhat chain.
+      and stay on the local Hardhat chain. Phase 2.2 cleanup also deletes this
+      run's offerings/master rows and restores the previously active term
+      without creating offerings in it. Periods are shared and left intact.
 """
 
 import os
@@ -92,11 +101,14 @@ import requests  # noqa: E402
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
-    AttendanceCheckIn, AttendanceSession, FacultyProfile, InstitutionWhitelist, ScheduledClass,
-    SessionLog, Student, StudentProfile, SubstituteToken, User, WorkloadSession,
+    AttendanceCheckIn, AttendanceSession, Course, FacultyProfile, InstitutionWhitelist, Period,
+    Room, ScheduledClass, Section, SessionLog, Student, StudentProfile, SubstituteToken, Term,
+    TermOffering, User, UserRole, WorkloadSession,
 )
 from app.scheduler import flag_unconducted_classes, overdue_classes  # noqa: E402
 from app.services import workload  # noqa: E402
+from app.services.auth import hash_password  # noqa: E402
+from app.services.timetable import seed_periods  # noqa: E402
 from app.util import utcnow  # noqa: E402
 
 # Windows consoles often default to a legacy code page (cp1252) that cannot
@@ -130,6 +142,14 @@ STATE = {
     "attendance_session_id": None,
     "attendance_tx_hash": None,
     "student_row_owned": False,
+    "master_section_ids": [],
+    "master_course_ids": [],
+    "master_room_ids": [],
+    "master_term_id": None,
+    "previous_active_term_id": None,
+    "term_activation_attempted": False,
+    "offering_ids": [],
+    "foreign_resources": [],
 }
 
 
@@ -738,6 +758,162 @@ def step_sweep_resolves_attendance():
     )
 
 
+def step_term_activation():
+    """New term activation creates exactly one blank offering per section (D11)."""
+    # ADMIN cannot self-register; use the same DB fixture/login as the grade tests.
+    admin = {
+        "email": f"ttv2.admin.{RUN_ID}@{APP.config['INSTITUTION_EMAIL_DOMAIN']}",
+        "password": PASSWORD, "full_name": "Timetable V2 ADMIN",
+    }
+    ACCOUNTS["admin"] = admin
+    with APP.app_context():
+        db.session.add(User(
+            role=UserRole.ADMIN, email=admin["email"], password_hash=hash_password(PASSWORD),
+            full_name=admin["full_name"], department=None, is_active=True,
+        ))
+        db.session.commit()
+        active = Term.query.filter_by(is_active=True).first()
+        STATE["previous_active_term_id"] = active.id if active else None
+    status, payload = api("POST", "/auth/login", json={"email": admin["email"], "password": PASSWORD})
+    assert status == 200 and payload.get("token"), f"ADMIN login failed: {status}: {payload}"
+    assert payload["user"]["role"] == "ADMIN", f"fixture is not ADMIN: {payload}"
+    AUTH["admin_token"] = payload["token"]
+    own_department = ACCOUNTS["hod"]["department"]
+    other_department = "Physics"
+    for suffix, department in (("A", own_department), ("B", other_department)):
+        for letter in ("A", "B"):
+            status, payload = api("POST", "/sections", token=AUTH["admin_token"], json={
+                "programme": f"TT2-{suffix}-{RUN_ID}", "batch_year": 2024,
+                "letter": letter, "department": department,
+            })
+            assert status == 201, f"section creation failed: {status}: {payload}"
+            resource_id = payload["section"]["id"]
+            STATE["master_section_ids"].append(resource_id)
+            if suffix == "B":
+                STATE["foreign_resources"].append(("sections", resource_id, {"letter": "C"}))
+    for path, body, patch in (
+        ("courses", {"code": f"T2B-{RUN_ID[:24]}", "title": "Scope Test", "is_lab": False,
+                     "department": other_department}, {"title": "Changed"}),
+        ("rooms", {"name": f"TT2 Room {RUN_ID}", "type": "LECTURE", "block": "B", "capacity": 30,
+                   "department": other_department}, {"capacity": 40}),
+    ):
+        status, payload = api("POST", f"/{path}", token=AUTH["admin_token"], json=body)
+        assert status == 201, f"{path} fixture creation failed: {status}: {payload}"
+        resource_id = payload[path[:-1]]["id"]
+        STATE["master_course_ids" if path == "courses" else "master_room_ids"].append(resource_id)
+        STATE["foreign_resources"].append((path, resource_id, patch))
+    status, payload = api("POST", "/admin/terms", token=AUTH["admin_token"], json={
+        "name": f"TT2-{RUN_ID}", "start_date": "2026-09-01", "end_date": "2027-01-31",
+    })
+    assert status == 201, f"term creation failed: {status}: {payload}"
+    term_id = payload["term"]["id"]
+    STATE["master_term_id"] = term_id
+    with APP.app_context():
+        section_ids = {row.id for row in Section.query.all()}
+        assert TermOffering.query.filter_by(term_id=term_id).count() == 0, "new term is not blank"
+    STATE["term_activation_attempted"] = True
+    status, payload = api("POST", f"/admin/terms/{term_id}/activate", token=AUTH["admin_token"], json={})
+    assert status == 200 and payload["term"]["isActive"] is True, f"activation failed: {status}: {payload}"
+    assert payload["offerings_created"] == len(section_ids), f"wrong creation count: {payload}"
+    with APP.app_context():
+        rows = TermOffering.query.filter_by(term_id=term_id).all()
+        assert len(rows) == len(section_ids), "activation did not create one offering per section"
+        assert {row.section_id for row in rows} == section_ids, "offering coverage differs from all sections"
+        assert [row.id for row in Term.query.filter_by(is_active=True)] == [term_id], "not exactly one active term"
+        STATE["offering_ids"] = sorted(row.id for row in rows)
+    print(f"   term {term_id}: {len(section_ids)} sections, {len(rows)} blank offerings")
+
+
+def step_term_activation_twice():
+    term_id = STATE["master_term_id"]
+    status, payload = api("POST", f"/admin/terms/{term_id}/activate", token=AUTH["admin_token"], json={})
+    assert status == 200, f"second activation failed: {status}: {payload}"
+    assert payload["offerings_created"] == 0, f"second activation created offerings: {payload}"
+    assert payload["deactivated_term_ids"] == [], f"second activation changed another term: {payload}"
+    with APP.app_context():
+        ids = sorted(row.id for row in TermOffering.query.filter_by(term_id=term_id).all())
+    assert ids == STATE["offering_ids"], f"second activation changed offering ids: {ids}"
+    status, payload = api("GET", f"/hod/offerings?term_id={term_id}", token=AUTH["hod_token"])
+    assert status == 200, f"GET /hod/offerings failed: {status}: {payload}"
+    assert all(row["section"]["department"] == ACCOUNTS["hod"]["department"] for row in payload["offerings"]), (
+        f"HOD received another department's offering: {payload}"
+    )
+    own_ids = set(STATE["master_section_ids"][:2])
+    assert own_ids <= {row["sectionId"] for row in payload["offerings"]}, "own offerings missing"
+    print(f"   term {term_id}: zero new offerings, original ids retained")
+
+
+def step_hod_department_scope():
+    """All master writes are refused against another department, including transfers."""
+    other_department = "Physics"
+    bodies = {
+        "sections": {"programme": f"TT2-REFUSED-{RUN_ID}", "batch_year": 2024, "letter": "A",
+                     "department": other_department},
+        "courses": {"code": f"T2R-{RUN_ID[:24]}", "title": "Refused", "department": other_department},
+        "rooms": {"name": f"TT2 Refused {RUN_ID}", "type": "LAB", "department": other_department},
+    }
+
+    def refused(method, path, body=None):
+        status, payload = api(method, path, token=AUTH["hod_token"], json=body)
+        assert status == 403, f"{method} {path} must be 403: {status}: {payload}"
+        assert payload.get("check") == "timetable" and payload.get("error") == "out_of_department", (
+            f"{method} {path}: wrong department error: {payload}"
+        )
+
+    for path, body in bodies.items():
+        model = {"sections": Section, "courses": Course, "rooms": Room}[path]
+        with APP.app_context():
+            before = model.query.count()
+        refused("POST", f"/{path}", body)
+        with APP.app_context():
+            assert model.query.count() == before, f"refused POST /{path} inserted a row"
+    for path, resource_id, patch in STATE["foreign_resources"]:
+        model = {"sections": Section, "courses": Course, "rooms": Room}[path]
+        with APP.app_context():
+            before = db.session.get(model, resource_id).to_dict()
+        for method in ("PATCH", "PUT", "DELETE"):
+            refused(method, f"/{path}/{resource_id}", patch if method != "DELETE" else None)
+        # Changing its department to the caller's must not bypass existing-row scope.
+        refused("PATCH", f"/{path}/{resource_id}", {"department": ACCOUNTS["hod"]["department"]})
+        with APP.app_context():
+            assert db.session.get(model, resource_id).to_dict() == before, "refused writes changed a row"
+    own_id = STATE["master_section_ids"][0]
+    refused("PATCH", f"/sections/{own_id}", {"department": other_department})
+    print("   cross-department create/update/delete and department transfers refused")
+
+
+def step_period_seed_idempotent():
+    with APP.app_context():
+        before = [row.to_dict() for row in Period.query.order_by(Period.start_time).all()]
+        assert seed_periods() == 0, "first repeated seed created periods"
+        assert seed_periods() == 0, "second repeated seed created periods"
+        after = [row.to_dict() for row in Period.query.order_by(Period.start_time).all()]
+    assert after == before, "period seeding changed existing rows"
+    expected = [
+        (1, "08:40", "09:30", False), (2, "09:30", "10:20", False),
+        (3, "10:20", "11:10", False), (None, "11:10", "11:30", True),
+        (4, "11:30", "12:20", False), (5, "12:20", "13:10", False),
+        (6, "13:10", "14:00", False),
+    ]
+    assert [(row["ordinal"], row["startTime"], row["endTime"], row["isBreak"]) for row in after] == expected, (
+        f"canonical period grid differs: {after}"
+    )
+    print("   two repeated seeds created zero rows; seven canonical rows retained")
+
+
+def step_break_period():
+    status, payload = api("GET", "/periods", token=AUTH["student_token"])
+    assert status == 200, f"GET /periods failed for STUDENT: {status}: {payload}"
+    breaks = [row for row in payload["periods"] if row.get("isBreak") is True]
+    assert len(breaks) == 1, f"expected exactly one break: {payload}"
+    assert breaks[0]["startTime"] == "11:10" and breaks[0]["endTime"] == "11:30", f"wrong break: {breaks}"
+    assert breaks[0]["ordinal"] is None, f"break must not have a teaching ordinal: {breaks}"
+    assert [row["ordinal"] for row in payload["periods"] if not row["isBreak"]] == [1, 2, 3, 4, 5, 6], (
+        f"teaching ordinals differ: {payload}"
+    )
+    print("   11:10-11:30 break exists, isBreak=true, ordinal=null")
+
+
 # --------------------------------------------------------------------------
 # Cleanup - only this run's rows
 # --------------------------------------------------------------------------
@@ -786,6 +962,26 @@ def cleanup() -> str | None:
             InstitutionWhitelist.query.filter_by(
                 employee_id=hod["employee_id"], email=hod["email"],
             ).delete(synchronize_session=False)
+            # Activation creates offerings for unrelated sections in this run's
+            # term too. Delete by our term OR our section ids, children first.
+            term_id = STATE["master_term_id"]
+            TermOffering.query.filter(db.or_(
+                TermOffering.term_id == term_id,
+                TermOffering.section_id.in_(STATE["master_section_ids"]),
+            )).delete(synchronize_session=False)
+            Section.query.filter(Section.id.in_(STATE["master_section_ids"])).delete(synchronize_session=False)
+            Course.query.filter(Course.id.in_(STATE["master_course_ids"])).delete(synchronize_session=False)
+            Room.query.filter(Room.id.in_(STATE["master_room_ids"])).delete(synchronize_session=False)
+            if STATE["term_activation_attempted"]:
+                Term.query.filter_by(id=term_id).update({Term.is_active: False}, synchronize_session=False)
+                db.session.flush()
+                prior_id = STATE["previous_active_term_id"]
+                current = Term.query.filter_by(is_active=True).first()
+                if current is not None and current.id != prior_id:
+                    raise RuntimeError("another process activated a term during the test; refusing to overwrite it")
+                if prior_id is not None and current is None:
+                    Term.query.filter_by(id=prior_id).update({Term.is_active: True}, synchronize_session=False)
+            Term.query.filter_by(id=term_id).delete(synchronize_session=False)
             db.session.commit()
     except Exception as exc:  # a cleanup failure must fail the run, not hide it
         return f"{type(exc).__name__}: {exc}"
@@ -815,6 +1011,11 @@ STEPS = [
     ("Attendance only, zero check-ins, end -> zero-student", step_attendance_only_zero),
     ("Workload-scan class, check-in + end -> no second entry", step_workload_logged_no_second_entry),
     ("Sweep: ended, started, one check-in -> CONDUCTED", step_sweep_resolves_attendance),
+    ("Term activation -> one blank offering per section", step_term_activation),
+    ("Second activation -> zero new offerings", step_term_activation_twice),
+    ("HOD writes against another department -> 403", step_hod_department_scope),
+    ("Period seeding is idempotent; exact grid", step_period_seed_idempotent),
+    ("Break period exists and is flagged", step_break_period),
 ]
 
 
@@ -842,7 +1043,7 @@ def run_steps() -> int:
 
 def main() -> int:
     print("=" * 60)
-    print("   TIMETABLE V2 LATE-START TESTS (test_timetable_v2.py)")
+    print("   TIMETABLE V2 WORKLOAD + MASTER-DATA TESTS (test_timetable_v2.py)")
     print("=" * 60)
     try:
         result = run_steps()

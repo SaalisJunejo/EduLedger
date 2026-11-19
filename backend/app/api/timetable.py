@@ -5,21 +5,25 @@
 - GET  /api/v1/timetable/classes    - HOD/ADMIN read-only listing of every
   scheduled occurrence (the institution-wide counterpart of the faculty's
   own GET /api/v1/faculty/classes).
+- Phase 2.2: authenticated periods, ADMIN terms/activation, scoped master
+  CRUD and HOD offerings. Copy-from awaits TimetableSlot in Phase 2.4.
 """
 
 import csv
 import io
+from datetime import date
 from pathlib import Path
 from zipfile import ZipFile
 
-from flask import current_app, jsonify, request
+from flask import current_app, g, jsonify, request
 from openpyxl import load_workbook
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..extensions import db
-from ..models import ScheduledClass, User
+from ..models import Course, Period, Room, ScheduledClass, Section, Term, TermOffering, User, UserRole
+from ..models.timetable import ROOM_TYPES
 from ..services.auth import require_auth
-from ..services.timetable import COLUMNS, timetable_timezone, validate_row
+from ..services.timetable import COLUMNS, activate_term, timetable_timezone, validate_row
 from ..util import utcnow
 from . import api_v1
 from .errors import api_error
@@ -159,3 +163,253 @@ def list_timetable_classes():
         entry["professorName"] = professor.full_name if professor is not None else None
         entries.append(entry)
     return jsonify({"classes": entries, "count": len(entries), "limit": _MAX_LISTED_CLASSES})
+
+
+# Phase 2.2 master data. JSON inputs use snake_case; models serialize camelCase.
+_MASTER_FIELDS = {
+    Section: {"programme", "batch_year", "letter", "department"},
+    Course: {"code", "title", "department", "is_lab"},
+    Room: {"name", "type", "block", "capacity", "department"},
+}
+
+
+def _master_body():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise ValueError("a JSON object is required")
+    return body
+
+
+def _master_text(body, field, limit):
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > limit:
+        raise ValueError(f"{field} must be nonempty text of at most {limit} characters")
+    return value.strip()
+
+
+def _master_department():
+    """HOD scope comes only from the authenticated user record, never the body."""
+    if g.role == "ADMIN":
+        return None, None
+    user = db.session.get(User, g.user_id)
+    if user is None or not user.is_active or user.role != UserRole.HOD or not user.department:
+        return None, api_error("timetable", "out_of_department", "HOD has no valid department scope", 403)
+    return user.department, None
+
+
+def _master_scope_error(department, target):
+    if department is not None and target != department:
+        return api_error("timetable", "out_of_department", "HOD may act only within their own department", 403)
+    return None
+
+
+def _master_values(model, body, existing, department):
+    if set(body) - _MASTER_FIELDS[model]:
+        raise ValueError("unknown fields: " + ", ".join(sorted(set(body) - _MASTER_FIELDS[model])))
+    values = {field: getattr(existing, field) for field in _MASTER_FIELDS[model]} if existing else {}
+    values.update(body)
+    if "department" not in values and department is not None:
+        values["department"] = department
+    values["department"] = _master_text(values, "department", 128)
+    fields = {
+        Section: (("programme", 64), ("letter", 4)),
+        Course: (("code", 32), ("title", 128)),
+        Room: (("name", 64), ("type", 16)),
+    }
+    for field, limit in fields[model]:
+        values[field] = _master_text(values, field, limit)
+    if model is Section:
+        year = values.get("batch_year")
+        if type(year) is not int or not 1 <= year <= 9999:
+            raise ValueError("batch_year must be an integer year between 1 and 9999")
+    elif model is Course:
+        values.setdefault("is_lab", False)
+        if type(values["is_lab"]) is not bool:
+            raise ValueError("is_lab must be a boolean")
+    else:
+        if values["type"] not in ROOM_TYPES:
+            raise ValueError("type must be LECTURE or LAB")
+        block = values.setdefault("block", None)
+        if block is not None:
+            values["block"] = _master_text(values, "block", 64)
+        capacity = values.setdefault("capacity", None)
+        if capacity is not None and (type(capacity) is not int or not 0 < capacity <= 2147483647):
+            raise ValueError("capacity must be null or a positive integer")
+    return values
+
+
+def _master_database_error(exc):
+    db.session.rollback()
+    if isinstance(exc, IntegrityError):
+        return api_error("timetable", "master_data_conflict", "duplicate data or a resource still in use", 409)
+    current_app.logger.exception("Timetable master data database failure")
+    return api_error("timetable", "database_error", "master data could not be saved", 500)
+
+
+def _master_collection(model, key):
+    department, error = _master_department()
+    if error is not None:
+        return error
+    if request.method in {"GET", "HEAD"}:
+        query = model.query
+        if department is not None:
+            query = query.filter(model.department == department)
+        rows = query.order_by(model.id).all()
+        return jsonify({key: [row.to_dict() for row in rows], "count": len(rows)})
+    try:
+        body = _master_body()
+        error = _master_scope_error(department, body.get("department", department))
+        if error is not None:
+            return error
+        row = model(**_master_values(model, body, None, department))
+        db.session.add(row)
+        db.session.commit()
+    except ValueError as exc:
+        return api_error("timetable", "invalid_fields", str(exc), 400)
+    except SQLAlchemyError as exc:
+        return _master_database_error(exc)
+    return jsonify({key[:-1]: row.to_dict()}), 201
+
+
+def _master_detail(model, key, resource_id):
+    department, error = _master_department()
+    if error is not None:
+        return error
+    row = db.session.get(model, resource_id)
+    if row is None:
+        code = {Course: "course_unknown", Room: "room_unknown", Section: "section_not_found"}[model]
+        return api_error("timetable", code, f"{key} does not exist", 404 if model is Section else 400)
+    error = _master_scope_error(department, row.department)
+    if error is not None:
+        return error
+    if request.method in {"GET", "HEAD"}:
+        return jsonify({key: row.to_dict()})
+    try:
+        if request.method == "DELETE":
+            # Sections are permanent cohorts: never discard an offering's history.
+            if model is Section and TermOffering.query.filter_by(section_id=row.id).first() is not None:
+                return api_error("timetable", "master_data_conflict", "section has term offerings and cannot be deleted", 409)
+            db.session.delete(row)
+            db.session.commit()
+            return jsonify({"deleted": resource_id})
+        body = _master_body()
+        error = _master_scope_error(department, body.get("department", row.department))
+        if error is not None:
+            return error
+        values = _master_values(model, body, row, department)
+        for field, value in values.items():
+            setattr(row, field, value)
+        db.session.commit()
+    except ValueError as exc:
+        return api_error("timetable", "invalid_fields", str(exc), 400)
+    except SQLAlchemyError as exc:
+        return _master_database_error(exc)
+    return jsonify({key: row.to_dict()})
+
+
+@api_v1.get("/periods")
+@require_auth(roles=["ADMIN", "HOD", "FACULTY", "STUDENT"])
+def timetable_periods():
+    rows = Period.query.order_by(Period.start_time, Period.id).all()
+    return jsonify({"periods": [row.to_dict() for row in rows], "count": len(rows)})
+
+
+@api_v1.route("/admin/terms", methods=["GET", "POST"])
+@require_auth(roles=["ADMIN"])
+def timetable_terms():
+    if request.method in {"GET", "HEAD"}:
+        rows = Term.query.order_by(Term.start_date.desc(), Term.id.desc()).all()
+        return jsonify({"terms": [row.to_dict() for row in rows], "count": len(rows)})
+    try:
+        body = _master_body()
+        if set(body) - {"name", "start_date", "end_date", "is_active"}:
+            raise ValueError("only name, start_date, end_date and is_active are accepted")
+        name = _master_text(body, "name", 64)
+        dates = []
+        for field in ("start_date", "end_date"):
+            raw = _master_text(body, field, 10)
+            parsed = date.fromisoformat(raw)
+            if parsed.isoformat() != raw:
+                raise ValueError(f"{field} must use YYYY-MM-DD")
+            dates.append(parsed)
+        if dates[1] < dates[0]:
+            raise ValueError("end_date must be on or after start_date")
+        active = body.get("is_active", False)
+        if type(active) is not bool:
+            raise ValueError("is_active must be a boolean")
+        term = Term(name=name, start_date=dates[0], end_date=dates[1], is_active=False)
+        db.session.add(term)
+        db.session.flush()
+        created, deactivated = activate_term(term) if active else (0, [])
+        db.session.commit()
+    except ValueError as exc:
+        return api_error("timetable", "invalid_fields", str(exc), 400)
+    except SQLAlchemyError as exc:
+        return _master_database_error(exc)
+    return jsonify({"term": term.to_dict(), "offerings_created": created, "deactivated_term_ids": deactivated}), 201
+
+
+@api_v1.post("/admin/terms/<int:term_id>/activate")
+@require_auth(roles=["ADMIN"])
+def timetable_activate_term(term_id):
+    term = db.session.get(Term, term_id)
+    if term is None:
+        return api_error("timetable", "term_not_found", "term does not exist", 404)
+    try:
+        created, deactivated = activate_term(term)
+        db.session.commit()
+    except SQLAlchemyError as exc:
+        return _master_database_error(exc)
+    return jsonify({"term": term.to_dict(), "offerings_created": created, "deactivated_term_ids": deactivated})
+
+
+@api_v1.route("/sections", methods=["GET", "POST"])
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_sections():
+    return _master_collection(Section, "sections")
+
+
+@api_v1.route("/sections/<int:resource_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_section(resource_id):
+    return _master_detail(Section, "section", resource_id)
+
+
+@api_v1.route("/courses", methods=["GET", "POST"])
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_courses():
+    return _master_collection(Course, "courses")
+
+
+@api_v1.route("/courses/<int:resource_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_course(resource_id):
+    return _master_detail(Course, "course", resource_id)
+
+
+@api_v1.route("/rooms", methods=["GET", "POST"])
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_rooms():
+    return _master_collection(Room, "rooms")
+
+
+@api_v1.route("/rooms/<int:resource_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_room(resource_id):
+    return _master_detail(Room, "room", resource_id)
+
+
+@api_v1.get("/hod/offerings")
+@require_auth(roles=["HOD"])
+def timetable_offerings():
+    department, error = _master_department()
+    if error is not None:
+        return error
+    query = TermOffering.query.join(Section).filter(Section.department == department)
+    raw_term = request.args.get("term_id")
+    if raw_term is not None:
+        if len(raw_term) > 10 or not raw_term.isascii() or not raw_term.isdigit() or not 0 < int(raw_term) <= 2147483647:
+            return api_error("timetable", "invalid_fields", "term_id must be a positive integer", 400)
+        query = query.filter(TermOffering.term_id == int(raw_term))
+    rows = query.order_by(TermOffering.term_id, TermOffering.section_id).all()
+    return jsonify({"offerings": [dict(row.to_dict(), section=row.section.to_dict()) for row in rows], "count": len(rows)})

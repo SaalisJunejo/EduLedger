@@ -15,20 +15,27 @@ from .grade import Grade
 from .proposal import Proposal
 from .session import AttendanceCheckIn, AttendanceSession, generate_nonce
 from .student import Student
+from .timetable import Course, Period, Room, Section, Term, TermOffering
 from .workload import ScheduledClass, SessionLog, SubstituteToken, WorkloadSession
 
 __all__ = [
     "AttendanceCheckIn",
     "AttendanceSession",
+    "Course",
     "FacultyProfile",
     "Grade",
     "InstitutionWhitelist",
+    "Period",
     "Proposal",
+    "Room",
     "ScheduledClass",
+    "Section",
     "SessionLog",
     "Student",
     "StudentProfile",
     "SubstituteToken",
+    "Term",
+    "TermOffering",
     "User",
     "UserRole",
     "WorkloadSession",

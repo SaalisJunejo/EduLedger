@@ -48,6 +48,10 @@ def create_app(config_name: str | None = None) -> Flask:
 
     with app.app_context():
         db.create_all()
+        # Phase 2.2 canonical grid: insert missing periods only (idempotent).
+        from .services.timetable import seed_periods
+
+        seed_periods()
 
     # -- REST API -----------------------------------------------------------
     from .api import api_v1

@@ -4,6 +4,10 @@ Uploaded weekdays/wall times become one dated occurrence on the next matching
 local calendar day (including today). Store UTC-naive datetimes so existing
 absolute-time seeds and the workload auto-flag job keep their semantics. A row
 is not a weekly recurrence: WorkloadLedger permits one outcome per class ID.
+
+Phase 2.2 adds the master-data helpers: the fixed period grid (seeded
+idempotently at app start) and term activation, which creates one blank
+TermOffering per section (D11).
 """
 
 import re
@@ -11,10 +15,12 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import current_app
+from sqlalchemy.exc import IntegrityError
 
 from ..extensions import db
 from ..models import (
-    AttendanceSession, FacultyProfile, ScheduledClass, User, UserRole, WorkloadSession,
+    AttendanceSession, FacultyProfile, Period, ScheduledClass, Section, Term, TermOffering, User,
+    UserRole, WorkloadSession,
 )
 from ..util import utcnow
 
@@ -23,6 +29,18 @@ COLUMNS = (
     "start_time", "end_time",
 )
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# The canonical grid (PRD v2.2 section 3): (ordinal, start, end, is_break),
+# local wall times in TIMETABLE_TIMEZONE. The break row has no ordinal.
+PERIOD_GRID = (
+    (1, time(8, 40), time(9, 30), False),
+    (2, time(9, 30), time(10, 20), False),
+    (3, time(10, 20), time(11, 10), False),
+    (None, time(11, 10), time(11, 30), True),
+    (4, time(11, 30), time(12, 20), False),
+    (5, time(12, 20), time(13, 10), False),
+    (6, time(13, 10), time(14, 0), False),
+)
 
 
 def timetable_timezone() -> ZoneInfo:
@@ -201,3 +219,63 @@ def lateness(scheduled_start: datetime, actual_start: datetime) -> tuple[bool, i
     delta = _utc(actual_start).astimezone(zone) - _utc(scheduled_start).astimezone(zone)
     minutes = max(0, int(delta.total_seconds() // 60))
     return delta > timedelta(minutes=late_after), minutes
+
+
+def seed_periods() -> int:
+    """Insert the PERIOD_GRID rows that are missing; returns how many were added.
+
+    Idempotent: a teaching period is matched by ordinal and the break by
+    is_break, so existing rows (including ADMIN edits) are never touched and a
+    second call adds nothing. Commits its own rows. If another process seeds
+    concurrently, the unique indexes refuse the duplicates and this call
+    rolls back and reports 0 - the other process inserted the same rows.
+    """
+    existing = Period.query.all()
+    ordinals = {period.ordinal for period in existing if not period.is_break}
+    has_break = any(period.is_break for period in existing)
+    created = 0
+    for ordinal, start, end, is_break in PERIOD_GRID:
+        if (has_break if is_break else ordinal in ordinals):
+            continue
+        db.session.add(Period(ordinal=ordinal, start_time=start, end_time=end, is_break=is_break))
+        created += 1
+    if not created:
+        return 0
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        # Suppress only a completed concurrent seed, not unrelated schema errors.
+        rows = Period.query.all()
+        complete = {row.ordinal for row in rows if not row.is_break} >= {1, 2, 3, 4, 5, 6}
+        if complete and any(row.is_break for row in rows):
+            return 0
+        raise
+    return created
+
+
+def activate_term(term: Term) -> tuple[int, list[int]]:
+    """Make `term` the only active term and give every section an offering.
+
+    Deactivates any other active term, then creates one blank TermOffering
+    for each Section that has none in this term (R4.1.4, D11). Idempotent: a
+    second call deactivates nothing and creates nothing. Not committed here.
+    Returns (offerings created, ids of the terms deactivated).
+    """
+    # Lock in a stable order so concurrent activations of existing terms serialize.
+    terms = Term.query.order_by(Term.id).populate_existing().with_for_update().all()
+    deactivated = []
+    for row in terms:
+        if row.id != term.id and row.is_active:
+            row.is_active = False
+            deactivated.append(row.id)
+    if deactivated:
+        # Flush the deactivation first: the single-active index is checked per row.
+        db.session.flush()
+    term.is_active = True
+    covered = db.session.query(TermOffering.section_id).filter(TermOffering.term_id == term.id)
+    missing = Section.query.filter(~Section.id.in_(covered)).order_by(Section.id).all()
+    for section in missing:
+        db.session.add(TermOffering(term_id=term.id, section_id=section.id))
+    db.session.flush()
+    return len(missing), deactivated
