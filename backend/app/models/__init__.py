@@ -16,18 +16,21 @@ from .proposal import Proposal
 from .session import AttendanceCheckIn, AttendanceSession, generate_nonce
 from .student import Student
 from .timetable import (
-    Course, DirectoryEntry, Period, Room, Section, StudentSection, Term, TermOffering, TimetableSlot,
+    CalendarClosure, Course, DirectoryEntry, OccurrenceAudit, Period, Room, Section,
+    StudentSection, Term, TermOffering, TimetableSlot,
 )
 from .workload import ScheduledClass, SessionLog, SubstituteToken, WorkloadSession
 
 __all__ = [
     "AttendanceCheckIn",
     "AttendanceSession",
+    "CalendarClosure",
     "Course",
     "DirectoryEntry",
     "FacultyProfile",
     "Grade",
     "InstitutionWhitelist",
+    "OccurrenceAudit",
     "Period",
     "Proposal",
     "Room",

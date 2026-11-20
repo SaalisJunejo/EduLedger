@@ -56,12 +56,19 @@ class ScheduledClass(db.Model):
     # UTC-naive dated occurrences, including when imported from local wall times.
     start_time = db.Column(db.DateTime, nullable=False, default=utcnow)
     end_time = db.Column(db.DateTime, nullable=True)
+    # Nullable references preserve dated uploads and pre-Stage-2 rows.
+    slot_id = db.Column(db.Integer, db.ForeignKey("timetable_slots.id"), nullable=True, index=True)
+    term_id = db.Column(db.Integer, db.ForeignKey("terms.id"), nullable=True, index=True)
+    session_group_id = db.Column(db.String(36), nullable=True)
+    slot = db.relationship("TimetableSlot")
     day_of_week = db.Column(db.Integer, nullable=True)  # Monday=0, Sunday=6.
     __table_args__ = (
         db.CheckConstraint(
             "day_of_week BETWEEN 0 AND 6",
             name="ck_scheduled_classes_day_of_week",
         ),
+        # The canonical daytime grid in Asia/Karachi has the same UTC/local date.
+        db.Index("uq_scheduled_classes_slot_date", slot_id, db.func.date(start_time), unique=True),
     )
 
     course_code = db.Column(db.String(64), nullable=False)
@@ -79,6 +86,9 @@ class ScheduledClass(db.Model):
             "courseCode": self.course_code,
             "dayOfWeek": self.day_of_week,
             "endTime": iso_z(self.end_time) if self.end_time else None,
+            "slotId": self.slot_id,
+            "termId": self.term_id,
+            "sessionGroupId": self.session_group_id,
         }
 
 

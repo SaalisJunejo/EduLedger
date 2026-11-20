@@ -44,6 +44,7 @@ class BaseConfig:
     ATTENDANCE_ROTATION_SECONDS = int(os.getenv("ATTENDANCE_ROTATION_SECONDS", "10"))
     SESSION_START_GRACE_MINUTES = int(os.getenv("SESSION_START_GRACE_MINUTES", "5"))
     TIMETABLE_TIMEZONE = os.getenv("TIMETABLE_TIMEZONE", "Asia/Karachi")
+    TIMETABLE_WINDOW_DAYS = int(os.getenv("TIMETABLE_WINDOW_DAYS", "21"))
     # A session starting more than this many minutes after the scheduled start
     # is shown as late (D18); derived off-chain only, never written on-chain.
     LATE_AFTER_MINUTES = int(os.getenv("LATE_AFTER_MINUTES", "10"))

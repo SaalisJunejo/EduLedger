@@ -67,6 +67,7 @@ from .errors import api_error
 _ERROR_RESPONSES = {
     "workload_already_logged": ("session_log", 409),
     "invalid_status": ("request", 400),
+    "occurrence_cancelled": ("timetable", 409),
 }
 
 

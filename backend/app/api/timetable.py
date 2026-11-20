@@ -27,7 +27,7 @@ from ..models import (
 from ..models.timetable import ROOM_TYPES
 from ..services.auth import require_auth
 from ..services.directory import apply_import, plan_import
-from ..services import pattern
+from ..services import occurrences, pattern
 from ..services.timetable import COLUMNS, activate_term, timetable_timezone, validate_row
 from ..util import utcnow
 from . import api_v1
@@ -166,8 +166,15 @@ def list_timetable_classes():
         serialized = scheduled_class.to_dict()
         entry = {field: serialized[field] for field in fields}
         entry["professorName"] = professor.full_name if professor is not None else None
+        entry.update(occurrences.derived_fields(scheduled_class))
         entries.append(entry)
-    return jsonify({"classes": entries, "count": len(entries), "limit": _MAX_LISTED_CLASSES})
+    try:
+        holidays = _occurrence_holidays(professor_id)
+        cancelled = _occurrence_deleted_cancellations(professor_id)
+    except (occurrences.OccurrenceError, ValueError) as exc:
+        return _occurrence_failure(exc)
+    return jsonify({"classes": entries, "count": len(entries), "limit": _MAX_LISTED_CLASSES,
+                    "holidays": holidays, "cancelled": cancelled})
 
 
 # Phase 2.2 master data. JSON inputs use snake_case; models serialize camelCase.
@@ -576,6 +583,75 @@ def timetable_copy_pattern(offering_id, source_term_id):
         return _pattern_report(report, existing, state, copied=True)
     except (pattern.PatternError, SQLAlchemyError) as exc:
         return _pattern_failure(exc)
+
+
+def _occurrence_failure(exc):
+    db.session.rollback()
+    if isinstance(exc, occurrences.OccurrenceError):
+        return api_error("timetable", exc.error, exc.message, exc.status)
+    if isinstance(exc, ValueError):
+        return api_error("timetable", "invalid_fields", str(exc), 400)
+    current_app.logger.exception("Occurrence operation failed")
+    return api_error("timetable", "occurrence_conflict", "occurrence operation could not be committed", 409)
+
+
+def _occurrence_holidays(professor_id=None):
+    first = date.fromisoformat(request.args["date_from"]) if "date_from" in request.args else None
+    last = date.fromisoformat(request.args["date_to"]) if "date_to" in request.args else None
+    return occurrences.holiday_entries(professor_id, first, last)
+
+
+def _occurrence_deleted_cancellations(professor_id=None):
+    first = date.fromisoformat(request.args["date_from"]) if "date_from" in request.args else None
+    last = date.fromisoformat(request.args["date_to"]) if "date_to" in request.args else None
+    return occurrences.deleted_cancellations(professor_id, first, last)
+
+
+@api_v1.post("/closures")
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_mark_closure():
+    try:
+        closure, result = occurrences.mark_closure(_master_body(), db.session.get(User, g.user_id))
+        db.session.commit()
+        return jsonify(dict(result, closure=closure.to_dict())), 201
+    except (occurrences.OccurrenceError, ValueError, SQLAlchemyError) as exc:
+        return _occurrence_failure(exc)
+
+
+@api_v1.delete("/closures/<int:closure_id>")
+@require_auth(roles=["HOD", "ADMIN"])
+def timetable_remove_closure(closure_id):
+    try:
+        occurrences.delete_closure(closure_id, db.session.get(User, g.user_id))
+        db.session.commit()
+        return jsonify({"deleted": True, "id": closure_id})
+    except (occurrences.OccurrenceError, SQLAlchemyError) as exc:
+        return _occurrence_failure(exc)
+
+
+@api_v1.post("/faculty/occurrences/<int:occurrence_id>/cancel")
+@require_auth(roles=["FACULTY", "HOD"])
+def timetable_cancel_occurrence(occurrence_id):
+    try:
+        row = occurrences.cancel(occurrence_id, db.session.get(User, g.user_id), _master_body().get("reason"))
+        db.session.commit()
+        return jsonify({"occurrence": dict(row.to_dict(), **occurrences.derived_fields(row))})
+    except (occurrences.OccurrenceError, ValueError, SQLAlchemyError) as exc:
+        return _occurrence_failure(exc)
+
+
+@api_v1.post("/faculty/occurrences/<int:occurrence_id>/move")
+@require_auth(roles=["FACULTY", "HOD"])
+def timetable_move_occurrence(occurrence_id):
+    try:
+        body = _master_body()
+        if {"start_time", "end_time"} & set(body):
+            raise occurrences.OccurrenceError("legacy_format", "use day_of_week, period_id, room_id and reason; no free-form times")
+        row, warnings = occurrences.move(occurrence_id, db.session.get(User, g.user_id), body)
+        db.session.commit()
+        return jsonify({"occurrence": dict(row.to_dict(), **occurrences.derived_fields(row)), "warnings": warnings})
+    except (occurrences.OccurrenceError, ValueError, SQLAlchemyError) as exc:
+        return _occurrence_failure(exc)
 
 
 @api_v1.get("/timetable/slots")

@@ -27,6 +27,9 @@ Jobs:
   Any session still live on such a class is closed first, in the same
   transaction (Phase 2.1f), so no scan can land after the outcome.
 
+- `generate_occurrences` (startup and daily at 00:05 timetable-local time) -
+  fills the active term's rolling future horizon without any chain writes.
+
 With SCHEDULER_ENABLED false no job is scheduled at all; tests call the job
 functions directly instead.
 """
@@ -38,16 +41,17 @@ from datetime import timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .extensions import db
-from .models import AttendanceSession, ScheduledClass, SessionLog, WorkloadSession
+from .models import AttendanceSession, ScheduledClass, SessionLog, Term, WorkloadSession
 from .models.workload import STATUS_UNCONDUCTED
-from .services import workload
-from .services.timetable import first_session_starts
+from .services import occurrences, workload
+from .services.timetable import first_session_starts, timetable_timezone
 from .util import utcnow
 
 logger = logging.getLogger(__name__)
 
 ROTATION_JOB_ID = "rotate_attendance_nonces"
 AUTOFLAG_JOB_ID = "flag_unconducted_classes"
+OCCURRENCES_JOB_ID = "generate_timetable_occurrences"
 
 
 def rotate_expired_nonces(app) -> int:
@@ -96,11 +100,13 @@ def overdue_classes(app, now) -> list[ScheduledClass]:
         ScheduledClass.end_time.is_(None),
         ScheduledClass.start_time <= now - threshold,
         ~ScheduledClass.session_logs.any(),
+        ~ScheduledClass.id.in_(occurrences.cancelled_ids()),
     ).all()
     ended = ScheduledClass.query.filter(
         ScheduledClass.end_time.isnot(None),
         ScheduledClass.end_time < now,
         ~ScheduledClass.session_logs.any(),
+        ~ScheduledClass.id.in_(occurrences.cancelled_ids()),
     ).all()
     started = first_session_starts(ended)
     return legacy + [scheduled_class for scheduled_class in ended if scheduled_class.id not in started]
@@ -117,6 +123,7 @@ def unresolved_started_classes(app, now) -> list[ScheduledClass]:
         ScheduledClass.end_time.isnot(None),
         ScheduledClass.end_time < now,
         ~ScheduledClass.session_logs.any(),
+        ~ScheduledClass.id.in_(occurrences.cancelled_ids()),
     ).all()
     started = first_session_starts(ended)
     return [scheduled_class for scheduled_class in ended if scheduled_class.id in started]
@@ -183,6 +190,16 @@ def flag_unconducted_classes(app) -> int:
 
             flagged = 0
             for scheduled_class in overdue:
+                scheduled_class = ScheduledClass.query.filter_by(id=scheduled_class.id).populate_existing().with_for_update().first()
+                if scheduled_class is None or occurrences.is_cancelled(scheduled_class):
+                    continue
+                if scheduled_class.session_logs:
+                    continue
+                if scheduled_class.end_time is not None:
+                    if scheduled_class.end_time >= now or occurrences.has_session(scheduled_class):
+                        continue
+                elif scheduled_class.start_time > now - timedelta(minutes=app.config["UNCONDUCTED_THRESHOLD_MINUTES"]):
+                    continue
                 try:
                     result = workload.log_workload(
                         scheduled_class.id,
@@ -234,6 +251,23 @@ def flag_unconducted_classes(app) -> int:
             return 0
 
 
+def generate_occurrences(app):
+    """Startup/daily rolling horizon for the active term. No chain calls."""
+    with app.app_context():
+        try:
+            term = Term.query.filter_by(is_active=True).first()
+            if term is None:
+                return {"created": 0, "skipped_existing": 0, "skipped_closed": 0}
+            result = occurrences.generate_for_term(term.id)
+            db.session.commit()
+            logger.info("Occurrence generation: %s", result)
+            return result
+        except Exception:
+            db.session.rollback()
+            logger.exception("Occurrence generation failed")
+            return None
+
+
 def init_scheduler(app) -> BackgroundScheduler | None:
     """Start the background jobs once per process; returns the scheduler.
 
@@ -266,6 +300,16 @@ def init_scheduler(app) -> BackgroundScheduler | None:
         coalesce=True,
         misfire_grace_time=30,
     )
+    # Daily at 00:05 local time, with one immediate startup fill. The disabled
+    # scheduler returns above, so test/script factories do neither operation.
+    with app.app_context():
+        zone = timetable_timezone()
+    scheduler.add_job(
+        generate_occurrences, trigger="cron", hour=0, minute=5, timezone=zone,
+        args=[app], id=OCCURRENCES_JOB_ID, max_instances=1, coalesce=True,
+        misfire_grace_time=3600,
+    )
+    generate_occurrences(app)
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown(wait=False))
 

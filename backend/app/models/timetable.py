@@ -270,6 +270,72 @@ FOR EACH ROW EXECUTE FUNCTION timetable_slot_teaching_period();
 """).execute_if(dialect="postgresql"))
 
 
+class CalendarClosure(db.Model):
+    """An active holiday declaration; DELETE removes it, not its audit history."""
+
+    __tablename__ = "calendar_closures"
+    __table_args__ = (
+        db.CheckConstraint("date_to >= date_from", name="ck_calendar_closures_dates"),
+        db.CheckConstraint(
+            "(scope = 'UNIVERSITY' AND department IS NULL) OR "
+            "(scope = 'DEPARTMENT' AND department IS NOT NULL)",
+            name="ck_calendar_closures_scope",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    date_from = db.Column(db.Date, nullable=False)
+    date_to = db.Column(db.Date, nullable=False)
+    scope = db.Column(db.String(16), nullable=False)
+    department = db.Column(db.String(128), nullable=True)
+    reason = db.Column(db.Text, nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "dateFrom": self.date_from.isoformat(), "dateTo": self.date_to.isoformat(),
+            "scope": self.scope, "department": self.department, "reason": self.reason,
+            "createdBy": self.created_by, "createdAt": iso_z(self.created_at),
+        }
+
+
+class OccurrenceAudit(db.Model):
+    """Off-chain changes and cancellation tombstones; never a SessionLog outcome.
+
+    Resource IDs are snapshots, deliberately not cascading foreign keys: an
+    audit must survive closure deletion or deletion of an unstarted occurrence.
+    """
+
+    __tablename__ = "occurrence_audits"
+    __table_args__ = (
+        db.CheckConstraint("action IN ('CLOSURE_CREATE', 'CLOSURE_DELETE', 'CANCEL', 'MOVE')",
+                           name="ck_occurrence_audits_action"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    actor_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    action = db.Column(db.String(24), nullable=False)
+    occurrence_id = db.Column(db.Integer, nullable=True, index=True)
+    closure_id = db.Column(db.Integer, nullable=True)
+    slot_id = db.Column(db.Integer, nullable=True)
+    date_from = db.Column(db.Date, nullable=False)
+    date_to = db.Column(db.Date, nullable=False)
+    removed_count = db.Column(db.Integer, nullable=False, default=0)
+    reason = db.Column(db.Text, nullable=False)
+    details = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "actorId": self.actor_id, "action": self.action,
+            "occurrenceId": self.occurrence_id, "closureId": self.closure_id,
+            "dateFrom": self.date_from.isoformat(), "dateTo": self.date_to.isoformat(),
+            "removedCount": self.removed_count, "reason": self.reason,
+            "details": self.details, "createdAt": iso_z(self.created_at),
+        }
+
+
 class DirectoryEntry(db.Model):
     """Imported identity; importing or editing it never moves a registered student."""
 

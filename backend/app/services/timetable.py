@@ -152,7 +152,15 @@ def start_gate(scheduled_class: ScheduledClass):
     start, workload start and substitute redeem.
     """
     from ..api.errors import api_error
+    from .occurrences import is_cancelled
 
+    # Serialize all start paths with closure deletion and single-row changes.
+    locked = ScheduledClass.query.filter_by(id=scheduled_class.id).populate_existing().with_for_update().first()
+    if locked is None:
+        return api_error("timetable", "occurrence_not_found", "the occurrence was removed", 404)
+    if is_cancelled(locked):
+        return api_error("timetable", "occurrence_cancelled", "the occurrence was cancelled", 409)
+    scheduled_class = locked
     grace = current_app.config["SESSION_START_GRACE_MINUTES"]
     if not isinstance(grace, int) or grace < 0:
         return api_error("schedule", "invalid_configuration", "SESSION_START_GRACE_MINUTES must be nonnegative", 500)

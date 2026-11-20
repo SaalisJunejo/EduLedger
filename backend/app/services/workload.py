@@ -204,6 +204,10 @@ def anchor_session_log(scheduled_class: ScheduledClass, conductor_id: int, statu
     the conductor recorded separately (D1). Returns (session_log,
     chain_result). Callers commit.
     """
+    from .occurrences import is_cancelled
+
+    if is_cancelled(scheduled_class):
+        raise WorkloadError("occurrence_cancelled", "a cancelled occurrence has no workload outcome")
     credited_professor_id = scheduled_class.professor_id
     result = log_workload(scheduled_class.id, credited_professor_id, status)
     session_log = SessionLog(
@@ -300,6 +304,10 @@ def ensure_workload_outcome(scheduled_class: ScheduledClass) -> SessionLog | Non
     new SessionLog or None. Raises WorkloadError when the chain write fails.
     Callers commit.
     """
+    from .occurrences import is_cancelled
+
+    if is_cancelled(scheduled_class):
+        return None
     if SessionLog.query.filter_by(class_id=scheduled_class.id).first() is not None:
         return None
     if not _has_check_in(class_session_ids(scheduled_class)):
@@ -318,6 +326,10 @@ def resolve_class_outcome(scheduled_class: ScheduledClass, *, require_closed: bo
     (the end route); the overdue sweep passes False because end_time has
     passed. Idempotent: never writes a second entry. Callers commit.
     """
+    from .occurrences import is_cancelled
+
+    if is_cancelled(scheduled_class):
+        return None
     session_log = ensure_workload_outcome(scheduled_class)
     if session_log is not None:
         return session_log

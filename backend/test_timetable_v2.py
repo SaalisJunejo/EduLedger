@@ -1,4 +1,4 @@
-"""Phase 2.1 workload, 2.2 master-data, 2.3 directory and 2.4 pattern tests.
+"""Phase 2.1-2.5 workload, directory, pattern and occurrence tests.
 
 Run it against a live stack (from backend/), after restarting Flask so it
 serves the Phase 2.4 code (apply all timetable migration SQL first):
@@ -70,6 +70,9 @@ Steps:
                             teacher/room clashes, section/mismatch warnings,
                             break/legacy rejection, dry run, HOD scope and copy.
                             Local Flask requests; no occurrence generation.
+   46-52. occurrences    - scoped future clock, rolling generation, closures,
+                            preserved started sessions, cancellation, clash-
+                            validated moves, audited reopening and isolation.
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -107,7 +110,7 @@ import logging
 import os
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -119,12 +122,13 @@ import requests  # noqa: E402
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
-    AttendanceCheckIn, AttendanceSession, Course, DirectoryEntry, FacultyProfile, InstitutionWhitelist, Period,
+    AttendanceCheckIn, AttendanceSession, CalendarClosure, Course, DirectoryEntry, FacultyProfile,
+    InstitutionWhitelist, OccurrenceAudit, Period,
     Room, ScheduledClass, Section, SessionLog, Student, StudentProfile, StudentSection, SubstituteToken, Term,
     TermOffering, TimetableSlot, User, UserRole, WorkloadSession,
 )
 from app.scheduler import flag_unconducted_classes, overdue_classes  # noqa: E402
-from app.services import registration_code, workload  # noqa: E402
+from app.services import occurrences, registration_code, workload  # noqa: E402
 from app.services.directory import COLUMNS as DIRECTORY_COLUMNS  # noqa: E402
 from app.services.auth import hash_password  # noqa: E402
 from app.services.timetable import seed_periods  # noqa: E402
@@ -179,6 +183,13 @@ STATE = {
     "pattern_courses": [],
     "pattern_rooms": [],
     "pattern_copy_term_ids": [],
+    "occurrence_term_ids": [],
+    "occurrence_slot_ids": [],
+    "occurrence_anchor": None,
+    "occurrence_closure_id": None,
+    "occurrence_kept_id": None,
+    "occurrence_removed_id": None,
+    "occurrence_sentinels": [],
 }
 
 
@@ -807,6 +818,7 @@ def step_term_activation():
     assert status == 200 and payload.get("token"), f"ADMIN login failed: {status}: {payload}"
     assert payload["user"]["role"] == "ADMIN", f"fixture is not ADMIN: {payload}"
     AUTH["admin_token"] = payload["token"]
+    AUTH["admin_id"] = payload["user"]["id"]
     own_department = ACCOUNTS["hod"]["department"]
     other_department = "Physics"
     for suffix, department in (("A", own_department), ("B", other_department)):
@@ -1217,12 +1229,14 @@ def cleanup() -> str | None:
                 ).all()}
             class_ids = list(class_ids)
             # Pattern children precede both their faculty and their offerings.
-            owned_terms = [STATE["master_term_id"], *STATE["pattern_copy_term_ids"]]
+            owned_terms = [STATE["master_term_id"], *STATE["pattern_copy_term_ids"], *STATE["occurrence_term_ids"]]
             owned_offerings = db.session.query(TermOffering.id).filter(db.or_(
                 TermOffering.term_id.in_([value for value in owned_terms if value is not None]),
                 TermOffering.section_id.in_(STATE["master_section_ids"]),
             ))
-            TimetableSlot.query.filter(TimetableSlot.offering_id.in_(owned_offerings)).delete(synchronize_session=False)
+            # Occurrences now reference slots; delete them before their pattern.
+            OccurrenceAudit.query.filter(OccurrenceAudit.actor_id.in_(user_ids)).delete(synchronize_session=False)
+            CalendarClosure.query.filter(CalendarClosure.created_by.in_(user_ids)).delete(synchronize_session=False)
             session_names = [str(class_id) for class_id in class_ids]
             session_names += [f"workload-{class_id}" for class_id in class_ids]
             for model in (SessionLog, SubstituteToken, WorkloadSession):
@@ -1245,6 +1259,7 @@ def cleanup() -> str | None:
                     AttendanceSession.id.in_(STATE["seeded_session_ids"]),
                 ).delete(synchronize_session=False)
             ScheduledClass.query.filter(ScheduledClass.id.in_(class_ids)).delete(synchronize_session=False)
+            TimetableSlot.query.filter(TimetableSlot.offering_id.in_(owned_offerings)).delete(synchronize_session=False)
             if STATE["student_row_owned"]:
                 Student.query.filter_by(id=AUTH["student_id"]).delete(synchronize_session=False)
             DirectoryEntry.query.filter(DirectoryEntry.roll_number.in_(
@@ -1283,7 +1298,7 @@ def cleanup() -> str | None:
                     raise RuntimeError("another process activated a term during the test; refusing to overwrite it")
                 if prior_id is not None and current is None:
                     Term.query.filter_by(id=prior_id).update({Term.is_active: True}, synchronize_session=False)
-            Term.query.filter(Term.id.in_(STATE["pattern_copy_term_ids"])).delete(synchronize_session=False)
+            Term.query.filter(Term.id.in_([*STATE["pattern_copy_term_ids"], *STATE["occurrence_term_ids"]])).delete(synchronize_session=False)
             Term.query.filter_by(id=term_id).delete(synchronize_session=False)
             db.session.commit()
             if STATE["directory_rows"]:
@@ -1521,6 +1536,261 @@ def step_pattern_copy():
 
 
 # --------------------------------------------------------------------------
+# Phase 2.5 - explicit generation, local requests and a scoped future clock
+# --------------------------------------------------------------------------
+def occurrence_api(method, path, token=None, **kwargs):
+    with patch("app.services.occurrences.utcnow", return_value=STATE["occurrence_anchor"]):
+        return pattern_api(method, path, token=token, **kwargs)
+
+
+def occurrence_generate(window_days=21):
+    with APP.app_context(), patch("app.services.occurrences.utcnow", return_value=STATE["occurrence_anchor"]):
+        result = occurrences.generate_for_term(STATE["occurrence_term_ids"][0], window_days=window_days)
+        db.session.commit()
+        return result
+
+
+def occurrence_rows():
+    with APP.app_context():
+        return [(r.id, r.slot_id, r.start_time, r.end_time, r.room, r.session_group_id)
+                for r in ScheduledClass.query.filter_by(term_id=STATE["occurrence_term_ids"][0])
+                .order_by(ScheduledClass.id).all()]
+
+
+def step_occurrence_generate():
+    # A next-week Monday avoids dependence on the real weekday or midnight.
+    with APP.app_context():
+        local_today = occurrences.today()
+        anchor_day = local_today + timedelta(days=(7 - local_today.weekday()) % 7 + 7)
+        zone = occurrences.timetable_timezone()
+        STATE["occurrence_anchor"] = datetime.combine(anchor_day, datetime.min.time(), zone).astimezone(
+            timezone.utc).replace(tzinfo=None)
+        term = Term(name=f"Occurrences {RUN_ID}", start_date=anchor_day + timedelta(days=2),
+                    end_date=anchor_day + timedelta(days=18))
+        db.session.add(term)
+        db.session.flush()
+        STATE["occurrence_term_ids"].append(term.id)
+        offerings = []
+        for letter in ("A", "B"):
+            section = Section(programme=f"TT2O-{RUN_ID}", batch_year=2023, letter=letter,
+                              department=f"Occurrence Test {RUN_ID}")
+            db.session.add(section)
+            db.session.flush()
+            STATE["master_section_ids"].append(section.id)
+            offering = TermOffering(term_id=term.id, section_id=section.id)
+            db.session.add(offering)
+            db.session.flush()
+            offerings.append(offering.id)
+        courses = [Course.query.filter_by(code=code).one().id for code in STATE["pattern_courses"]]
+        rooms = [Room.query.filter_by(name=name).one().id for name in STATE["pattern_rooms"]]
+        STATE["occurrence_room_ids"] = rooms
+        # Two lab cells in A, two non-clashing clash destinations in B, and
+        # two Wednesday cells for closure deletion/retained-session tests.
+        cells = [(0, 0, 1, "professor", 0, 2), (0, 0, 2, "professor", 0, 2),
+                 (1, 0, 3, "professor", 1, 0), (1, 0, 4, "substitute", 0, 0),
+                 (0, 2, 2, "professor", 0, 0), (1, 2, 3, "substitute", 1, 0)]
+        for offering, weekday, ordinal, teacher, room, course in cells:
+            slot = TimetableSlot(offering_id=offerings[offering], day_of_week=weekday,
+                period_id=Period.query.filter_by(ordinal=ordinal).one().id,
+                faculty_id=AUTH[f"{teacher}_id"], room_id=rooms[room], course_id=courses[course],
+                session_group_id=uuid4().hex if ordinal == 1 else None)
+            if offering == 0 and weekday == 0 and ordinal == 2:
+                slot.session_group_id = db.session.get(TimetableSlot, STATE["occurrence_slot_ids"][0]).session_group_id
+            db.session.add(slot)
+            db.session.flush()
+            STATE["occurrence_slot_ids"].append(slot.id)
+        first_slot = db.session.get(TimetableSlot, STATE["occurrence_slot_ids"][0])
+        for day in (anchor_day, anchor_day - timedelta(days=7)):
+            start, end = occurrences.period_times(day, first_slot.period)
+            row = ScheduledClass(slot_id=first_slot.id, term_id=term.id, professor_id=first_slot.faculty_id,
+                room=first_slot.room.name, course_code=first_slot.course.code, day_of_week=0,
+                start_time=start, end_time=end)
+            db.session.add(row)
+            db.session.flush()
+            STATE["class_ids"].append(row.id)
+            STATE["occurrence_sentinels"].append(row.to_dict())
+        db.session.commit()
+    first_result = occurrence_generate(window_days=7)
+    assert first_result["created"] == 6, f"incorrect seven-day horizon: {first_result}"
+    sentinel_ids = {s["id"] for s in STATE["occurrence_sentinels"]}
+    with APP.app_context():
+        assert all(occurrences.local_date(r.start_time) <= anchor_day + timedelta(days=7)
+                   for r in ScheduledClass.query.filter_by(term_id=STATE["occurrence_term_ids"][0]).all()
+                   if r.id not in sentinel_ids), "generator exceeded explicit window"
+    result = occurrence_generate()
+    assert result["created"] == 8, f"incorrect remaining clipped weekday count: {result}"
+    with APP.app_context():
+        for row in ScheduledClass.query.filter_by(term_id=STATE["occurrence_term_ids"][0]).all():
+            if row.id in {s["id"] for s in STATE["occurrence_sentinels"]}:
+                continue
+            day = occurrences.local_date(row.start_time)
+            assert anchor_day < day <= anchor_day + timedelta(days=21), "generated today, past or beyond window"
+            assert anchor_day + timedelta(days=2) <= day <= anchor_day + timedelta(days=18), "outside term"
+            assert day.weekday() < 5 and row.day_of_week == day.weekday(), "weekend/weekday mismatch"
+            assert row.course_code == row.slot.course.code and row.room == row.slot.room.name, "slot snapshot differs"
+            assert row.session_group_id == row.slot.session_group_id, "lost lab group"
+        for snapshot in STATE["occurrence_sentinels"]:
+            assert db.session.get(ScheduledClass, snapshot["id"]).to_dict() == snapshot, "generator altered old row"
+
+
+def step_occurrence_idempotent():
+    before = occurrence_rows()
+    result = occurrence_generate()
+    assert result == {"created": 0, "skipped_existing": 14, "skipped_closed": 0}, result
+    assert occurrence_rows() == before, "repeat generation changed occurrence IDs or snapshots"
+
+
+def step_occurrence_closure():
+    with APP.app_context():
+        term_id = STATE["occurrence_term_ids"][0]
+        rows = ScheduledClass.query.filter(ScheduledClass.term_id == term_id, ScheduledClass.day_of_week == 2).order_by(
+            ScheduledClass.start_time).all()
+        # Resets reuse class IDs but retain old attendance sessions. Select a
+        # pristine same-day pair without deleting or ignoring that evidence.
+        clean_days = {}
+        for row in rows:
+            if (WorkloadSession.query.filter_by(class_id=row.id).first() is not None or
+                    AttendanceSession.query.filter(AttendanceSession.class_id.in_(
+                        [str(row.id), f"workload-{row.id}"])).first() is not None or
+                    SessionLog.query.filter_by(class_id=row.id).first() is not None):
+                continue
+            clean_days.setdefault(occurrences.local_date(row.start_time), []).append(row)
+        pair = next((candidates for candidates in clean_days.values() if len(candidates) == 2), None)
+        assert pair is not None, "closure fixture needs two session/log-free occurrences on the same Wednesday"
+        kept, removed = pair
+        day = occurrences.local_date(kept.start_time)
+        kept_id, removed_id, removed_slot = kept.id, removed.id, removed.slot_id
+        STATE["occurrence_kept_id"], STATE["occurrence_removed_id"] = kept_id, removed_id
+        STATE["occurrence_closed_date"] = day
+        session = AttendanceSession(class_id=str(kept.id), start_time=kept.start_time,
+                                    current_nonce=f"tt2-closure-{RUN_ID}", nonce_expires_at=kept.end_time,
+                                    ended_at=kept.end_time, is_active=False)
+        db.session.add(session)
+        db.session.flush()
+        STATE["seeded_session_ids"].append(session.id)
+        db.session.commit()
+        pattern_before = pattern_snapshot(term_id)
+    # Use ADMIN to target only the isolated test department, never demo data.
+    status, payload = occurrence_api("POST", "/closures", token=AUTH["admin_token"], json={
+        "date_from": day.isoformat(), "date_to": day.isoformat(), "scope": "DEPARTMENT",
+        "department": f"Occurrence Test {RUN_ID}", "reason": "Test holiday"})
+    assert status == 201, f"closure failed: {status}: {payload}"
+    STATE["occurrence_closure_id"] = payload["closure"]["id"]
+    assert payload["removed"] == 1 and payload["kept_started"] == 1, payload
+    with APP.app_context():
+        assert db.session.get(ScheduledClass, kept_id) is not None, "deleted an ended/started session's class"
+        assert db.session.get(ScheduledClass, removed_id) is None, "unstarted row survived closure"
+        entry = OccurrenceAudit.query.filter_by(action="CLOSURE_CREATE", closure_id=STATE["occurrence_closure_id"]).one()
+        assert entry.actor_id == AUTH["admin_id"] and entry.removed_count == 1 and entry.date_from == day, "incorrect audit"
+    assert pattern_snapshot(term_id) == pattern_before, "closure touched pattern"
+    result = occurrence_generate()
+    assert result["created"] == 0 and result["skipped_closed"] == 2, result
+    assert pattern_snapshot(term_id) == pattern_before, "generation after closure touched pattern"
+    status, payload = occurrence_api("GET", f"/timetable/classes?date_from={day}&date_to={day}", token=AUTH["admin_token"])
+    assert status == 200 and any(h["slotId"] == removed_slot and h["state"] == "HOLIDAY"
+                                 for h in payload["holidays"]), f"deleted holiday not derived: {payload}"
+
+
+def step_occurrence_cancel():
+    with APP.app_context():
+        slot_id = STATE["occurrence_slot_ids"][0]
+        rows = ScheduledClass.query.filter_by(slot_id=slot_id).order_by(ScheduledClass.start_time).all()[2:]
+        first, following = rows
+        STATE["occurrence_cancelled_id"] = first.id
+        target_id, next_id, next_before = first.id, following.id, following.to_dict()
+        original = pattern_snapshot(STATE["occurrence_term_ids"][0])
+    status, payload = occurrence_api("POST", f"/faculty/occurrences/{target_id}/cancel", token=AUTH["professor_token"],
+                                     json={"reason": "One date only"})
+    assert status == 200 and payload["occurrence"]["state"] == "CANCELLED", payload
+    for route in ("/session/start", "/faculty/session/start"):
+        status, payload = occurrence_api("POST", route, token=AUTH["professor_token"], json={"class_id": target_id})
+        assert_directory_error(status, payload, 409, "timetable", "occurrence_cancelled")
+    with APP.app_context(), patch("app.services.workload.log_workload") as chain:
+        row = db.session.get(ScheduledClass, target_id)
+        assert workload.resolve_class_outcome(row, require_closed=False) is None, "cancelled outcome resolved"
+        assert target_id not in {r.id for r in overdue_classes(APP, first.end_time + timedelta(days=1))}, "cancelled row auto-flags"
+        chain.assert_not_called()
+        assert not SessionLog.query.filter_by(class_id=target_id).count(), "cancel wrote an outcome"
+        assert db.session.get(ScheduledClass, next_id).to_dict() == next_before, "next week changed"
+        assert OccurrenceAudit.query.filter_by(action="CANCEL", occurrence_id=target_id).count() == 1, "cancel not audited"
+    occurrence_generate()
+    assert pattern_snapshot(STATE["occurrence_term_ids"][0]) == original, "cancel touched pattern"
+
+
+def step_occurrence_move():
+    with APP.app_context():
+        row = ScheduledClass.query.filter_by(slot_id=STATE["occurrence_slot_ids"][1]).order_by(
+            ScheduledClass.start_time).first()
+        target_id, before = row.id, row.to_dict()
+        following = ScheduledClass.query.filter_by(slot_id=row.slot_id).order_by(ScheduledClass.start_time).all()[1]
+        next_id, next_before = following.id, following.to_dict()
+        pattern_before = pattern_snapshot(STATE["occurrence_term_ids"][0])
+        periods = {p.ordinal: p.id for p in Period.query.filter_by(is_break=False).all()}
+        group_partner = db.session.get(ScheduledClass, STATE["occurrence_cancelled_id"]).to_dict()
+    base = {"day_of_week": 0, "room_id": STATE["occurrence_room_ids"][0], "reason": "One-off move"}
+    for ordinal, error in ((3, "teacher_clash"), (4, "room_clash")):
+        status, payload = occurrence_api("POST", f"/faculty/occurrences/{target_id}/move", token=AUTH["professor_token"],
+                                        json=dict(base, period_id=periods[ordinal]))
+        assert_directory_error(status, payload, 409, "timetable", error)
+        with APP.app_context():
+            assert db.session.get(ScheduledClass, target_id).to_dict() == before, "rejected move changed row"
+    status, payload = occurrence_api("POST", f"/faculty/occurrences/{target_id}/move", token=AUTH["professor_token"],
+        json=dict(base, period_id=periods[6], room_id=STATE["occurrence_room_ids"][1]))
+    assert status == 200, f"valid move failed: {status}: {payload}"
+    assert payload["occurrence"]["sessionGroupId"] is None, "moved half still grouped"
+    assert any(w["error"] == "lab_group_split" for w in payload["warnings"]), "missing split warning"
+    stable = occurrence_rows()
+    occurrence_generate()
+    assert occurrence_rows() == stable, "generator undid/recreated moved row"
+    with APP.app_context():
+        assert db.session.get(ScheduledClass, STATE["occurrence_cancelled_id"]).to_dict() == group_partner, "other lab half edited"
+        assert OccurrenceAudit.query.filter_by(action="MOVE", occurrence_id=target_id).count() == 1, "move not audited"
+        assert db.session.get(ScheduledClass, next_id).to_dict() == next_before, "move altered next week"
+    # A different day must consume the original slot/date too, not recreate it.
+    status, payload = occurrence_api("POST", f"/faculty/occurrences/{target_id}/move", token=AUTH["professor_token"],
+        json=dict(base, day_of_week=3, period_id=periods[6], room_id=STATE["occurrence_room_ids"][1]))
+    assert status == 200 and payload["occurrence"]["dayOfWeek"] == 3, payload
+    stable = occurrence_rows()
+    assert occurrence_generate()["created"] == 0, "day move recreated original date"
+    assert occurrence_rows() == stable and pattern_snapshot(STATE["occurrence_term_ids"][0]) == pattern_before, "move changed pattern"
+
+
+def step_occurrence_started_guards():
+    target = STATE["occurrence_kept_id"]
+    for action in ("cancel", "move"):
+        status, payload = occurrence_api("POST", f"/faculty/occurrences/{target}/{action}", token=AUTH["professor_token"],
+            json={"reason": "Must refuse", "day_of_week": 2, "period_id": 1, "room_id": STATE["occurrence_room_ids"][0]})
+        assert_directory_error(status, payload, 409, "timetable", "session_already_started")
+    past_id = STATE["occurrence_sentinels"][1]["id"]
+    for action in ("cancel", "move"):
+        status, payload = occurrence_api("POST", f"/faculty/occurrences/{past_id}/{action}", token=AUTH["professor_token"],
+                                        json={"reason": "Must refuse past"})
+        assert_directory_error(status, payload, 409, "timetable", "occurrence_in_past")
+    status, payload = occurrence_api("POST", f"/faculty/occurrences/{STATE['occurrence_cancelled_id']}/cancel",
+                                    token=AUTH["substitute_token"], json={"reason": "Not mine"})
+    assert_directory_error(status, payload, 403, "timetable", "out_of_department")
+    status, payload = occurrence_api("DELETE", f"/closures/{STATE['occurrence_closure_id']}", token=AUTH["hod_token"])
+    assert_directory_error(status, payload, 403, "timetable", "out_of_department")
+    day = STATE["occurrence_closed_date"].isoformat()
+    status, payload = occurrence_api("POST", "/closures", token=AUTH["hod_token"], json={
+        "date_from": day, "date_to": day, "scope": "DEPARTMENT",
+        "department": f"Occurrence Test {RUN_ID}", "reason": "Wrong department"})
+    assert_directory_error(status, payload, 403, "timetable", "out_of_department")
+
+
+def step_occurrence_reopen_closure():
+    closure_id = STATE["occurrence_closure_id"]
+    status, payload = occurrence_api("DELETE", f"/closures/{closure_id}", token=AUTH["admin_token"])
+    assert status == 200 and payload["deleted"], payload
+    result = occurrence_generate()
+    assert result["created"] == 1, f"future reopening did not restore only deleted row: {result}"
+    with APP.app_context():
+        assert OccurrenceAudit.query.filter_by(action="CLOSURE_DELETE", closure_id=closure_id).count() == 1, "delete lost audit"
+        assert db.session.get(ScheduledClass, STATE["occurrence_cancelled_id"]) is not None, "lost cancellation tombstone"
+    assert occurrence_generate()["created"] == 0, "reopening is not idempotent"
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 STEPS = [
@@ -1570,6 +1840,13 @@ STEPS = [
     ("Dry run reports every violation without writing", step_pattern_dry_run),
     ("Pattern import obeys authenticated HOD department", step_pattern_hod_scope),
     ("Copy pattern into blank offering; non-blank refused", step_pattern_copy),
+    ("Generate tomorrow-only rolling window, clipped to term, with lab groups", step_occurrence_generate),
+    ("Occurrence generation is idempotent", step_occurrence_idempotent),
+    ("Closure deletes unstarted dates, retains started rows, derives HOLIDAY", step_occurrence_closure),
+    ("Cancel one date: no start/outcome path, next week and pattern intact", step_occurrence_cancel),
+    ("Move hard-validates teacher/room clashes and survives regeneration", step_occurrence_move),
+    ("Move/cancel after session start or in past refused; department scope", step_occurrence_started_guards),
+    ("Remove closure: audit retained, only future unstarted date regenerates", step_occurrence_reopen_closure),
 ]
 
 
