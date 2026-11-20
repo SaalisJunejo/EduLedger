@@ -2,9 +2,9 @@
   "contractName": "GovernanceRegistry",
   "network": "localhost",
   "chainId": 31337,
-  "address": "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e",
+  "address": "0x3Aa5ebB10DC797CAC828524e59A333d0A371443c",
   "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  "deployedAt": "2026-11-19T17:10:42.745Z",
+  "deployedAt": "2026-11-20T00:16:41.901Z",
   "roles": {
     "DEPLOYER": {
       "label": "Deployer (the only account allowed to call lockRoot once)",

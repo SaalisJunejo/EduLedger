@@ -1,7 +1,7 @@
-"""Phase 2.1 workload, 2.2 master-data and 2.3 directory tests (PRD v2.2).
+"""Phase 2.1 workload, 2.2 master-data, 2.3 directory and 2.4 pattern tests.
 
 Run it against a live stack (from backend/), after restarting Flask so it
-serves the Phase 2.2 code (apply the master-data SQL first):
+serves the Phase 2.4 code (apply all timetable migration SQL first):
 
     .\\venv\\Scripts\\python.exe test_timetable_v2.py
 
@@ -66,6 +66,10 @@ Steps:
                             These steps use APP.test_client against the same
                             DB/Redis to capture logs and scope the 1s TTL.
                             Only IPFS pinning is mocked for these new steps.
+   35-45. weekly pattern  - atomic/idempotent import, merged labs, whole-term
+                            teacher/room clashes, section/mismatch warnings,
+                            break/legacy rejection, dry run, HOD scope and copy.
+                            Local Flask requests; no occurrence generation.
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -117,13 +121,14 @@ from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
     AttendanceCheckIn, AttendanceSession, Course, DirectoryEntry, FacultyProfile, InstitutionWhitelist, Period,
     Room, ScheduledClass, Section, SessionLog, Student, StudentProfile, StudentSection, SubstituteToken, Term,
-    TermOffering, User, UserRole, WorkloadSession,
+    TermOffering, TimetableSlot, User, UserRole, WorkloadSession,
 )
 from app.scheduler import flag_unconducted_classes, overdue_classes  # noqa: E402
 from app.services import registration_code, workload  # noqa: E402
 from app.services.directory import COLUMNS as DIRECTORY_COLUMNS  # noqa: E402
 from app.services.auth import hash_password  # noqa: E402
 from app.services.timetable import seed_periods  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 from app.util import utcnow  # noqa: E402
 
 # Windows consoles often default to a legacy code page (cp1252) that cannot
@@ -170,6 +175,10 @@ STATE = {
     "directory_ids": [],
     "directory_codes": {},
     "directory_success": None,
+    "pattern_rows": [],
+    "pattern_courses": [],
+    "pattern_rooms": [],
+    "pattern_copy_term_ids": [],
 }
 
 
@@ -1207,6 +1216,13 @@ def cleanup() -> str | None:
                     ScheduledClass.professor_id.in_(user_ids),
                 ).all()}
             class_ids = list(class_ids)
+            # Pattern children precede both their faculty and their offerings.
+            owned_terms = [STATE["master_term_id"], *STATE["pattern_copy_term_ids"]]
+            owned_offerings = db.session.query(TermOffering.id).filter(db.or_(
+                TermOffering.term_id.in_([value for value in owned_terms if value is not None]),
+                TermOffering.section_id.in_(STATE["master_section_ids"]),
+            ))
+            TimetableSlot.query.filter(TimetableSlot.offering_id.in_(owned_offerings)).delete(synchronize_session=False)
             session_names = [str(class_id) for class_id in class_ids]
             session_names += [f"workload-{class_id}" for class_id in class_ids]
             for model in (SessionLog, SubstituteToken, WorkloadSession):
@@ -1246,7 +1262,7 @@ def cleanup() -> str | None:
             # term too. Delete by our term OR our section ids, children first.
             term_id = STATE["master_term_id"]
             TermOffering.query.filter(db.or_(
-                TermOffering.term_id == term_id,
+                TermOffering.term_id.in_([value for value in owned_terms if value is not None]),
                 TermOffering.section_id.in_(STATE["master_section_ids"]),
             )).delete(synchronize_session=False)
             # Query by our unique programme too, covering a failure immediately
@@ -1267,6 +1283,7 @@ def cleanup() -> str | None:
                     raise RuntimeError("another process activated a term during the test; refusing to overwrite it")
                 if prior_id is not None and current is None:
                     Term.query.filter_by(id=prior_id).update({Term.is_active: True}, synchronize_session=False)
+            Term.query.filter(Term.id.in_(STATE["pattern_copy_term_ids"])).delete(synchronize_session=False)
             Term.query.filter_by(id=term_id).delete(synchronize_session=False)
             db.session.commit()
             if STATE["directory_rows"]:
@@ -1279,6 +1296,228 @@ def cleanup() -> str | None:
     except Exception as exc:  # a cleanup failure must fail the run, not hide it
         return f"{type(exc).__name__}: {exc}"
     return None
+
+
+# --------------------------------------------------------------------------
+# Phase 2.4 weekly pattern tests (existing steps 0-34 are unchanged)
+# --------------------------------------------------------------------------
+def pattern_api(method, path, token=None, **kwargs):
+    headers = {"Authorization": f"Bearer {token or AUTH['hod_token']}"}
+    response = APP.test_client().open(f"/api/v1{path}", method=method, headers=headers, **kwargs)
+    return response.status_code, response.get_json()
+
+
+def pattern_row(section=None, course=0, faculty="professor", room=0, day="MON", period="1"):
+    return dict(section=str(section or STATE["master_section_ids"][0]),
+                course_code=STATE["pattern_courses"][course],
+                faculty_employee_id=ACCOUNTS[faculty]["employee_id"],
+                room=STATE["pattern_rooms"][room], day=day, period=str(period))
+
+
+def pattern_import(rows, *, dry_run=False, token=None, columns=None):
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=columns or (
+        "section", "course_code", "faculty_employee_id", "room", "day", "period"))
+    writer.writeheader()
+    writer.writerows(rows)
+    return pattern_api("POST", "/hod/timetable/import", token=token, data={
+        "file": (io.BytesIO(output.getvalue().encode("utf-8")), "pattern.csv"),
+        "term_id": str(STATE["master_term_id"]), "dry_run": "true" if dry_run else "false",
+    })
+
+
+def pattern_snapshot(term_id=None):
+    with APP.app_context():
+        rows = TimetableSlot.query.join(TermOffering).filter(
+            TermOffering.term_id == (term_id or STATE["master_term_id"]),
+        ).order_by(TimetableSlot.id).all()
+        return [(row.id, row.offering_id, row.course_id, row.faculty_id, row.room_id,
+                 row.day_of_week, row.period_id, row.session_group_id) for row in rows]
+
+
+def pattern_rejected(rows, code, status=409, **kwargs):
+    before = pattern_snapshot()
+    actual, payload = pattern_import(rows, **kwargs)
+    assert_directory_error(actual, payload, status, "timetable", code)
+    assert pattern_snapshot() == before, f"{code} partially changed the term pattern"
+    return payload
+
+
+def step_pattern_import():
+    department = ACCOUNTS["hod"]["department"]
+    with APP.app_context():
+        for suffix, is_lab in (("A", False), ("B", False), ("L", True)):
+            code = f"P{suffix}-{RUN_ID[:24]}"
+            row = Course(code=code, title=f"Pattern {suffix}", department=department, is_lab=is_lab)
+            db.session.add(row)
+            db.session.flush()
+            STATE["master_course_ids"].append(row.id)
+            STATE["pattern_courses"].append(code)
+        for suffix, kind in (("1", "LECTURE"), ("2", "LECTURE"), ("L", "LAB")):
+            name = f"Pattern {suffix} {RUN_ID}"
+            row = Room(name=name, type=kind, department=department)
+            db.session.add(row)
+            db.session.flush()
+            STATE["master_room_ids"].append(row.id)
+            STATE["pattern_rooms"].append(name)
+        db.session.commit()
+        section = db.session.get(Section, STATE["master_section_ids"][0])
+        label = section.to_dict()["label"]
+    rows = [
+        pattern_row(course=2, room=2, period=1), pattern_row(course=2, room=2, period=2),
+        pattern_row(period=4, faculty="substitute"),
+        pattern_row(day="tue", period=1), pattern_row(day="TUE", period=3, course=1),
+        pattern_row(day="WED", period=1), pattern_row(day="WED", period=4, course=2, room=2),
+        pattern_row(day="WED", period=5, course=2, room=2),
+        pattern_row(day="THU", period=2, course=2), pattern_row(day="THU", period=4, course=1),
+        pattern_row(day="FRI", period=1), pattern_row(day="FRI", period=5, course=1),
+    ]
+    rows[0]["section"] = label
+    STATE["pattern_rows"] = rows
+    status, payload = pattern_import(rows)
+    assert status == 200 and payload["rows_created"] == 12, f"pattern import failed: {status}: {payload}"
+    assert payload["rows_updated"] == payload["rows_unchanged"] == 0, f"unexpected report: {payload}"
+    assert len(pattern_snapshot()) == 12, "pattern count does not match the import"
+    with APP.app_context():
+        offering_id = TermOffering.query.filter_by(term_id=STATE["master_term_id"],
+                                                   section_id=STATE["master_section_ids"][0]).one().id
+    status, view = pattern_api("GET", f"/timetable/slots?offering_id={offering_id}")
+    assert status == 200 and view["count"] == 12, f"slots read failed: {status}: {view}"
+    pairs = [group for group in view["groups"] if group["sessionGroupId"]]
+    assert len(pairs) == 2 and [group["periodOrdinals"] for group in pairs] == [[1, 2], [4, 5]], "lab pairs were not merged"
+    assert all(len(group["slots"]) == 2 for group in pairs), "a group must contain exactly two cells"
+    assert all(slot["periodOrdinal"] is not None for slot in view["slots"]), "slot references a break"
+
+
+def step_pattern_reimport():
+    before = pattern_snapshot()
+    status, payload = pattern_import(STATE["pattern_rows"])
+    assert status == 200 and payload["rows_unchanged"] == 12, f"re-import not unchanged: {status}: {payload}"
+    assert payload["rows_created"] == payload["rows_updated"] == 0, f"re-import changed rows: {payload}"
+    assert pattern_snapshot() == before, "re-import changed IDs/groups"
+
+
+def step_pattern_teacher_clash():
+    other = STATE["master_section_ids"][1]
+    payload = pattern_rejected([pattern_row(section=other, course=2, room=1),
+                                pattern_row(section=other, day="FRI", period=6)], "teacher_clash")
+    assert any(item["line"] == 2 for item in payload["violations"]), "clash lacks line number"
+    # Incoming-only conflicts must also be checked in the final term snapshot.
+    pattern_rejected([pattern_row(day="FRI", period=6),
+                      pattern_row(section=other, day="FRI", period=6, room=1)], "teacher_clash")
+
+
+def step_pattern_room_clash():
+    pattern_rejected([pattern_row(section=STATE["master_section_ids"][1], course=2,
+                                  faculty="substitute", room=2)], "room_clash")
+
+
+def step_pattern_section_warning():
+    first = pattern_row(day="FRI", period=6)
+    last = pattern_row(day="FRI", period=6, course=1)
+    status, payload = pattern_import([first, last])
+    assert status == 200 and payload["rows_created"] == 1, f"section warning blocked write: {status}: {payload}"
+    assert any(item["error"] == "section_clash" and item["line"] == 3 for item in payload["warnings"]), "section warning missing"
+    with APP.app_context():
+        period = Period.query.filter_by(ordinal=6).one()
+        row = TimetableSlot.query.join(TermOffering).filter(TermOffering.term_id == STATE["master_term_id"],
+               TermOffering.section_id == STATE["master_section_ids"][0],
+               TimetableSlot.day_of_week == 4, TimetableSlot.period_id == period.id).one()
+        assert row.course.code == last["course_code"], "last CSV row did not win the unique cell"
+
+
+def step_pattern_lab_warning():
+    status, payload = pattern_import([pattern_row(day="TUE", period=6, course=2)])
+    assert status == 200 and payload["rows_created"] == 1, f"lab warning blocked write: {status}: {payload}"
+    assert any(item["error"] == "lab_room_mismatch" and item["line"] == 2 for item in payload["warnings"]), "lab warning missing"
+    status, payload = pattern_import([pattern_row(day="TUE", period=3, course=2, room=2),
+                                      pattern_row(day="TUE", period=4, course=2, room=2)])
+    assert status == 200, f"lab across break import failed: {status}: {payload}"
+    with APP.app_context():
+        rows = TimetableSlot.query.join(TermOffering).join(Period, TimetableSlot.period_id == Period.id).filter(
+            TermOffering.term_id == STATE["master_term_id"], TimetableSlot.day_of_week == 1,
+            Period.ordinal.in_([3, 4]),
+        ).all()
+        assert len(rows) == 2 and all(row.session_group_id is None for row in rows), "lab group incorrectly spans the break"
+
+
+def step_pattern_break():
+    pattern_rejected([pattern_row(day="THU", period="BREAK")], "break_period", 400)
+    # The PostgreSQL trigger also protects writes which bypass the importer.
+    before = pattern_snapshot()
+    with APP.app_context():
+        if db.engine.dialect.name == "postgresql":
+            slot = TimetableSlot.query.join(TermOffering).filter(TermOffering.term_id == STATE["master_term_id"]).first()
+            break_id = Period.query.filter_by(is_break=True).one().id
+            slot.period_id = break_id
+            try:
+                db.session.flush()
+            except IntegrityError as exc:
+                assert getattr(exc.orig.diag, "constraint_name", None) == "ck_timetable_slots_teaching_period", str(exc)
+            else:
+                raise AssertionError("database accepted a break slot")
+            finally:
+                db.session.rollback()
+    assert pattern_snapshot() == before, "break guard changed the pattern"
+
+
+def step_pattern_legacy():
+    for field in ("start_time", "end_time"):
+        row = dict(pattern_row(), **{field: "08:40"})
+        payload = pattern_rejected([row], "legacy_format", 400, columns=list(row))
+        assert all(column in payload["message"] for column in (
+            "section", "course_code", "faculty_employee_id", "room", "day", "period")), "legacy message omits new columns"
+
+
+def step_pattern_dry_run():
+    before = pattern_snapshot()
+    status, payload = pattern_import([pattern_row(day="THU", period=6)], dry_run=True)
+    assert status == 200 and payload["rows_created"] == 1 and payload["dry_run"], f"dry run report wrong: {status}: {payload}"
+    assert payload["proposed_changes"] and not payload["applied"], "dry run lacks a proposed plan"
+    assert pattern_snapshot() == before, "dry run wrote slots"
+    payload = pattern_rejected([pattern_row(section=STATE["master_section_ids"][1], course=2, room=2)],
+                               "teacher_clash", dry_run=True)
+    assert {item["error"] for item in payload["violations"]} >= {"teacher_clash", "room_clash"}, "dry run omitted a violation"
+    for field, code, value in (("course_code", "course_unknown", "MISSING"),
+                               ("room", "room_unknown", "MISSING"),
+                               ("faculty_employee_id", "faculty_not_faculty", ACCOUNTS["hod"]["employee_id"])):
+        pattern_rejected([dict(pattern_row(day="THU", period=6), **{field: value})], code, 400)
+
+
+def step_pattern_hod_scope():
+    pattern_rejected([pattern_row(section=STATE["master_section_ids"][2])], "out_of_department", 403)
+    with APP.app_context():
+        own_hod = db.session.get(User, AUTH["hod_id"])
+        original = own_hod.department
+        own_hod.department = "Physics"
+        db.session.commit()
+    try:
+        pattern_rejected([pattern_row()], "out_of_department", 403)
+    finally:
+        with APP.app_context():
+            db.session.get(User, AUTH["hod_id"]).department = original
+            db.session.commit()
+
+
+def step_pattern_copy():
+    with APP.app_context():
+        term = Term(name=f"Pattern Copy {RUN_ID}", start_date=utcnow().date(), end_date=utcnow().date())
+        db.session.add(term)
+        db.session.flush()
+        STATE["pattern_copy_term_ids"].append(term.id)
+        target = TermOffering(term_id=term.id, section_id=STATE["master_section_ids"][0])
+        db.session.add(target)
+        db.session.commit()
+        term_id, target_id = term.id, target.id
+    source_count = len(pattern_snapshot())
+    path = f"/hod/offerings/{target_id}/copy-from/{STATE['master_term_id']}"
+    status, payload = pattern_api("POST", path, json={})
+    assert status == 200 and payload["slots_copied"] == source_count, f"copy failed: {status}: {payload}"
+    before = pattern_snapshot(term_id)
+    assert len(before) == source_count and any(row[-1] for row in before), "copy lost slots/lab groups"
+    status, payload = pattern_api("POST", path, json={})
+    assert_directory_error(status, payload, 409, "timetable", "offering_not_blank")
+    assert pattern_snapshot(term_id) == before, "second copy changed a non-blank offering"
 
 
 # --------------------------------------------------------------------------
@@ -1320,6 +1559,17 @@ STEPS = [
     ("Registration attaches permanent section; login and me return it", step_directory_section_success),
     ("Same directory roll claimed twice -> 409", step_directory_claim_twice),
     ("Development code endpoint requires explicit opt-in", step_directory_dev_guard),
+    ("Pattern import -> 12 slots, merged labs and grouped read", step_pattern_import),
+    ("Pattern re-import -> unchanged=all, stable IDs/groups", step_pattern_reimport),
+    ("Whole-term teacher clashes -> 409, atomic", step_pattern_teacher_clash),
+    ("Whole-term room clash -> 409, atomic", step_pattern_room_clash),
+    ("Section clash warns and last row wins", step_pattern_section_warning),
+    ("Lab in lecture room warns and writes", step_pattern_lab_warning),
+    ("Break period -> 400 and database guard", step_pattern_break),
+    ("Legacy time columns -> 400 with new columns", step_pattern_legacy),
+    ("Dry run reports every violation without writing", step_pattern_dry_run),
+    ("Pattern import obeys authenticated HOD department", step_pattern_hod_scope),
+    ("Copy pattern into blank offering; non-blank refused", step_pattern_copy),
 ]
 
 

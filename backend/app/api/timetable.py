@@ -6,7 +6,8 @@
   scheduled occurrence (the institution-wide counterpart of the faculty's
   own GET /api/v1/faculty/classes).
 - Phase 2.2: authenticated periods, ADMIN terms/activation, scoped master
-  CRUD and HOD offerings. Copy-from awaits TimetableSlot in Phase 2.4.
+  CRUD and HOD offerings.
+- Phase 2.4: weekly CSV import, copy-from and grouped slot reads.
 """
 
 import csv
@@ -20,10 +21,13 @@ from openpyxl import load_workbook
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..extensions import db
-from ..models import Course, DirectoryEntry, Period, Room, ScheduledClass, Section, Term, TermOffering, User, UserRole
+from ..models import (
+    Course, DirectoryEntry, Period, Room, ScheduledClass, Section, StudentSection, Term, TermOffering, User, UserRole,
+)
 from ..models.timetable import ROOM_TYPES
 from ..services.auth import require_auth
 from ..services.directory import apply_import, plan_import
+from ..services import pattern
 from ..services.timetable import COLUMNS, activate_term, timetable_timezone, validate_row
 from ..util import utcnow
 from . import api_v1
@@ -479,3 +483,120 @@ def timetable_directory_list():
     rows = query.order_by(DirectoryEntry.roll_number, DirectoryEntry.id).offset((page - 1) * per_page).limit(per_page).all()
     return jsonify({"entries": [row.to_dict() for row in rows], "total": total,
                     "page": page, "per_page": per_page})
+
+
+# Weekly pattern operations; the verified dated upload above remains separate.
+def _pattern_failure(exc):
+    db.session.rollback()
+    if isinstance(exc, pattern.PatternError):
+        return api_error("timetable", exc.error, exc.message, exc.status)
+    if isinstance(exc, (UnicodeError, csv.Error)):
+        return api_error("timetable", "invalid_file", f"cannot parse pattern CSV: {exc}", 400)
+    if isinstance(exc, IntegrityError):
+        if getattr(getattr(exc.orig, "diag", None), "constraint_name", None) == "ck_timetable_slots_teaching_period":
+            return api_error("timetable", "break_period", "slot must reference a teaching period, never the break", 400)
+        return api_error("timetable", "pattern_conflict", "concurrent pattern/master-data conflict; no slots written", 409)
+    current_app.logger.exception("Timetable pattern database failure")
+    return api_error("timetable", "database_error", "pattern could not be saved; no slots written", 500)
+
+
+def _pattern_report(report, existing, state, *, dry_run=False, copied=False):
+    violation = pattern.rejection(report)
+    if violation:
+        db.session.rollback()
+        return api_error("timetable", violation["error"], violation["message"], violation["status"],
+                         dry_run=dry_run, applied=False, **report)
+    if dry_run:
+        db.session.rollback()
+    else:
+        pattern.apply_plan(existing, state)
+        db.session.commit()
+    if copied:
+        report["slots_copied"] = report["rows_created"]
+    return jsonify(dict(report, dry_run=dry_run, applied=not dry_run))
+
+
+def _reject_pattern_times(fields):
+    if {"start_time", "end_time"} & {str(field).lower() for field in fields}:
+        raise pattern.PatternError("legacy_format", "weekly pattern accepts " + ",".join(pattern.COLUMNS)
+                                   + "; start_time/end_time are not accepted")
+
+
+@api_v1.post("/hod/timetable/import")
+@require_auth(roles=["HOD"])
+def timetable_pattern_import():
+    department, error = _master_department()
+    if error is not None:
+        return error
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return api_error("timetable", "missing_file", "multipart file field is required", 400)
+    if Path(uploaded.filename).suffix.lower() != ".csv":
+        return api_error("timetable", "unsupported_file_type", "pattern must be .csv", 400)
+    try:
+        _reject_pattern_times(set(request.form) | set(request.args))
+        raw_dry = request.args.get("dry_run", request.form.get("dry_run", "false")).strip().lower()
+        if raw_dry not in {"true", "false"}:
+            raise pattern.PatternError("invalid_fields", "dry_run must be true or false")
+        dry_run = raw_dry == "true"
+        raw_term = request.args.get("term_id", request.form.get("term_id"))
+        term_id = pattern.positive_id(raw_term, "term_id") if raw_term is not None else None
+        data = uploaded.stream.read(_MAX_BYTES + 1)
+        if len(data) > _MAX_BYTES:
+            raise pattern.PatternError("file_too_large", "CSV must be at most 10 MB", 413)
+        term = pattern.lock_term(term_id, lock=not dry_run)
+        report, existing, state = pattern.plan_import(data, term, department)
+        return _pattern_report(report, existing, state, dry_run=dry_run)
+    except (pattern.PatternError, UnicodeError, csv.Error, SQLAlchemyError) as exc:
+        return _pattern_failure(exc)
+
+
+@api_v1.post("/hod/offerings/<int:offering_id>/copy-from/<int:source_term_id>")
+@require_auth(roles=["HOD"])
+def timetable_copy_pattern(offering_id, source_term_id):
+    department, error = _master_department()
+    if error is not None:
+        return error
+    try:
+        body = request.get_json(silent=True)
+        if body is not None and not isinstance(body, dict):
+            raise pattern.PatternError("invalid_fields", "copy-from accepts an empty JSON object")
+        _reject_pattern_times(set(request.args) | set(request.form) | set(body or {}))
+        target = db.session.get(TermOffering, offering_id)
+        if target is None:
+            raise pattern.PatternError("offering_not_found", "target offering does not exist", 403)
+        error = _master_scope_error(department, target.section.department)
+        if error is not None:
+            return error
+        # Both term locks in ID order serialize copy/import without deadlocks.
+        terms = Term.query.filter(Term.id.in_([target.term_id, source_term_id])).order_by(Term.id).with_for_update().all()
+        if source_term_id not in {row.id for row in terms}:
+            raise pattern.PatternError("offering_not_found", "source term does not exist", 403)
+        report, existing, state = pattern.plan_copy(target, source_term_id)
+        return _pattern_report(report, existing, state, copied=True)
+    except (pattern.PatternError, SQLAlchemyError) as exc:
+        return _pattern_failure(exc)
+
+
+@api_v1.get("/timetable/slots")
+@require_auth(roles=["ADMIN", "HOD", "FACULTY", "STUDENT"])
+def timetable_pattern_slots():
+    try:
+        offering_id = pattern.positive_id(request.args.get("offering_id"), "offering_id")
+        offering = db.session.get(TermOffering, offering_id)
+        if offering is None:
+            raise pattern.PatternError("offering_not_found", "offering does not exist", 403)
+        if g.role == "HOD":
+            department, error = _master_department()
+            if error is not None:
+                return error
+            error = _master_scope_error(department, offering.section.department)
+            if error is not None:
+                return error
+        elif g.role == "STUDENT":
+            membership = db.session.get(StudentSection, g.user_id)
+            if membership is None or membership.section_id != offering.section_id:
+                raise pattern.PatternError("out_of_department", "students may read only their own section's pattern", 403)
+        return jsonify(pattern.grouped_slots(offering))
+    except (pattern.PatternError, SQLAlchemyError) as exc:
+        return _pattern_failure(exc)

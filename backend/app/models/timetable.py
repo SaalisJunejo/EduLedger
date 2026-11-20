@@ -18,6 +18,8 @@ to the HOD's own department (`out_of_department`). `to_dict()` emits
 camelCase, like every other model.
 """
 
+from sqlalchemy import DDL, event
+
 from ..extensions import db
 from ..util import iso_z, utcnow
 
@@ -208,6 +210,64 @@ class Period(db.Model):
             "endTime": self.end_time.strftime("%H:%M"),
             "isBreak": self.is_break,
         }
+
+
+class TimetableSlot(db.Model):
+    """One weekly teaching cell; two adjacent lab cells may share a group ID."""
+
+    __tablename__ = "timetable_slots"
+    __table_args__ = (
+        db.UniqueConstraint("offering_id", "day_of_week", "period_id", name="uq_timetable_slots_cell"),
+        db.CheckConstraint("day_of_week BETWEEN 0 AND 4", name="ck_timetable_slots_day"),
+        db.Index("ix_timetable_slots_teacher_cell", "faculty_id", "day_of_week", "period_id"),
+        db.Index("ix_timetable_slots_room_cell", "room_id", "day_of_week", "period_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    offering_id = db.Column(db.Integer, db.ForeignKey("term_offerings.id"), nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey("courses.id"), nullable=False)
+    faculty_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    room_id = db.Column(db.Integer, db.ForeignKey("rooms.id"), nullable=False)
+    day_of_week = db.Column(db.Integer, nullable=False)
+    period_id = db.Column(db.Integer, db.ForeignKey("periods.id"), nullable=False)
+    session_group_id = db.Column(db.String(36), nullable=True)
+
+    offering = db.relationship("TermOffering", backref="slots")
+    course = db.relationship("Course")
+    faculty = db.relationship("User")
+    room = db.relationship("Room")
+    period = db.relationship("Period")
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "offeringId": self.offering_id, "courseId": self.course_id,
+            "facultyId": self.faculty_id, "roomId": self.room_id,
+            "dayOfWeek": self.day_of_week, "periodId": self.period_id,
+            "periodOrdinal": self.period.ordinal, "sessionGroupId": self.session_group_id,
+        }
+
+
+# CHECK constraints cannot query another table. PostgreSQL's slot trigger
+# protects raw writes without changing periods; periods have no write endpoint.
+# Register the same guard for a fresh database created by the app factory.
+event.listen(TimetableSlot.__table__, "after_create", DDL("""
+CREATE OR REPLACE FUNCTION timetable_slot_teaching_period() RETURNS trigger AS $$
+BEGIN
+    PERFORM 1 FROM periods WHERE id = NEW.period_id
+        AND NOT is_break AND ordinal BETWEEN 1 AND 6 FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'slot must reference a teaching period (1-6), never the break'
+            USING ERRCODE = '23514', CONSTRAINT = 'ck_timetable_slots_teaching_period';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""").execute_if(dialect="postgresql"))
+event.listen(TimetableSlot.__table__, "after_create", DDL("""
+CREATE TRIGGER timetable_slots_teaching_period
+BEFORE INSERT OR UPDATE OF period_id ON timetable_slots
+FOR EACH ROW EXECUTE FUNCTION timetable_slot_teaching_period();
+""").execute_if(dialect="postgresql"))
 
 
 class DirectoryEntry(db.Model):
