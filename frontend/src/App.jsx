@@ -12,6 +12,7 @@ import AdminPage from './pages/AdminPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import SetupPage from './pages/SetupPage';
+import Timetable from './pages/Timetable.jsx';
 
 function ProtectedRoutes() {
   const navigate = useNavigate();
@@ -71,7 +72,8 @@ function ProtectedRoutes() {
 
 function RoleRoute({ role, children }) {
   const user = useOutletContext();
-  if (user.role !== role) return <Navigate to={getRolePath(user.role)} replace />;
+  const allowed = Array.isArray(role) ? role.includes(user.role) : user.role === role;
+  if (!allowed) return <Navigate to={getRolePath(user.role)} replace />;
   return children;
 }
 
@@ -90,6 +92,7 @@ function App() {
         <Route path="/instructor" element={<RoleRoute role="FACULTY"><InstructorPage /></RoleRoute>} />
         <Route path="/hod" element={<RoleRoute role="HOD"><HodPage /></RoleRoute>} />
         <Route path="/admin" element={<RoleRoute role="ADMIN"><AdminPage /></RoleRoute>} />
+        <Route path="/timetable" element={<RoleRoute role={['HOD', 'ADMIN', 'FACULTY']}><Timetable /></RoleRoute>} />
       </Route>
       <Route path="*" element={<Navigate to="/login" replace />} />
     </Routes>

@@ -1,6 +1,6 @@
-import { Link, useNavigate } from "react-router-dom";
+import { Link, NavLink, useNavigate, useOutletContext } from "react-router-dom";
 import Button from "./ui/Button.jsx";
-import { logout } from "../lib/auth.js";
+import { getRolePath, logout } from "../lib/auth.js";
 
 /**
  * Shared shell for role dashboards. Each dashboard grows feature widgets
@@ -14,6 +14,11 @@ import { logout } from "../lib/auth.js";
  */
 export default function PageLayout({ role, title, description, features = [], wide = false, children }) {
   const navigate = useNavigate();
+  const user = useOutletContext();
+  const isStaff = ["HOD", "ADMIN", "FACULTY"].includes(user?.role);
+  const navClass = ({ isActive }) => `rounded-lg border px-3 py-2 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-primary ${
+    isActive ? "border-primary bg-primary-soft text-primary-strong" : "border-line bg-surface text-ink hover:border-primary hover:text-primary"
+  }`;
 
   function handleLogout() {
     logout();
@@ -31,6 +36,13 @@ export default function PageLayout({ role, title, description, features = [], wi
           <Button variant="secondary" onClick={handleLogout}>Logout</Button>
         </div>
       </header>
+
+      {isStaff ? (
+        <nav aria-label="Staff navigation" className="mb-5 flex flex-wrap gap-2">
+          <NavLink to={getRolePath(user.role)} end className={navClass}>Dashboard</NavLink>
+          <NavLink to="/timetable" className={navClass}>Timetable</NavLink>
+        </nav>
+      ) : null}
 
       {children ? (
         <>
