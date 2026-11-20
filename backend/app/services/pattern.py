@@ -3,11 +3,15 @@
 No occurrences or chain writes. All pattern writers lock the parent term to
 serialize clash checks. Duplicate CSV cells warn and use the last row; the
 unique database cell remains authoritative. Group IDs are deterministic.
+
+Phase 2.6 read views build one complete week from the stored pattern, merge
+lab pairs and report stored-pattern warnings with slot ids.
 """
 
 import csv
 import io
 import re
+import zlib
 from collections import defaultdict
 from uuid import NAMESPACE_URL, uuid5
 
@@ -17,6 +21,10 @@ from ..models import Course, FacultyProfile, Period, Room, Section, Term, TermOf
 COLUMNS = ("section", "course_code", "faculty_employee_id", "room", "day", "period")
 DAYS = ("MON", "TUE", "WED", "THU", "FRI")
 FIELDS = ("offering_id", "course_id", "faculty_id", "room_id", "day_of_week", "period_id", "session_group_id")
+# Fixed palette for legend colours. No red: conflicts are never signalled by colour.
+COLOUR_TOKENS = ("sky", "emerald", "amber", "violet", "teal", "orange", "indigo", "lime", "fuchsia", "cyan")
+# The name each view already shows in its heading is omitted from its cells.
+VIEW_OMITS = {"class": "sectionLabel", "teacher": "facultyName", "room": "roomName"}
 
 
 class PatternError(Exception):
@@ -279,3 +287,113 @@ def grouped_slots(offering):
                            periodOrdinals=[item["periodOrdinal"] for item in members], slots=members))
     groups.sort(key=lambda item: (item["dayOfWeek"], item["slots"][0]["period"]["startTime"]))
     return dict(offering=offering.to_dict(), slots=slots, groups=groups, count=len(slots))
+
+
+def colour_token(key):
+    """Stable across processes and views; Python's hash() is salted per run."""
+    return COLOUR_TOKENS[zlib.crc32(str(key).strip().casefold().encode("utf-8")) % len(COLOUR_TOKENS)]
+
+
+def _view_warning(code, message, members, severity):
+    first = members[0]
+    return {"check": "timetable", "error": code, "message": message, "severity": severity,
+            "dayOfWeek": first.day_of_week, "periodId": first.period_id, "periodOrdinal": first.period.ordinal,
+            "slotIds": [row.id for row in members], "offeringIds": sorted({row.offering_id for row in members})}
+
+
+def term_warnings(term_id, visible_slot_ids=None):
+    """Stored-pattern warnings with slot ids, using the Phase 2.4 rules.
+
+    Teacher/room clashes are refused at import, so stored ones come only from
+    raw writes. The unique cell makes a stored section clash impossible; the
+    rule is kept so the grid contract matches the import report.
+    Optional slot visibility filters the response after whole-term validation.
+    """
+    rows = TimetableSlot.query.join(TermOffering).filter(TermOffering.term_id == term_id).order_by(TimetableSlot.id).all()
+    buckets = {"teacher_clash": defaultdict(list), "room_clash": defaultdict(list), "section_clash": defaultdict(list)}
+    for row in rows:
+        buckets["teacher_clash"][(row.faculty_id, row.day_of_week, row.period_id)].append(row)
+        buckets["room_clash"][(row.room_id, row.day_of_week, row.period_id)].append(row)
+        buckets["section_clash"][(row.offering_id, row.day_of_week, row.period_id)].append(row)
+    warnings = []
+    for code, grouped in buckets.items():
+        for key in sorted(grouped):
+            members = grouped[key]
+            resource_id, day, period_id = key
+            offerings = sorted({row.offering_id for row in members})
+            if (len(members) if code == "section_clash" else len(offerings)) > 1:
+                warnings.append(_view_warning(
+                    code, f"{code}: resource {resource_id}, {DAYS[day]}, period {period_id}, offerings {offerings}",
+                    members, "WARN" if code == "section_clash" else "HARD"))
+    for row in rows:
+        if row.course.is_lab != (row.room.type == "LAB"):
+            warnings.append(_view_warning(
+                "lab_room_mismatch", f"{row.course.code} does not match {row.room.type} room {row.room.name}",
+                [row], "WARN"))
+    if visible_slot_ids is not None:
+        visible = set(visible_slot_ids)
+        warnings = [dict(warning, slotIds=[slot_id for slot_id in warning["slotIds"] if slot_id in visible])
+                    for warning in warnings if visible.intersection(warning["slotIds"])]
+    return warnings
+
+
+def week_view(view, slots):
+    """Five days x six periods; a lab pair is one span-2 block plus a COVERED marker.
+
+    A cell holding several slots (a stored clash) lists the extras in
+    ``overlaps`` and is never merged.
+    """
+    teaching = {row.ordinal: row for row in Period.query.filter(Period.is_break.is_(False)).all()
+                if row.ordinal in range(1, 7)}
+    break_row = Period.query.filter_by(is_break=True).first()
+    grid, courses, sections, rooms = defaultdict(list), {}, {}, {}
+    for slot in sorted(slots, key=lambda row: row.id):
+        period = slot.period
+        if period is None or period.is_break or period.ordinal not in range(1, 7) or slot.day_of_week not in range(5):
+            continue
+        course, room, section = slot.course, slot.room, slot.offering.section
+        label = section.to_dict()["label"]
+        entry = {
+            "slotId": slot.id, "offeringId": slot.offering_id, "sectionId": section.id, "courseId": course.id,
+            "facultyId": slot.faculty_id, "roomId": room.id, "courseCode": course.code, "courseTitle": course.title,
+            "isLab": course.is_lab, "roomName": room.name, "facultyName": slot.faculty.full_name,
+            "sectionLabel": label, "sessionGroupId": slot.session_group_id, "colour": colour_token(course.code),
+        }
+        entry.pop(VIEW_OMITS[view])
+        grid[(slot.day_of_week, period.ordinal)].append(entry)
+        courses[course.id] = {"id": course.id, "code": course.code, "title": course.title,
+                              "isLab": course.is_lab, "colour": colour_token(course.code)}
+        sections[section.id] = {"id": section.id, "label": label, "colour": colour_token(label)}
+        rooms[room.id] = {"id": room.id, "name": room.name, "type": room.type, "colour": colour_token(room.name)}
+    days = []
+    for day in range(5):
+        cells, ordinal = [], 1
+        while ordinal <= 6:
+            entries, period = grid.get((day, ordinal), []), teaching.get(ordinal)
+            base = {"dayOfWeek": day, "period": ordinal, "periodId": period.id if period else None}
+            if not entries:
+                cells.append(dict(base, kind="EMPTY", span=1))
+                ordinal += 1
+                continue
+            following, after = grid.get((day, ordinal + 1), []), teaching.get(ordinal + 1)
+            group = entries[0]["sessionGroupId"]
+            # Same adjacency rule as pairing: never merge across the break.
+            merged = (group is not None and len(entries) == 1 and len(following) == 1
+                      and following[0]["sessionGroupId"] == group and period is not None
+                      and after is not None and period.end_time == after.start_time)
+            span = 2 if merged else 1
+            block = entries[:1] + (following if merged else [])
+            cells.append(dict(entries[0], **base, kind="SLOT", span=span, periods=list(range(ordinal, ordinal + span)),
+                              slotIds=[item["slotId"] for item in block], overlaps=entries[1:]))
+            if merged:
+                cells.append({"dayOfWeek": day, "period": ordinal + 1, "periodId": after.id,
+                              "kind": "COVERED", "span": 0, "coveredBy": ordinal})
+            ordinal += span
+        days.append({"dayOfWeek": day, "label": DAYS[day], "cells": cells})
+    legend = {
+        "courses": sorted(courses.values(), key=lambda item: (item["code"].casefold(), item["id"])),
+        "sections": sorted(sections.values(), key=lambda item: (item["label"], item["id"])),
+        "rooms": sorted(rooms.values(), key=lambda item: (item["name"].casefold(), item["id"])),
+    }
+    return {"periods": [teaching[key].to_dict() for key in sorted(teaching)],
+            "break": break_row.to_dict() if break_row else None, "days": days, "legend": legend}

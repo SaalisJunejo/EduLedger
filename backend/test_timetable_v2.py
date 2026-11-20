@@ -1,4 +1,4 @@
-"""Phase 2.1-2.5 workload, directory, pattern and occurrence tests.
+"""Phase 2.1-2.6 workload, directory, pattern, occurrence and view tests.
 
 Run it against a live stack (from backend/), after restarting Flask so it
 serves the Phase 2.4 code (apply all timetable migration SQL first):
@@ -73,6 +73,10 @@ Steps:
    46-52. occurrences    - scoped future clock, rolling generation, closures,
                             preserved started sessions, cancellation, clash-
                             validated moves, audited reopening and isolation.
+   53-58. read views     - 5x6 class/teacher/room weeks, span-2 lab blocks,
+                            a seeded teacher clash in warnings, STUDENT/HOD
+                            read scope and cross-department write refusal.
+                            Local Flask requests on the occurrence term.
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -1791,6 +1795,160 @@ def step_occurrence_reopen_closure():
 
 
 # --------------------------------------------------------------------------
+# Phase 2.6 - read views over the isolated occurrence term's pattern
+# --------------------------------------------------------------------------
+def view_api(token, view, target_id):
+    return pattern_api("GET", f"/timetable?view={view}&id={target_id}&term={STATE['occurrence_term_ids'][0]}", token=token)
+
+
+def view_offering(letter):
+    with APP.app_context():
+        return TermOffering.query.join(Section).filter(
+            TermOffering.term_id == STATE["occurrence_term_ids"][0],
+            Section.programme == f"TT2O-{RUN_ID}", Section.letter == letter,
+        ).one().id
+
+
+def view_targets():
+    return (("class", view_offering("A")), ("teacher", AUTH["professor_id"]),
+            ("room", STATE["occurrence_room_ids"][0]))
+
+
+def assert_week(status, payload, label):
+    assert status == 200, f"{label} view failed: {status}: {payload}"
+    assert [day["dayOfWeek"] for day in payload["days"]] == [0, 1, 2, 3, 4], f"{label}: not Mon-Fri: {payload}"
+    for day in payload["days"]:
+        assert [cell["period"] for cell in day["cells"]] == [1, 2, 3, 4, 5, 6], f"{label}: not six periods: {day}"
+    assert [period["ordinal"] for period in payload["periods"]] == [1, 2, 3, 4, 5, 6], f"{label}: periods: {payload}"
+    assert payload["term"]["id"] == STATE["occurrence_term_ids"][0] and isinstance(payload["warnings"], list), label
+
+
+def step_view_grids():
+    colours = {}
+    for view, target in view_targets():
+        status, payload = view_api(AUTH["admin_token"], view, target)
+        assert_week(status, payload, view)
+        assert payload["view"] == view and payload["target"]["id"] == target, f"wrong target: {payload}"
+        legend = {course["code"]: course["colour"] for course in payload["legend"]["courses"]}
+        for day in payload["days"]:
+            for cell in day["cells"]:
+                if cell["kind"] == "SLOT":
+                    assert cell["colour"] == legend[cell["courseCode"]], f"cell colour differs from legend: {cell}"
+        for code, colour in legend.items():
+            assert colours.setdefault(code, colour) == colour, f"{code} colour differs between views"
+        assert payload["legend"]["sections"] and payload["legend"]["rooms"], f"legend lists missing: {payload}"
+    status, payload = pattern_api("GET", f"/timetable/offerings?term={STATE['occurrence_term_ids'][0]}",
+                                  token=AUTH["admin_token"])
+    assert status == 200, f"offering picker failed: {status}: {payload}"
+    labels = [offering["sectionLabel"] for offering in payload["offerings"]]
+    assert labels == [f"TT2O-{RUN_ID} \u00b7 2023 \u00b7 A", f"TT2O-{RUN_ID} \u00b7 2023 \u00b7 B"], labels
+
+
+def step_view_lab_span():
+    first, second = STATE["occurrence_slot_ids"][:2]
+    omitted = {"class": "sectionLabel", "teacher": "facultyName", "room": "roomName"}
+    for view, target in view_targets():
+        status, payload = view_api(AUTH["admin_token"], view, target)
+        assert_week(status, payload, view)
+        block, covered = payload["days"][0]["cells"][:2]
+        assert block["kind"] == "SLOT" and block["span"] == 2 and block["periods"] == [1, 2], f"{view}: lab not merged: {block}"
+        assert block["slotIds"] == [first, second] and block["sessionGroupId"], f"{view}: wrong lab block: {block}"
+        assert block["courseCode"] == STATE["pattern_courses"][2] and not block["overlaps"], f"{view}: {block}"
+        assert covered["kind"] == "COVERED" and covered["coveredBy"] == 1, f"{view}: P2 not covered: {covered}"
+        assert omitted[view] not in block and all(field in block for field in set(omitted.values()) - {omitted[view]}), (
+            f"{view}: wrong per-view fields: {block}")
+    status, payload = view_api(AUTH["admin_token"], "class", view_offering("A"))
+    single = payload["days"][2]["cells"][1]
+    assert single["kind"] == "SLOT" and single["span"] == 1 and single["slotIds"] == [STATE["occurrence_slot_ids"][4]], single
+
+
+def step_view_seeded_clash():
+    first = STATE["occurrence_slot_ids"][0]
+    with APP.app_context():
+        # A raw write, as import refuses it: B Monday P1 double-books the professor.
+        slot = TimetableSlot(offering_id=view_offering("B"), day_of_week=0,
+                             period_id=Period.query.filter_by(ordinal=1).one().id, faculty_id=AUTH["professor_id"],
+                             room_id=STATE["occurrence_room_ids"][1],
+                             course_id=Course.query.filter_by(code=STATE["pattern_courses"][0]).one().id)
+        db.session.add(slot)
+        db.session.commit()
+        clash_id = STATE["view_clash_slot_id"] = slot.id
+    for view, target in (("teacher", AUTH["professor_id"]), ("class", view_offering("A"))):
+        status, payload = view_api(AUTH["admin_token"], view, target)
+        assert_week(status, payload, view)
+        found = [w for w in payload["warnings"] if w["error"] == "teacher_clash" and set(w["slotIds"]) == {first, clash_id}]
+        assert len(found) == 1 and found[0]["severity"] == "HARD" and found[0]["dayOfWeek"] == 0, (
+            f"{view}: seeded clash missing: {payload['warnings']}")
+    status, payload = view_api(AUTH["admin_token"], "teacher", AUTH["professor_id"])
+    cell = payload["days"][0]["cells"][0]
+    assert cell["span"] == 1 and {cell["slotId"], *(item["slotId"] for item in cell["overlaps"])} == {first, clash_id}, (
+        f"clashing cell was merged or lost a slot: {cell}")
+    for view, target, expected_ids in (("class", view_offering("A"), {first}),
+                                      ("teacher", AUTH["professor_id"], {first, clash_id})):
+        status, payload = view_api(AUTH["professor_token"], view, target)
+        assert_week(status, payload, f"faculty {view}")
+        found = [w for w in payload["warnings"] if w["error"] == "teacher_clash" and first in w["slotIds"]]
+        assert len(found) == 1 and set(found[0]["slotIds"]) == expected_ids and found[0]["severity"] == "HARD", (
+            f"faculty {view}: seeded warning missing or leaked an inaccessible slot: {payload['warnings']}")
+        with APP.app_context():
+            query = TimetableSlot.query.join(TermOffering).filter(
+                TermOffering.term_id == STATE["occurrence_term_ids"][0])
+            query = query.filter(TimetableSlot.offering_id == target) if view == "class" else query.filter(
+                TimetableSlot.faculty_id == AUTH["professor_id"])
+            visible_ids = {slot.id for slot in query.all()}
+        assert all(w["slotIds"] and set(w["slotIds"]) <= visible_ids for w in payload["warnings"]), (
+            f"faculty {view}: warnings contain inaccessible slots: {payload['warnings']}")
+
+
+def step_view_student_forbidden():
+    token = STATE["directory_success"]["token"]
+    for view, target in (("teacher", AUTH["professor_id"]), ("room", STATE["occurrence_room_ids"][0]),
+                         ("class", view_offering("A"))):
+        status, payload = view_api(token, view, target)
+        assert_directory_error(status, payload, 403, "timetable", "out_of_scope")
+
+
+def step_view_student_own_class():
+    token = STATE["directory_success"]["token"]
+    with APP.app_context():
+        membership = db.session.get(StudentSection, STATE["directory_success"]["user"]["id"])
+        offering = TermOffering(term_id=STATE["occurrence_term_ids"][0], section_id=membership.section_id)
+        db.session.add(offering)
+        db.session.commit()
+        offering_id = offering.id
+    status, payload = view_api(token, "class", offering_id)
+    assert_week(status, payload, "student class")
+    assert payload["target"]["id"] == offering_id, f"wrong student offering: {payload}"
+    assert all(cell["kind"] == "EMPTY" for day in payload["days"] for cell in day["cells"]), "blank offering has cells"
+    assert payload["warnings"] == [], f"student received warnings outside their offering: {payload['warnings']}"
+    status, payload = pattern_api("GET", f"/timetable/offerings?term={STATE['occurrence_term_ids'][0]}", token=token)
+    assert status == 200 and [row["id"] for row in payload["offerings"]] == [offering_id], f"student picker: {payload}"
+
+
+def step_view_hod_foreign_reads():
+    term_id = STATE["occurrence_term_ids"][0]
+    for view, target in view_targets():
+        status, payload = view_api(AUTH["hod_token"], view, target)
+        assert_week(status, payload, f"foreign HOD {view}")
+        expected_ids = {STATE["occurrence_slot_ids"][0], STATE["view_clash_slot_id"]}
+        found = [w for w in payload["warnings"] if w["error"] == "teacher_clash" and set(w["slotIds"]) == expected_ids]
+        assert len(found) == 1 and found[0]["severity"] == "HARD", (
+            f"foreign HOD {view}: full seeded warning missing: {payload['warnings']}")
+    offering_id = view_offering("A")
+    with APP.app_context():
+        section = db.session.get(TermOffering, offering_id).section
+        section_id, section_before = section.id, section.to_dict()
+    pattern_before = pattern_snapshot(term_id)
+    status, payload = pattern_api("POST", f"/hod/offerings/{offering_id}/copy-from/{term_id}", json={})
+    assert_directory_error(status, payload, 403, "timetable", "out_of_department")
+    status, payload = pattern_api("PATCH", f"/sections/{section_id}", json={"letter": "Z"})
+    assert_directory_error(status, payload, 403, "timetable", "out_of_department")
+    with APP.app_context():
+        assert db.session.get(Section, section_id).to_dict() == section_before, "foreign section changed"
+    assert pattern_snapshot(term_id) == pattern_before, "foreign write changed the pattern"
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 STEPS = [
@@ -1847,6 +2005,12 @@ STEPS = [
     ("Move hard-validates teacher/room clashes and survives regeneration", step_occurrence_move),
     ("Move/cancel after session start or in past refused; department scope", step_occurrence_started_guards),
     ("Remove closure: audit retained, only future unstarted date regenerates", step_occurrence_reopen_closure),
+    ("Class/teacher/room views: 5 days x 6 periods, stable legend, picker", step_view_grids),
+    ("Two-period lab is one span-2 block in every view", step_view_lab_span),
+    ("Seeded teacher clash appears in warnings with slot ids", step_view_seeded_clash),
+    ("STUDENT teacher/room/other-class view -> 403 out_of_scope", step_view_student_forbidden),
+    ("STUDENT own class view -> 200", step_view_student_own_class),
+    ("Foreign-department HOD: reads 200, writes 403", step_view_hod_foreign_reads),
 ]
 
 

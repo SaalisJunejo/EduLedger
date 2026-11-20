@@ -8,6 +8,8 @@
 - Phase 2.2: authenticated periods, ADMIN terms/activation, scoped master
   CRUD and HOD offerings.
 - Phase 2.4: weekly CSV import, copy-from and grouped slot reads.
+- Phase 2.6: GET /timetable class/teacher/room week views and the
+  GET /timetable/offerings picker.
 """
 
 import csv
@@ -22,7 +24,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..extensions import db
 from ..models import (
-    Course, DirectoryEntry, Period, Room, ScheduledClass, Section, StudentSection, Term, TermOffering, User, UserRole,
+    Course, DirectoryEntry, Period, Room, ScheduledClass, Section, StudentSection, Term, TermOffering, TimetableSlot,
+    User, UserRole,
 )
 from ..models.timetable import ROOM_TYPES
 from ..services.auth import require_auth
@@ -674,5 +677,105 @@ def timetable_pattern_slots():
             if membership is None or membership.section_id != offering.section_id:
                 raise pattern.PatternError("out_of_department", "students may read only their own section's pattern", 403)
         return jsonify(pattern.grouped_slots(offering))
+    except (pattern.PatternError, SQLAlchemyError) as exc:
+        return _pattern_failure(exc)
+
+
+# Phase 2.6 read views: one complete pattern week, no paging, no history stamp.
+_VIEWS = ("class", "teacher", "room")
+
+
+def _view_term(raw):
+    term = Term.query.filter_by(is_active=True).first() if raw is None else db.session.get(
+        Term, pattern.positive_id(raw, "term"))
+    if term is None:
+        raise pattern.PatternError("term_not_found", "term does not exist; pass term=<id> or activate a term", 404)
+    return term
+
+
+def _view_actor():
+    """The stored, active user whose role matches the token, or None."""
+    user = db.session.get(User, g.user_id)
+    if user is None or not user.is_active or user.role.value != g.role:
+        return None
+    return user
+
+
+def _view_allowed(view, target_id, term):
+    """STUDENT/FACULTY refusals never reveal whether the target exists."""
+    if _view_actor() is None:
+        return False
+    if g.role in {"HOD", "ADMIN"}:
+        return True
+    if g.role == "STUDENT":
+        membership = db.session.get(StudentSection, g.user_id)
+        offering = db.session.get(TermOffering, target_id) if view == "class" else None
+        return (membership is not None and offering is not None and offering.term_id == term.id
+                and offering.section_id == membership.section_id)
+    if g.role == "FACULTY":
+        if view == "teacher":
+            return target_id == g.user_id
+        if view == "class":
+            return TimetableSlot.query.filter_by(offering_id=target_id, faculty_id=g.user_id).first() is not None
+    return False
+
+
+@api_v1.get("/timetable")
+@require_auth(roles=["ADMIN", "HOD", "FACULTY", "STUDENT"])
+def timetable_week_view():
+    try:
+        view = (request.args.get("view") or "").strip().lower()
+        if view not in _VIEWS:
+            raise pattern.PatternError("invalid_fields", "view must be class, teacher or room")
+        target_id = pattern.positive_id(request.args.get("id"), "id")
+        term = _view_term(request.args.get("term"))
+        if not _view_allowed(view, target_id, term):
+            return api_error("timetable", "out_of_scope", f"this role may not read the {view} view requested", 403)
+        in_term = TimetableSlot.query.join(TermOffering).filter(TermOffering.term_id == term.id)
+        if view == "class":
+            offering = db.session.get(TermOffering, target_id)
+            if offering is None or offering.term_id != term.id:
+                raise pattern.PatternError("offering_not_found", "offering does not exist in this term", 404)
+            section = offering.section.to_dict()
+            target = dict(offering.to_dict(), section=section, sectionLabel=section["label"])
+            slots = in_term.filter(TimetableSlot.offering_id == offering.id).all()
+        elif view == "teacher":
+            user = db.session.get(User, target_id)
+            if user is None or user.role != UserRole.FACULTY:
+                raise pattern.PatternError("faculty_not_found", "faculty user does not exist", 404)
+            target = {"id": user.id, "fullName": user.full_name, "department": user.department}
+            slots = in_term.filter(TimetableSlot.faculty_id == user.id).all()
+        else:
+            room = db.session.get(Room, target_id)
+            if room is None:
+                raise pattern.PatternError("room_not_found", "room does not exist", 404)
+            target = room.to_dict()
+            slots = in_term.filter(TimetableSlot.room_id == room.id).all()
+        visible_slot_ids = {slot.id for slot in slots} if g.role in {"STUDENT", "FACULTY"} else None
+        return jsonify(dict(pattern.week_view(view, slots), view=view, term=term.to_dict(), target=target,
+                            warnings=pattern.term_warnings(term.id, visible_slot_ids=visible_slot_ids)))
+    except (pattern.PatternError, SQLAlchemyError) as exc:
+        return _pattern_failure(exc)
+
+
+@api_v1.get("/timetable/offerings")
+@require_auth(roles=["ADMIN", "HOD", "FACULTY", "STUDENT"])
+def timetable_offering_picker():
+    """The by-class picker, limited to the offerings each role may view."""
+    try:
+        term = _view_term(request.args.get("term"))
+        query = TermOffering.query.join(Section).filter(TermOffering.term_id == term.id)
+        if _view_actor() is None:
+            query = query.filter(db.false())
+        elif g.role == "FACULTY":
+            query = query.filter(TermOffering.id.in_(
+                db.session.query(TimetableSlot.offering_id).filter(TimetableSlot.faculty_id == g.user_id)))
+        elif g.role == "STUDENT":
+            membership = db.session.get(StudentSection, g.user_id)
+            query = query.filter(TermOffering.section_id == membership.section_id) if membership else query.filter(db.false())
+        rows = query.order_by(Section.programme, Section.batch_year, Section.letter, TermOffering.id).all()
+        offerings = [dict(row.to_dict(), section=row.section.to_dict(), sectionLabel=row.section.to_dict()["label"])
+                     for row in rows]
+        return jsonify({"term": term.to_dict(), "offerings": offerings, "count": len(offerings)})
     except (pattern.PatternError, SQLAlchemyError) as exc:
         return _pattern_failure(exc)
