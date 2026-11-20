@@ -10,6 +10,7 @@
 - Phase 2.4: weekly CSV import, copy-from and grouped slot reads.
 - Phase 2.6: GET /timetable class/teacher/room week views and the
   GET /timetable/offerings picker.
+- Phase 2.8: GET /student/timetable resolves the permanent section's active-term week.
 """
 
 import csv
@@ -754,6 +755,38 @@ def timetable_week_view():
         visible_slot_ids = {slot.id for slot in slots} if g.role in {"STUDENT", "FACULTY"} else None
         return jsonify(dict(pattern.week_view(view, slots), view=view, term=term.to_dict(), target=target,
                             warnings=pattern.term_warnings(term.id, visible_slot_ids=visible_slot_ids)))
+    except (pattern.PatternError, SQLAlchemyError) as exc:
+        return _pattern_failure(exc)
+
+
+@api_v1.get("/student/timetable")
+@require_auth(roles=["STUDENT"])
+def student_timetable_week():
+    """Own active-term pattern only; missing assignment is a successful empty week."""
+    try:
+        if _view_actor() is None:
+            return api_error("timetable", "out_of_scope", "this account may not read a student timetable", 403)
+        membership = db.session.get(StudentSection, g.user_id)
+        term = Term.query.filter_by(is_active=True).first()
+        offering = TermOffering.query.filter_by(term_id=term.id, section_id=membership.section_id).first() if (
+            membership is not None and term is not None) else None
+        slots = TimetableSlot.query.filter_by(offering_id=offering.id).all() if offering else []
+        target, note = None, None
+        if offering is not None:
+            section = offering.section.to_dict()
+            target = dict(offering.to_dict(), section=section, sectionLabel=section["label"])
+        if membership is None:
+            note = {"check": "section", "error": "section_unassigned",
+                    "message": "No section is assigned. Contact your department."}
+        elif term is None:
+            note = {"check": "timetable", "error": "term_not_found",
+                    "message": "No current term is active. Contact your department."}
+        elif offering is None:
+            note = {"check": "timetable", "error": "offering_not_found",
+                    "message": "Your section has no offering in the current term. Contact your department."}
+        warnings = pattern.term_warnings(term.id, visible_slot_ids={slot.id for slot in slots}) if slots else []
+        return jsonify(dict(pattern.week_view("class", slots), view="class", term=term.to_dict() if term else None,
+                            target=target, warnings=warnings, note=note, timezone=str(timetable_timezone())))
     except (pattern.PatternError, SQLAlchemyError) as exc:
         return _pattern_failure(exc)
 

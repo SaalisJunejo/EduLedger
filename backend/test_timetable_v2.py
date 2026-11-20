@@ -77,6 +77,9 @@ Steps:
                             a seeded teacher clash in warnings, STUDENT/HOD
                             read scope and cross-department write refusal.
                             Local Flask requests on the occurrence term.
+   59-60. student week   - permanent section selects the current term's non-empty
+                            week; an unlinked student gets an empty week and
+                            section_unassigned note, both with HTTP 200.
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -1949,6 +1952,77 @@ def step_view_hod_foreign_reads():
 
 
 # --------------------------------------------------------------------------
+# Phase 2.8 - student shortcut, without changing the active term or membership
+# --------------------------------------------------------------------------
+def assert_student_week(status, payload, term_id):
+    assert status == 200, f"student timetable failed: {status}: {payload}"
+    assert payload["view"] == "class" and payload["term"]["id"] == term_id, payload
+    assert [day["dayOfWeek"] for day in payload["days"]] == list(range(5)), payload
+    assert all([cell["period"] for cell in day["cells"]] == list(range(1, 7))
+               for day in payload["days"]), payload
+    assert [period["ordinal"] for period in payload["periods"]] == list(range(1, 7)), payload
+    assert payload["timezone"] == APP.config["TIMETABLE_TIMEZONE"], payload
+
+
+def step_student_timetable_assigned():
+    student = STATE["directory_success"]
+    with APP.app_context():
+        term = Term.query.filter_by(is_active=True).one()
+        assert term.id == STATE["master_term_id"], "another process changed the active test term"
+        term_id = term.id
+        membership = db.session.get(StudentSection, student["user"]["id"])
+        assert membership is not None, "linked fixture lacks permanent membership"
+        section_id = membership.section_id
+        # Phase 2.6 created a blank offering in a DIFFERENT term. This route
+        # must ignore it and resolve the current term, without moving the student.
+        other = TermOffering.query.filter_by(term_id=STATE["occurrence_term_ids"][0], section_id=section_id).one()
+        offering = TermOffering.query.filter_by(term_id=term_id, section_id=section_id).first()
+        if offering is None:
+            offering = TermOffering(term_id=term_id, section_id=section_id)
+            db.session.add(offering)
+            db.session.flush()
+        assert TimetableSlot.query.filter_by(offering_id=offering.id).count() == 0, "student fixture is not blank"
+        group, slot_ids = uuid4().hex, []
+        for source_id in STATE["occurrence_slot_ids"][:2]:
+            source = db.session.get(TimetableSlot, source_id)
+            slot = TimetableSlot(offering_id=offering.id, day_of_week=source.day_of_week,
+                                 period_id=source.period_id, faculty_id=source.faculty_id,
+                                 room_id=source.room_id, course_id=source.course_id, session_group_id=group)
+            db.session.add(slot)
+            db.session.flush()
+            slot_ids.append(slot.id)
+        db.session.commit()
+        offering_id, other_id = offering.id, other.id
+    # Caller-supplied targets cannot choose a different offering or term.
+    status, payload = pattern_api("GET", f"/student/timetable?term={STATE['occurrence_term_ids'][0]}&id={other_id}",
+                                  token=student["token"])
+    assert_student_week(status, payload, term_id)
+    assert payload["note"] is None and payload["target"]["id"] == offering_id, payload
+    assert payload["target"]["section"]["id"] == section_id, payload
+    blocks = [cell for day in payload["days"] for cell in day["cells"] if cell["kind"] == "SLOT"]
+    assert len(blocks) == 1 and blocks[0]["span"] == 2 and blocks[0]["slotIds"] == slot_ids, payload
+    assert blocks[0]["courseCode"] == STATE["pattern_courses"][2] and blocks[0]["roomName"], blocks
+    assert all(w["slotIds"] and set(w["slotIds"]) <= set(slot_ids) for w in payload["warnings"]), payload
+    with APP.app_context():
+        assert db.session.get(StudentSection, student["user"]["id"]).section_id == section_id, "membership changed"
+        assert Term.query.filter_by(is_active=True).one().id == term_id, "read changed the active term"
+        assert TimetableSlot.query.filter_by(offering_id=other_id).count() == 0, "read changed the other term"
+
+
+def step_student_timetable_unassigned():
+    # The unique legacy student has profile fields, but no permanent section row.
+    with APP.app_context():
+        assert db.session.get(StudentSection, AUTH["student_id"]) is None, "unlinked fixture has a membership"
+        term_id = Term.query.filter_by(is_active=True).one().id
+    status, payload = pattern_api("GET", "/student/timetable", token=AUTH["student_token"])
+    assert_student_week(status, payload, term_id)
+    assert payload["note"]["check"] == "section" and payload["note"]["error"] == "section_unassigned", payload
+    assert payload["target"] is None and payload["warnings"] == [], payload
+    assert all(cell["kind"] == "EMPTY" for day in payload["days"] for cell in day["cells"]), payload
+    assert payload["legend"] == {"courses": [], "sections": [], "rooms": []}, payload
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 STEPS = [
@@ -2011,6 +2085,8 @@ STEPS = [
     ("STUDENT teacher/room/other-class view -> 403 out_of_scope", step_view_student_forbidden),
     ("STUDENT own class view -> 200", step_view_student_own_class),
     ("Foreign-department HOD: reads 200, writes 403", step_view_hod_foreign_reads),
+    ("Student shortcut: permanent section's current-term non-empty week", step_student_timetable_assigned),
+    ("Student shortcut: no section -> 200 empty week with section_unassigned note", step_student_timetable_unassigned),
 ]
 
 

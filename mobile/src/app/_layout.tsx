@@ -33,6 +33,7 @@ export default function RootLayout() {
           <Stack.Protected guard={isStudent}>
             <Stack.Screen name="index" />
             <Stack.Screen name="attendance" />
+            <Stack.Screen name="timetable" />
           </Stack.Protected>
           <Stack.Protected guard={!isStudent}>
             <Stack.Screen name="login" />

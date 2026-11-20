@@ -84,6 +84,7 @@ export default function Home() {
         </View>
       )}
 
+      <ActionButton title={messages.home.timetable} secondary onPress={() => router.push('/timetable')} />
       <ActionButton
         title={messages.home.markAttendance}
         disabled={!ready}
