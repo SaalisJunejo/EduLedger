@@ -1,15 +1,22 @@
 """End-to-end test of the Phase 1.3 monthly attendance export.
 
-Run it against a live stack (from backend/):
+Runs in-process (from backend/) with no Flask server and no chain node:
 
     .\\venv\\Scripts\\python.exe test_export.py
 
+This script builds its own app (SCHEDULER_ENABLED=false), patches
+app.services.profile_metadata.pin so no registration can reach IPFS, and uses
+Flask's test client instead of HTTP. The export reads only the
+database, so the fixture writes its own well-formed tx hashes instead of
+running real on-chain scans. chain_double.ChainDouble is installed for the
+whole run: every ledger entry point is intercepted in memory and both
+``_load_ledger`` helpers become tripwires, so no code path can append to the
+shared Hardhat node. That is not a contract test.
+
 Prerequisites:
-    - Flask backend running (backend/: python run.py), same backend/.env as
-      this script (expected local times use its TIMETABLE_TIMEZONE)
-    - No chain needed: the export reads only the attendance_check_ins mirror,
-      so this script writes its own mirror rows (fake but well-formed tx
-      hashes) instead of running real on-chain scans.
+    - PostgreSQL database configured (DB_URL), same backend/.env as this
+      script (expected local times use its TIMETABLE_TIMEZONE)
+    - Redis is untouched: these steps never request a registration code
 
 Steps:
      0. preflight          - GET /health
@@ -39,7 +46,9 @@ Steps:
     12. empty month        - 200, header rows only (xlsx both sheets, and csv)
     13. timetable list     - HOD GET /timetable/classes sees every class with
                              its professor's name, newest first
-    14. professor filter   - ?professor_id= returns only that professor's rows
+    14. professor filter   - ?professor_id= returns only that professor's rows,
+                             each with the full /timetable/classes row shape
+                             (base fields + professorName + derived state)
     15. list guards        - FACULTY and STUDENT -> 403, no token -> 401
     16. export scope       - HOD ?professor_id=A exports A's rows only,
                              ?professor_id=B only B's
@@ -57,10 +66,10 @@ import io
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-import requests
 from openpyxl import load_workbook
 
 os.environ["SCHEDULER_ENABLED"] = "false"
@@ -79,12 +88,12 @@ from app.models import (
     generate_nonce,
 )
 from app.util import utcnow
+from chain_double import ChainDouble  # noqa: E402
 
 # Windows consoles often default to cp1252, which cannot print the marks below.
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-BASE_URL = "http://127.0.0.1:5000/api/v1"
 RUN_ID = uuid4().hex[:10]
 PASSWORD = "ExportTestPass123!"
 FACULTY_A_EMAIL = f"faculty.export.a.{RUN_ID}@gcu.edu.pk"
@@ -111,6 +120,13 @@ TEST_MONTH = "2025-03"
 NEXT_MONTH = "2025-04"
 EMPTY_MONTH = "1999-01"
 
+# GET /timetable/classes row contract. An exact set on purpose: the base
+# fields are the ScheduledClass.to_dict() projection in app/api/timetable.py
+# (id, courseCode, room, professorId, dayOfWeek, startTime, endTime),
+# professorName is the joined professor for the HOD/Admin filter, and the last
+# eight are occurrences.derived_fields() (Phase 2.5 display state). A new key
+# has to be added here deliberately; it must never be absorbed by a subset
+# check.
 CLASS_FIELDS = {
     "id",
     "courseCode",
@@ -120,6 +136,14 @@ CLASS_FIELDS = {
     "dayOfWeek",
     "startTime",
     "endTime",
+    "state",
+    "late",
+    "lateMinutes",
+    "date",
+    "slotId",
+    "termId",
+    "sessionGroupId",
+    "holidayDeclaredAfterFact",
 }
 
 HEADERS = [
@@ -162,36 +186,33 @@ STATE = {
 # Helpers
 # --------------------------------------------------------------------------
 def api(method: str, path: str, token: str | None = None, **kwargs) -> tuple[int, dict]:
-    """Call the API; returns (status, decoded JSON body). Never raises on HTTP errors."""
+    """Call the API in-process; returns (status, decoded JSON body)."""
     headers = kwargs.pop("headers", {})
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    response = requests.request(method, f"{BASE_URL}{path}", headers=headers, timeout=15, **kwargs)
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"raw_body": response.text}
+    response = APP.test_client().open(f"/api/v1{path}", method=method, headers=headers, **kwargs)
+    payload = response.get_json(silent=True)
+    if payload is None:
+        payload = {"raw_body": response.get_data(as_text=True)[:200]}
     return response.status_code, payload
 
 
-def export(token: str, **params) -> requests.Response:
+def export(token: str, **params):
     """GET /attendance/export, returning the raw response (files are not JSON)."""
-    return requests.get(
-        f"{BASE_URL}/attendance/export",
+    return APP.test_client().get(
+        "/api/v1/attendance/export",
         headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=30,
+        query_string=params,
     )
 
 
-def error_of(response: requests.Response) -> dict:
-    try:
-        return response.json()
-    except ValueError:
-        return {"raw_body": response.text[:200]}
+def error_of(response) -> dict:
+    payload = response.get_json(silent=True)
+    return payload if payload is not None else {
+        "raw_body": response.get_data(as_text=True)[:200]}
 
 
-def assert_file(response: requests.Response, month: str, ext: str) -> None:
+def assert_file(response, month: str, ext: str) -> None:
     assert response.status_code == 200, (
         f"export returned {response.status_code}: {error_of(response)}"
     )
@@ -202,9 +223,9 @@ def assert_file(response: requests.Response, month: str, ext: str) -> None:
     )
 
 
-def xlsx_sheets(response: requests.Response) -> dict[str, list[list[str]]]:
+def xlsx_sheets(response) -> dict[str, list[list[str]]]:
     """Every sheet as a list of rows of strings (None -> '')."""
-    workbook = load_workbook(io.BytesIO(response.content), read_only=True)
+    workbook = load_workbook(io.BytesIO(response.get_data()), read_only=True)
     sheets = {}
     for sheet in workbook.worksheets:
         sheets[sheet.title] = [
@@ -215,8 +236,8 @@ def xlsx_sheets(response: requests.Response) -> dict[str, list[list[str]]]:
     return sheets
 
 
-def csv_rows(response: requests.Response) -> list[list[str]]:
-    return list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
+def csv_rows(response) -> list[list[str]]:
+    return list(csv.reader(io.StringIO(response.get_data().decode("utf-8-sig"))))
 
 
 def local_to_utc(text: str) -> datetime:
@@ -241,6 +262,9 @@ def register_and_login(kind: str, email: str, body: dict) -> dict:
 # Steps
 # --------------------------------------------------------------------------
 def step_preflight():
+    # In-process equivalent of the old live-server prerequisite; the route reads
+    # this config at request time. No assertion changed.
+    APP.config["GRANDFATHER_OPEN_REGISTRATION"] = True
     status, payload = api("GET", "/health")
     assert status == 200, f"/health returned {status}: {payload}"
     assert payload.get("status") == "ok", f"health status is not 'ok': {payload}"
@@ -505,7 +529,7 @@ def step_timetable_classes_filter():
     """?professor_id= limits the listing, and each row names its professor."""
     status, payload = api(
         "GET", "/timetable/classes", token=AUTH["hod"],
-        params={"professor_id": STATE["faculty_a_id"]},
+        query_string={"professor_id": STATE["faculty_a_id"]},
     )
     assert status == 200, f"filtered listing returned {status}: {payload}"
     by_id = {entry["id"]: entry for entry in payload["classes"]}
@@ -513,7 +537,19 @@ def step_timetable_classes_filter():
         f"faculty A's filtered classes are {sorted(by_id)}, expected {STATE['class_ids'][:2]}"
     )
     a1 = by_id[STATE["a1_id"]]
-    assert set(a1) == CLASS_FIELDS, f"unexpected fields: {sorted(a1)}"
+    assert set(a1) == CLASS_FIELDS, (
+        f"class field mismatch: unexpected {sorted(set(a1) - CLASS_FIELDS)}, "
+        f"missing {sorted(CLASS_FIELDS - set(a1))}"
+    )
+    # The derived block is computed from this row, not copied from a stub: the
+    # export fixture writes a legacy dated occurrence in the export month (no
+    # slot, term or lab group), so those references are null while the local
+    # date and the "no earlier outcome" holiday flag come from the row itself.
+    assert a1["date"] == f"{TEST_MONTH}-10", f"unexpected local date: {a1}"
+    assert a1["slotId"] is None and a1["termId"] is None and a1["sessionGroupId"] is None, (
+        f"legacy dated occurrence gained timetable references: {a1}"
+    )
+    assert a1["holidayDeclaredAfterFact"] is False, f"unexpected holiday flag: {a1}"
     assert a1["courseCode"] == COURSE_CODE, f"unexpected course code: {a1}"
     assert a1["room"] == "EXPORT-A1", f"unexpected room: {a1}"
     assert a1["professorId"] == STATE["faculty_a_id"], f"unexpected professor: {a1}"
@@ -521,7 +557,7 @@ def step_timetable_classes_filter():
 
     status, payload = api(
         "GET", "/timetable/classes", token=AUTH["hod"],
-        params={"professor_id": STATE["faculty_b_id"]},
+        query_string={"professor_id": STATE["faculty_b_id"]},
     )
     assert status == 200, f"filtered listing returned {status}: {payload}"
     entries = payload["classes"]
@@ -694,23 +730,21 @@ def main() -> int:
     print("=" * 60)
 
     failed = None
-    for index, (title, action) in enumerate(STEPS):
-        print(f"\n{index}. {title}")
-        try:
-            action()
-        except requests.RequestException as exc:
-            print(f"   \u274c FAIL: cannot reach the backend at {BASE_URL} ({exc})")
-            failed = (index, title)
-            break
-        except AssertionError as exc:
-            print(f"   \u274c FAIL: {exc}")
-            failed = (index, title)
-            break
-        except Exception as exc:
-            print(f"   \u274c FAIL: unexpected {type(exc).__name__}: {exc}")
-            failed = (index, title)
-            break
-        print("   \u2705 PASS")
+    # No registration may reach IPFS, and no ledger path may reach the node.
+    with ChainDouble(), patch("app.services.profile_metadata.pin", return_value=None):
+        for index, (title, action) in enumerate(STEPS):
+            print(f"\n{index}. {title}")
+            try:
+                action()
+            except AssertionError as exc:
+                print(f"   \u274c FAIL: {exc}")
+                failed = (index, title)
+                break
+            except Exception as exc:
+                print(f"   \u274c FAIL: unexpected {type(exc).__name__}: {exc}")
+                failed = (index, title)
+                break
+            print("   \u2705 PASS")
 
     print("\nCleanup")
     cleanup_ok = True

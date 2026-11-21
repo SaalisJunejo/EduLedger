@@ -12,6 +12,7 @@ from .auth import (
     UserRole,
 )
 from .grade import Grade
+from .legacy_mapping import LegacyOccurrenceMapping
 from .proposal import Proposal
 from .session import AttendanceCheckIn, AttendanceSession, generate_nonce
 from .student import Student
@@ -30,6 +31,7 @@ __all__ = [
     "FacultyProfile",
     "Grade",
     "InstitutionWhitelist",
+    "LegacyOccurrenceMapping",
     "OccurrenceAudit",
     "Period",
     "Proposal",

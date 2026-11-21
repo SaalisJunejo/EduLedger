@@ -184,6 +184,8 @@ def mark_closure(body, actor):
     future = max(first, today() + timedelta(days=1))
     removed = kept = kept_logged = 0
     removed_snapshots = []
+    # Imported here: legacy_mapping imports this module at load time.
+    from .legacy_mapping import release_for_deleted_occurrence
     if future <= last:
         start, end = utc_bounds(future, last)
         rows = ScheduledClass.query.filter(ScheduledClass.start_time >= start,
@@ -200,6 +202,8 @@ def mark_closure(body, actor):
                 continue
             removed_snapshots.append(dict(row.to_dict(), department=department_of(row)))
             SubstituteToken.query.filter_by(class_id=row.id).delete(synchronize_session=False)
+            # D15 still deletes the occurrence; the mapping becomes history.
+            release_for_deleted_occurrence(row.id)
             db.session.delete(row)
             removed += 1
     audit(actor.id, "CLOSURE_CREATE", first, last, reason, closure_id=closure.id,

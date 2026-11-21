@@ -109,8 +109,14 @@ class AttendanceCheckIn(db.Model):
     # Hash of the AttendanceLedger.lockAttendance() transaction that is the
     # real record; this row is only the fast local view of it.
     onchain_tx_hash = db.Column(db.String(66), nullable=True)
+    # Capture-time evidence; legacy rows are unknown, not inferred from a
+    # student's current device registration or the session namespace.
+    method = db.Column(db.String(16), nullable=True)
+    device_verified = db.Column(db.Boolean, nullable=True)
 
     __table_args__ = (
+        db.CheckConstraint("method IS NULL OR method IN ('qr', 'numeric_code')",
+                           name="ck_attendance_check_ins_method"),
         db.UniqueConstraint(
             "session_id", "student_id", name="uq_attendance_check_ins_session_student"
         ),

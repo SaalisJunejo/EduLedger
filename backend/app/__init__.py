@@ -21,8 +21,14 @@ from .extensions import db, socketio
 __version__ = "0.1.0"
 
 
-def create_app(config_name: str | None = None) -> Flask:
-    """Build a fully configured Flask application instance."""
+def create_app(config_name: str | None = None, *, initialise_database: bool = True) -> Flask:
+    """Build a fully configured Flask application instance.
+
+    ``initialise_database=False`` skips ``create_all`` and ``seed_periods`` so a
+    strictly read-only tool (the Phase 2.9 mapping inventory) cannot create
+    tables or insert rows. Such a caller must run against a database that
+    already has the schema and the Phase 2.9 migration.
+    """
     app = Flask(__name__)
 
     config_name = config_name or os.getenv("FLASK_CONFIG", "development")
@@ -47,11 +53,12 @@ def create_app(config_name: str | None = None) -> Flask:
     from . import models  # noqa: F401
 
     with app.app_context():
-        db.create_all()
-        # Phase 2.2 canonical grid: insert missing periods only (idempotent).
-        from .services.timetable import seed_periods
+        if initialise_database:
+            db.create_all()
+            # Phase 2.2 canonical grid: insert missing periods only (idempotent).
+            from .services.timetable import seed_periods
 
-        seed_periods()
+            seed_periods()
 
     # -- REST API -----------------------------------------------------------
     from .api import api_v1

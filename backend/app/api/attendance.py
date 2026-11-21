@@ -357,7 +357,8 @@ def scan():
     checked_in_at = None
     try:
         check_in = live_attendance.record_check_in(
-            session.id, student_id, result["transaction_hash"]
+            session.id, student_id, result["transaction_hash"],
+            method="numeric_code" if has_code else "qr", device_verified=True,
         )
         checked_in_at = iso_z(check_in.checked_in_at)
         emit_checked_in(

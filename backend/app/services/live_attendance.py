@@ -55,7 +55,8 @@ def conductor_id(session: AttendanceSession) -> int | None:
     return scheduled_class.professor_id if scheduled_class is not None else None
 
 
-def record_check_in(session_id: int, student_id: int, onchain_tx_hash: str | None = None):
+def record_check_in(session_id: int, student_id: int, onchain_tx_hash: str | None = None,
+                    *, method: str | None = None, device_verified: bool | None = None):
     """Mirror one on-chain lock locally; idempotent per (session, student)."""
     existing = AttendanceCheckIn.query.filter_by(
         session_id=session_id, student_id=student_id
@@ -67,6 +68,8 @@ def record_check_in(session_id: int, student_id: int, onchain_tx_hash: str | Non
         session_id=session_id,
         student_id=student_id,
         onchain_tx_hash=onchain_tx_hash,
+        method=method,
+        device_verified=device_verified,
     )
     db.session.add(check_in)
     try:

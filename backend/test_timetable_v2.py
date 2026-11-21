@@ -1,17 +1,36 @@
-"""Phase 2.1-2.6 workload, directory, pattern, occurrence and view tests.
+"""Phase 2.1-2.9 workload, directory, pattern, occurrence, view and attendance tests.
 
-Run it against a live stack (from backend/), after restarting Flask so it
-serves the Phase 2.4 code (apply all timetable migration SQL first):
+Runs in-process (from backend/) with no Flask server and no blockchain node:
 
     .\\venv\\Scripts\\python.exe test_timetable_v2.py
 
+This script builds its own app (SCHEDULER_ENABLED=false), patches
+app.services.profile_metadata.pin so no registration can reach IPFS, and
+installs chain_double.ChainDouble: every ledger write stays in memory for the
+run, and any ledger call that bypasses the double trips an assertion instead
+of touching the shared Hardhat node. HARDHAT_RPC_URL and contract addresses
+are therefore not required for this run.
+
 Prerequisites:
-    - Hardhat node running        (contracts/: npm run node)
-    - WorkloadLedger deployed     (contracts/: npm run deploy:workload)
-    - Flask backend running       (backend/: python run.py)
-    - Phase 2.3 SQL applied and Redis running
-    - Legacy steps 0-23 need GRANDFATHER_OPEN_REGISTRATION=true on the
-      live TEST server; this script does not turn on that flag.
+    - DB_URL exported explicitly and naming a FRESH, uniquely named PostgreSQL
+      database that matches ``eduledger_test_<unique suffix>`` (for example
+      ``eduledger_test_20261121_143005``). The runner refuses every other name
+      BEFORE it creates or touches anything, so a Flask default, the
+      development database or any non-test name can never be initialized by
+      mistake. Nothing here drops or force-drops a database; each run uses a
+      new name and the previous ones are left in place.
+    - That database must already carry the base schema and the Phase 2.9 SQL,
+      in this order (from backend/, scheduler explicitly off):
+        1. create the database (psql -d postgres -c "CREATE DATABASE ...")
+        2. $env:DB_URL / $env:SCHEDULER_ENABLED = "false"
+        3. .\\venv\\Scripts\\python.exe -c "from app import create_app; create_app()"
+        4. psql "<the same postgresql:// URL>" -v ON_ERROR_STOP=1 -f migrate_2_9.sql
+      Preflight then refuses any application data outside the canonical seven
+      periods and refuses a database whose mapping guard triggers are missing,
+      because cleanup never deletes audit rows and cannot undo a foreign row.
+    - Redis running (directory code delivery and attempt counting)
+    - GRANDFATHER_OPEN_REGISTRATION is enabled in-process below, so the
+      environment value does not matter.
 
 Steps:
     0. preflight          - register + log in unique professor, substitute,
@@ -80,42 +99,77 @@ Steps:
    59-60. student week   - permanent section selects the current term's non-empty
                             week; an unlinked student gets an empty week and
                             section_unassigned note, both with HTTP 200.
+   61-66. attendance     - conducted-only percentages, excluded dates, started
+                            zero-present denominator, null percentage, identical
+                            JSON/CSV/XLSX rows, paging, scope and read-only verify.
+                            Local future fixtures; Ledger reads use an immutable
+                            mock snapshot, never additional chain writes.
+   67. legacy mapping    - an explicit operator mapping joins a slotless
+                            occurrence to a TermOffering; history is append-only,
+                            supersede-only, and a D15 closure still deletes the
+                            occurrence while keeping the mapping as history.
+   68. mapping guard     - an ACTIVE mapping blocks deleting its offering at the
+                            database level; deleting the occurrence (D15)
+                            releases it and superseded history never blocks a
+                            delete.
+   69. mapping race      - two real connections: A inserts a mapping and holds
+                            the guard's FOR SHARE lock; B starts the offering
+                            DELETE (and, for a second offering, a section
+                            UPDATE) and truly blocks on that row lock, then
+                            resumes once A commits. B's pre-commit snapshot
+                            cannot see the new row, so the mutation is refused
+                            (by the guard or at COMMIT by the deferred check)
+                            and the rollback leaves the offering, its active
+                            mapping and its scope intact. Every wait is bounded.
+   70. attendance scope  - with the global backlog cleared APPEND-ONLY (every
+                            remaining slotless row is mapped to a dedicated
+                            empty section; no audit row is deleted), HOD
+                            receives its own department's rows, a foreign
+                            department HOD is refused, and FACULTY still sees
+                            only its own classes.
+   71. attendance verify - clean snapshot, missing mirror discrepancy, no writes.
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
-      never hosts a second scheduler. The auto-flag selection is checked
-      in-process via app.scheduler.overdue_classes(); step 7 anchors
-      nothing. Every step that depends on the sweep (8, 9, 10, 18) calls
-      flag_unconducted_classes() directly, which also flags or resolves any
-      other eligible row in the shared DB (as the live job would; in step 10
-      with the 1-minute threshold, like test_workload.py). If the live job
-      gets to one of those classes first, the outcome asserted is the same.
-      For a fully deterministic run, start the server with
-      SCHEDULER_ENABLED=false too.
+      never hosts a scheduler. The auto-flag selection is checked in-process via
+      app.scheduler.overdue_classes(); step 7 anchors nothing. Every step that
+      depends on the sweep (8, 9, 10, 18) calls `bounded_sweep()`, which runs the
+      real job with its two selection functions restricted to this run's class
+      ids: unrelated rows in the shared database are never flagged, resolved or
+      closed.
+    - chain_double replaces both ledger clients for the whole run, so the
+      assertions below verify the backend flow (chain-first ordering, one entry
+      per class, duplicate refusal), not the Solidity contracts. Real contract
+      integration is not retested here; use a disposable node for that.
     - The too_late class already ended and carries one ended attendance
-      session (zero check-ins), so D19 never flags it UNCONDUCTED - but the
-      live server's sweep resolves it CONDUCTED_ZERO_STUDENTS (Phase 2.1e)
-      once it ticks. Workload start and substitute redeem check the
-      SessionLog before the start gate, so steps 3-4 accept either too_late
-      or class_already_logged; both still mean a refused start.
+      session (zero check-ins), so D19 never flags it UNCONDUCTED; the step 8
+      sweep resolves it CONDUCTED_ZERO_STUDENTS (Phase 2.1e). Workload start and
+      substitute redeem check the SessionLog before the start gate, so steps 3-4
+      accept either too_late or class_already_logged; both still mean a refused
+      start.
     - The step 13 check-in is seeded directly (one AttendanceCheckIn row, as
       /attendance/scan would mirror it); the face/device scan path is not
-      exercised here. It is deleted in cleanup before its session. Steps
-      14, 17 and 18 seed their check-ins the same way; step 18 writes the
-      class, its ended session and the check-in in one commit, so the live
-      sweep can only ever resolve it as CONDUCTED.
+      exercised here. It is deleted in cleanup before its session. Steps 14, 17
+      and 18 seed their check-ins the same way; step 18 writes the class, its
+      ended session and the check-in in one commit, so the bounded sweep can only
+      ever resolve it as CONDUCTED.
     - Cleanup deletes only this run's rows (users by unique email, their
-      classes, sessions, tokens and logs). On-chain entries are append-only
-      and stay on the local Hardhat chain. Phase 2.2 cleanup also deletes this
-      run's offerings/master rows and restores the previously active term
-      without creating offerings in it. Periods are shared and left intact.
+      classes, sessions, tokens, logs, offerings and master rows). It never
+      deletes legacy_occurrence_mappings: that history is immutable, so the rows
+      stay behind, superseded by the D15 release trigger, and every run uses a
+      fresh, uniquely named database. Ledger entries live only in
+      ChainDouble and vanish with the process. Phase 2.2 cleanup also restores
+      the previously active term without creating offerings in it. Periods are
+      shared and left intact.
 """
 
 import csv
 import io
 import logging
 import os
+import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -124,22 +178,25 @@ from uuid import uuid4
 # Must be set before `app` is imported (the config reads it at import time).
 os.environ["SCHEDULER_ENABLED"] = "false"
 
-import requests  # noqa: E402
-
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
     AttendanceCheckIn, AttendanceSession, CalendarClosure, Course, DirectoryEntry, FacultyProfile,
-    InstitutionWhitelist, OccurrenceAudit, Period,
+    InstitutionWhitelist, LegacyOccurrenceMapping, OccurrenceAudit, Period,
     Room, ScheduledClass, Section, SessionLog, Student, StudentProfile, StudentSection, SubstituteToken, Term,
     TermOffering, TimetableSlot, User, UserRole, WorkloadSession,
 )
-from app.scheduler import flag_unconducted_classes, overdue_classes  # noqa: E402
-from app.services import occurrences, registration_code, workload  # noqa: E402
+from app.scheduler import (  # noqa: E402
+    flag_unconducted_classes, overdue_classes, unresolved_started_classes,
+)
+from app.services import legacy_mapping, occurrences, registration_code, workload  # noqa: E402
 from app.services.directory import COLUMNS as DIRECTORY_COLUMNS  # noqa: E402
 from app.services.auth import hash_password  # noqa: E402
 from app.services.timetable import seed_periods  # noqa: E402
+from sqlalchemy import func, inspect, select, text  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
 from sqlalchemy.exc import IntegrityError  # noqa: E402
+from chain_double import ChainDouble  # noqa: E402
 from app.util import utcnow  # noqa: E402
 
 # Windows consoles often default to a legacy code page (cp1252) that cannot
@@ -147,7 +204,6 @@ from app.util import utcnow  # noqa: E402
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-BASE_URL = "http://127.0.0.1:5000/api/v1"
 RUN_ID = uuid4().hex
 RUN_STARTED = utcnow()
 PASSWORD = "TimetableV2Password123!"
@@ -197,23 +253,59 @@ STATE = {
     "occurrence_kept_id": None,
     "occurrence_removed_id": None,
     "occurrence_sentinels": [],
+    "attendance_legacy_day": None,
+    "legacy_ids": [],
+    "legacy_session_ids": [],
+    "legacy_mapping_ids": [],
+    "legacy_future_id": None,
 }
+
+
+def _owned_session(session_id: int) -> bool:
+    """A ledger lock may only name a session of one of this run's classes."""
+    row = db.session.get(AttendanceSession, session_id)
+    if row is None:
+        return False
+    scheduled_class = workload.session_scheduled_class(row)
+    return scheduled_class is not None and scheduled_class.id in STATE["class_ids"]
+
+
+# Every ledger write in this run stays in memory; a bypass trips an assertion.
+CHAIN = ChainDouble(owns_class=lambda class_id: class_id in STATE["class_ids"],
+                    owns_session=_owned_session)
 
 
 # --------------------------------------------------------------------------
 # API helpers
 # --------------------------------------------------------------------------
 def api(method: str, path: str, token: str | None = None, **kwargs) -> tuple[int, dict]:
-    """Call the API; returns (status, decoded JSON body). Never raises on HTTP errors."""
+    """Call the API in-process; returns (status, decoded JSON body)."""
+    assert APP is not None, "preflight must create the app before any API call"
     headers = kwargs.pop("headers", {})
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    response = requests.request(method, f"{BASE_URL}{path}", headers=headers, timeout=15, **kwargs)
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"raw_body": response.text}
+    response = APP.test_client().open(f"/api/v1{path}", method=method, headers=headers, **kwargs)
+    payload = response.get_json(silent=True)
+    if payload is None:
+        payload = {"raw_body": response.get_data(as_text=True)}
     return response.status_code, payload
+
+
+def bounded_sweep() -> int:
+    """The real auto-flag job with both selections restricted to this run.
+
+    The job itself is unchanged; only its two read-only selection functions are
+    narrowed. Unrelated rows in the shared database are never flagged, resolved
+    or closed by this test process.
+    """
+    def owned(real, app, now):
+        return [row for row in real(app, now) if row.id in STATE["class_ids"]]
+
+    with patch("app.scheduler.overdue_classes",
+               side_effect=lambda app, now: owned(overdue_classes, app, now)), \
+            patch("app.scheduler.unresolved_started_classes",
+                  side_effect=lambda app, now: owned(unresolved_started_classes, app, now)):
+        return flag_unconducted_classes(APP)
 
 
 def assert_too_late(status: int, payload: dict, route: str) -> None:
@@ -400,12 +492,147 @@ def assert_resolved(class_id: int, status: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Disposable-database guard (runs before any database initialization)
+# --------------------------------------------------------------------------
+TEST_DB_PREFIX = "eduledger_test_"
+TEST_DB_NAME = re.compile(r"^eduledger_test_[a-z0-9][a-z0-9_]{7,}$")
+
+# The canonical Phase 2.2 grid: six teaching periods and the 11:10 break.
+CANONICAL_PERIODS = [
+    (1, "08:40", "09:30", False), (2, "09:30", "10:20", False),
+    (3, "10:20", "11:10", False), (None, "11:10", "11:30", True),
+    (4, "11:30", "12:20", False), (5, "12:20", "13:10", False),
+    (6, "13:10", "14:00", False),
+]
+
+# Every guard this suite relies on. A database initialized before the latest
+# Phase 2.9 migration is missing some of them and must be migrated, not tested.
+MAPPING_GUARDS = {
+    "legacy_occurrence_mappings": ("legacy_occurrence_mappings_guard",
+                                   "legacy_occurrence_mappings_delete_guard"),
+    "scheduled_classes": ("scheduled_classes_release_legacy_mapping",),
+    "term_offerings": ("term_offerings_active_mapping_guard", "term_offerings_scope_guard",
+                       "term_offerings_active_mapping_commit_check"),
+}
+
+
+def require_disposable_database() -> str:
+    """Refuse to run unless DB_URL explicitly names a disposable test database.
+
+    Called before ``create_app()``. It opens no connection and writes nothing,
+    so a misconfigured DB_URL is never initialized, seeded, emptied or
+    inspected: the development database cannot be reached by accident.
+    """
+    raw = os.environ.get("DB_URL", "").strip()
+    if not raw:
+        raise RuntimeError(
+            "DB_URL is not set. This suite initializes a database and maps its legacy "
+            "backlog; export DB_URL for a fresh, uniquely named PostgreSQL test database "
+            f"({TEST_DB_PREFIX}<8+ chars>, e.g. {TEST_DB_PREFIX}20261121_143005).")
+    profile = os.getenv("FLASK_CONFIG", "development")
+    if profile != "development":
+        raise RuntimeError(
+            f"FLASK_CONFIG is {profile!r}; this suite needs the development profile over a "
+            "real PostgreSQL database, because the testing profile replaces DB_URL.")
+    try:
+        url = make_url(raw)
+    except Exception as exc:  # noqa: BLE001 - any parse failure is a refusal
+        raise RuntimeError(f"DB_URL is not a usable SQLAlchemy URL: {exc}") from exc
+    backend = url.get_backend_name()
+    if backend != "postgresql":
+        raise RuntimeError(
+            f"DB_URL uses {backend!r}; the mapping guards are PostgreSQL triggers, so a "
+            "PostgreSQL URL is required.")
+    database = url.database or ""
+    if not TEST_DB_NAME.match(database):
+        raise RuntimeError(
+            f"Refusing database {database!r}: this suite initializes schema, seeds the "
+            "canonical periods and maps the legacy backlog, so DB_URL must name a freshly "
+            f"created, uniquely named disposable database matching {TEST_DB_PREFIX}<8+ "
+            f"chars> (e.g. {TEST_DB_PREFIX}20261121_143005). Nothing here drops or "
+            "force-drops a database.")
+    return database
+
+
+def application_rows() -> dict:
+    """Row counts for every table except the canonical period grid."""
+    counts = {}
+    for table in db.metadata.sorted_tables:
+        if table.name == "periods":
+            continue
+        count = db.session.execute(select(func.count()).select_from(table)).scalar_one()
+        if count:
+            counts[table.name] = count
+    return counts
+
+
+def canonical_period_grid() -> list:
+    """The period rows exactly as the app factory seeds them."""
+    return [(row.ordinal, row.start_time.strftime("%H:%M"), row.end_time.strftime("%H:%M"),
+             row.is_break) for row in Period.query.order_by(Period.start_time).all()]
+
+
+def unexpected_tables() -> list:
+    """Tables the app factory would not create (a foreign or stale schema)."""
+    return sorted(set(inspect(db.engine).get_table_names()) - set(db.metadata.tables))
+
+
+def missing_mapping_guards() -> list:
+    """Guard triggers that a fully migrated database must carry."""
+    present = {
+        (table, name) for table, name in db.session.execute(text(
+            "SELECT c.relname, t.tgname FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal")).all()
+    }
+    return sorted(f"{table}.{name}" for table, names in MAPPING_GUARDS.items()
+                  for name in names if (table, name) not in present)
+
+
+# --------------------------------------------------------------------------
 # Steps
 # --------------------------------------------------------------------------
 def step_preflight():
     """Register/login unique users, then check DB + RPC + workload ledger."""
     global APP
+    # Refuse a non-test DB_URL before create_app can run create_all/seed_periods.
+    database = require_disposable_database()
     APP = create_app()
+    # Mapping history is immutable and cleanup never deletes it, so the suite
+    # must start from a freshly created database. Anything left over means a
+    # reused (or shared) database: the append-only backlog clear in step 70
+    # would touch foreign rows and cleanup could not restore them.
+    with APP.app_context():
+        initialized = db.engine.url.database
+        if initialized != database:
+            raise RuntimeError(
+                f"create_app initialized {initialized!r} but DB_URL names {database!r}; "
+                "a config profile is overriding DB_URL.")
+        used = application_rows()
+        periods = canonical_period_grid()
+        missing = missing_mapping_guards()
+        extra = unexpected_tables()
+    if used:
+        detail = ", ".join(f"{table}={count}" for table, count in sorted(used.items()))
+        raise RuntimeError(
+            f"database {database!r} already holds application data ({detail}); this suite "
+            "needs a freshly created, uniquely named test database (it maps the remaining "
+            "legacy backlog and never deletes audit rows). Create a new database, apply the "
+            "base schema and backend/migrate_2_9.sql, then re-run.")
+    if periods != CANONICAL_PERIODS:
+        raise RuntimeError(
+            f"database {database!r} has a non-canonical period grid ({periods}); this suite "
+            "only runs against a database seeded by the app factory and never resets periods.")
+    if missing:
+        raise RuntimeError(
+            f"database {database!r} is missing Phase 2.9 guard(s): {', '.join(missing)}. "
+            "Apply backend/migrate_2_9.sql to it and re-run.")
+    if extra:
+        raise RuntimeError(
+            f"database {database!r} holds table(s) this application does not create: "
+            f"{', '.join(extra)}. Use a freshly created, uniquely named test database.")
+    # In-process equivalent of the old live-server prerequisite; the route reads
+    # this config at request time.
+    APP.config["GRANDFATHER_OPEN_REGISTRATION"] = True
     domain = APP.config.get("INSTITUTION_EMAIL_DOMAIN", "gcu.edu.pk").strip().lower()
     for persona in ("professor", "substitute", "student", "hod"):
         account = {
@@ -597,7 +824,7 @@ def step_not_auto_flagged():
 def step_ended_no_session_flagged():
     """end_time passed, no session -> UNCONDUCTED on-chain + local SessionLog."""
     class_id = seed_class(timedelta(minutes=-60), timedelta(seconds=-30), "TT2-ENDED-EMPTY")
-    flag_unconducted_classes(APP)
+    bounded_sweep()
     tx_hash = assert_flagged_unconducted(class_id)
     print(f"   class {class_id} (ended, no session) flagged UNCONDUCTED on-chain: tx={tx_hash}")
 
@@ -608,7 +835,7 @@ def step_ended_with_session_not_flagged():
     with APP.app_context():
         selected = {row.id for row in overdue_classes(APP, utcnow())}
     assert class_id not in selected, f"class {class_id} with a started session was selected"
-    flag_unconducted_classes(APP)
+    bounded_sweep()
     assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
     entry = assert_resolved(class_id, "CONDUCTED_ZERO_STUDENTS")
     print(
@@ -632,7 +859,7 @@ def step_legacy_null_end_time_flagged():
     original = APP.config["UNCONDUCTED_THRESHOLD_MINUTES"]
     APP.config["UNCONDUCTED_THRESHOLD_MINUTES"] = TEST_THRESHOLD_MINUTES
     try:
-        flag_unconducted_classes(APP)
+        bounded_sweep()
     finally:
         APP.config["UNCONDUCTED_THRESHOLD_MINUTES"] = original
     tx_hash = assert_flagged_unconducted(class_id)
@@ -792,7 +1019,7 @@ def step_sweep_resolves_attendance():
     with APP.app_context():
         selected = {row.id for row in overdue_classes(APP, utcnow())}
     assert class_id not in selected, f"class {class_id} with a started session was selected for UNCONDUCTED"
-    flag_unconducted_classes(APP)
+    bounded_sweep()
     assert log_count(class_id) == 1, f"class {class_id} has {log_count(class_id)} SessionLog rows, expected 1"
     entry = assert_resolved(class_id, "CONDUCTED")
     minutes = entry.get("lateMinutes")
@@ -937,13 +1164,7 @@ def step_period_seed_idempotent():
         assert seed_periods() == 0, "second repeated seed created periods"
         after = [row.to_dict() for row in Period.query.order_by(Period.start_time).all()]
     assert after == before, "period seeding changed existing rows"
-    expected = [
-        (1, "08:40", "09:30", False), (2, "09:30", "10:20", False),
-        (3, "10:20", "11:10", False), (None, "11:10", "11:30", True),
-        (4, "11:30", "12:20", False), (5, "12:20", "13:10", False),
-        (6, "13:10", "14:00", False),
-    ]
-    assert [(row["ordinal"], row["startTime"], row["endTime"], row["isBreak"]) for row in after] == expected, (
+    assert [(row["ordinal"], row["startTime"], row["endTime"], row["isBreak"]) for row in after] == CANONICAL_PERIODS, (
         f"canonical period grid differs: {after}"
     )
     print("   two repeated seeds created zero rows; seven canonical rows retained")
@@ -1221,7 +1442,7 @@ def step_directory_dev_guard():
 # Cleanup - only this run's rows
 # --------------------------------------------------------------------------
 def cleanup() -> str | None:
-    """Delete this run's rows, children first; returns an error string or None."""
+    """Delete this run's rows, children first; mapping history is never touched."""
     if APP is None or not ACCOUNTS:
         return None
     try:
@@ -1266,6 +1487,12 @@ def cleanup() -> str | None:
                     AttendanceSession.id.in_(STATE["seeded_session_ids"]),
                 ).delete(synchronize_session=False)
             ScheduledClass.query.filter(ScheduledClass.id.in_(class_ids)).delete(synchronize_session=False)
+            if STATE["legacy_future_id"] is not None:
+                # A failed D15 step may leave the mapped occurrence alive; the
+                # release trigger supersedes its mapping in this delete.
+                ScheduledClass.query.filter_by(id=STATE["legacy_future_id"]).delete(synchronize_session=False)
+            # Mapping history is immutable and is NEVER deleted here. The rows
+            # stay as superseded provenance in the disposable test database.
             TimetableSlot.query.filter(TimetableSlot.offering_id.in_(owned_offerings)).delete(synchronize_session=False)
             if STATE["student_row_owned"]:
                 Student.query.filter_by(id=AUTH["student_id"]).delete(synchronize_session=False)
@@ -1308,6 +1535,14 @@ def cleanup() -> str | None:
             Term.query.filter(Term.id.in_([*STATE["pattern_copy_term_ids"], *STATE["occurrence_term_ids"]])).delete(synchronize_session=False)
             Term.query.filter_by(id=term_id).delete(synchronize_session=False)
             db.session.commit()
+            # Immutable audit rows must survive cleanup; only the disposable
+            # database itself is replaced between runs.
+            if STATE["legacy_mapping_ids"]:
+                kept = LegacyOccurrenceMapping.query.filter(
+                    LegacyOccurrenceMapping.id.in_(STATE["legacy_mapping_ids"]),
+                ).count()
+                if kept != len(STATE["legacy_mapping_ids"]):
+                    raise RuntimeError("cleanup removed immutable mapping history")
             if STATE["directory_rows"]:
                 client = registration_code.redis_client()
                 keys = [key for row in STATE["directory_rows"] for key in (
@@ -2023,6 +2258,901 @@ def step_student_timetable_unassigned():
 
 
 # --------------------------------------------------------------------------
+# Phase 2.9 - isolated attendance fixtures; no extra irreversible chain writes
+# --------------------------------------------------------------------------
+def attendance_api(path="/faculty/attendance", token=None, **filters):
+    params = dict(STATE["attendance_filters"], **filters)
+    with patch("app.services.attendance_portal.utcnow", return_value=STATE["attendance_now"]):
+        return pattern_api("GET", path, token=token or AUTH["professor_token"], query_string=params)
+
+
+def step_attendance_percentage():
+    with APP.app_context():
+        anchor = occurrences.local_date(STATE["occurrence_anchor"])
+        term = Term(name=f"Attendance {RUN_ID}", start_date=anchor, end_date=anchor + timedelta(days=28))
+        db.session.add(term)
+        db.session.flush()
+        STATE["pattern_copy_term_ids"].append(term.id)
+        sections, offerings = [], []
+        for letter in ("A", "B"):
+            section = Section(programme=f"TT2A-{RUN_ID}", batch_year=2023, letter=letter,
+                              department="Computer Science")
+            db.session.add(section)
+            db.session.flush()
+            STATE["master_section_ids"].append(section.id)
+            sections.append(section)
+            offering = TermOffering(term_id=term.id, section_id=section.id)
+            db.session.add(offering)
+            db.session.flush()
+            offerings.append(offering)
+        student_ids = []
+        for index in range(2):
+            email = f"tt2-attendance-{index}-{RUN_ID}@example.edu"
+            ACCOUNTS[f"attendance_student_{index}"] = {"email": email}
+            user = User(role=UserRole.STUDENT, email=email, password_hash=hash_password(PASSWORD),
+                        full_name=f"Attendance Student {index}", department="Computer Science")
+            db.session.add(user)
+            db.session.flush()
+            student_ids.append(user.id)
+            db.session.add(StudentProfile(user_id=user.id, roll_number=f"TT2A-{RUN_ID}-{index}",
+                                          batch="2023", programme=sections[0].programme))
+            db.session.add(StudentSection(user_id=user.id, section_id=sections[0].id))
+        course = Course.query.filter_by(code=STATE["pattern_courses"][0]).one()
+        room = db.session.get(Room, STATE["occurrence_room_ids"][1])
+        period = Period.query.filter_by(ordinal=1).one()
+        slots = {}
+        for day in range(5):
+            slot = TimetableSlot(offering_id=offerings[0].id, course_id=course.id,
+                                 faculty_id=AUTH["professor_id"], room_id=room.id,
+                                 period_id=period.id, day_of_week=day)
+            db.session.add(slot)
+            db.session.flush()
+            slots[day] = slot
+        foreign_slot = TimetableSlot(offering_id=offerings[1].id, course_id=course.id,
+                                    faculty_id=AUTH["substitute_id"], room_id=room.id,
+                                    period_id=period.id, day_of_week=0)
+        db.session.add(foreign_slot)
+        db.session.flush()
+        ids, session_ids, capture_ids, ledger = [], [], [], set()
+        # Two conducted (second late), one started/ended zero with no log,
+        # unconducted, holiday, cancelled and a future CONDUCTED mirror.
+        for index, offset in enumerate((0, 1, 2, 3, 4, 7, 21)):
+            day = anchor + timedelta(days=offset)
+            start, end = occurrences.period_times(day, period)
+            slot = slots[day.weekday()]
+            row = ScheduledClass(slot_id=slot.id, term_id=term.id, professor_id=AUTH["professor_id"],
+                                 room=room.name, course_code=course.code, day_of_week=day.weekday(),
+                                 start_time=start, end_time=end)
+            db.session.add(row)
+            db.session.flush()
+            STATE["class_ids"].append(row.id)
+            ids.append(row.id)
+            actual = start + timedelta(minutes=15 if index == 1 else 0)
+            if index != 4:  # A true holiday has no started/logged class to retain.
+                session = AttendanceSession(class_id=f"workload-{row.id}" if index == 1 else str(row.id),
+                    start_time=actual, current_nonce=f"tt2-attendance-{RUN_ID}-{index}",
+                    nonce_expires_at=end, is_active=False, ended_at=end)
+                db.session.add(session)
+                db.session.flush()
+                session_ids.append(session.id)
+                STATE["seeded_session_ids"].append(session.id)
+            if index not in (2, 4):
+                outcome = "UNCONDUCTED" if index == 3 else "CONDUCTED"
+                db.session.add(SessionLog(class_id=row.id, status=outcome, professor_id=row.professor_id,
+                    conducted_by=row.professor_id, timestamp=end, onchain_tx_hash="0x" + "ab" * 32))
+                captured = student_ids[:1] if index == 1 else student_ids
+                for sid in captured:
+                    capture = AttendanceCheckIn(session_id=session.id, student_id=sid, checked_in_at=actual,
+                        onchain_tx_hash="0x" + "cd" * 32, method="numeric_code" if index == 1 else "qr",
+                        device_verified=True)
+                    db.session.add(capture)
+                    db.session.flush()
+                    capture_ids.append(capture.id)
+                    ledger.add((sid, session.id))
+            if index == 4:
+                db.session.add(CalendarClosure(date_from=day, date_to=day, scope="DEPARTMENT",
+                    department="Computer Science", reason=f"Attendance fixture {RUN_ID}", created_by=AUTH["admin_id"]))
+            if index == 5:
+                db.session.add(OccurrenceAudit(action="CANCEL", actor_id=AUTH["admin_id"], occurrence_id=row.id,
+                    slot_id=slot.id, date_from=day, date_to=day, reason=f"Attendance fixture {RUN_ID}",
+                    details={"occurrence": row.to_dict()}))
+        start, end = occurrences.period_times(anchor, period)
+        foreign = ScheduledClass(slot_id=foreign_slot.id, term_id=term.id, professor_id=AUTH["substitute_id"],
+            room=room.name, course_code=course.code, day_of_week=0, start_time=start, end_time=end)
+        db.session.add(foreign)
+        db.session.flush()
+        STATE["class_ids"].append(foreign.id)
+        STATE["attendance_foreign_id"] = foreign.id
+        STATE["attendance_foreign_section"] = sections[1].id
+        STATE["attendance_filters"] = {"term": term.id, "section": sections[0].id,
+            "course": course.id, "date_from": anchor.isoformat(), "date_to": term.end_date.isoformat()}
+        STATE["attendance_now"] = occurrences.period_times(anchor + timedelta(days=10), period)[1]
+        STATE["attendance_student_ids"] = student_ids
+        STATE["attendance_occurrence_ids"] = ids
+        STATE["attendance_session_ids"] = session_ids
+        STATE["attendance_capture_id"] = capture_ids[0]
+        STATE["attendance_alter_capture_id"] = capture_ids[2]
+        STATE["attendance_ledger"] = frozenset(ledger)
+        db.session.commit()
+    status, payload = attendance_api()
+    assert status == 200 and payload["total"] == 2, payload
+    rows = payload["rows"]
+    assert [r["studentId"] for r in rows] == student_ids, rows
+    assert [(r["present"], r["conducted"], r["percentage"]) for r in rows] == [(2, 3, 66.7), (1, 3, 33.3)], rows
+    assert all(r["percentage"] == round(r["present"] / r["conducted"] * 100, 1) for r in rows), rows
+    assert all(r["scheduled"] == 5 for r in rows), rows
+
+
+def step_attendance_excluded():
+    first = STATE["attendance_filters"]["date_from"]
+    narrow_end = datetime.fromisoformat(first).date() + timedelta(days=2)
+    status, narrow = attendance_api(date_to=narrow_end.isoformat())
+    status_all, broad = attendance_api()
+    assert status == status_all == 200, (narrow, broad)
+    keys = ("present", "conducted", "percentage")
+    assert [tuple(r[k] for k in keys) for r in narrow["rows"]] == [tuple(r[k] for k in keys) for r in broad["rows"]], broad
+    assert all(r["scheduled"] == 3 for r in narrow["rows"]), narrow
+    status, matrix = attendance_api("/faculty/attendance/matrix", offset=1, limit=1)
+    assert status == 200 and matrix["total"] == 2 and len(matrix["rows"]) == 1, matrix
+    states = {s["occurrenceId"]: s["status"] for s in matrix["sessions"]}
+    ids = STATE["attendance_occurrence_ids"]
+    assert [states[oid] for oid in ids] == ["CONDUCTED", "CONDUCTED_LATE", "CONDUCTED_ZERO",
+                                          "UNCONDUCTED", "HOLIDAY", "CANCELLED", "SCHEDULED"], states
+    cells = {c["occurrenceId"]: c["attendance"] for c in matrix["rows"][0]["cells"]}
+    assert [cells[oid] for oid in ids] == ["PRESENT", "ABSENT", "ABSENT", None, None, None, None], cells
+    status, matched = attendance_api(q=f"TT2A-{RUN_ID}-1")
+    assert status == 200 and matched["total"] == 1 and matched["rows"][0] == broad["rows"][1], matched
+
+
+def step_attendance_zero_denominator():
+    first = datetime.fromisoformat(STATE["attendance_filters"]["date_from"]).date()
+    status, payload = attendance_api(date_from=(first + timedelta(days=2)).isoformat(),
+                                     date_to=(first + timedelta(days=2)).isoformat())
+    assert status == 200 and all((r["conducted"], r["present"], r["percentage"]) == (1, 0, 0.0)
+                                for r in payload["rows"]), payload
+    with APP.app_context():
+        assert SessionLog.query.filter_by(class_id=STATE["attendance_occurrence_ids"][2]).count() == 0
+    status, sessions = attendance_api("/faculty/sessions", status="CONDUCTED")
+    assert status == 200 and len(sessions["rows"]) == 3, sessions
+    assert [r["present"] for r in sessions["rows"]] == [2, 1, 0], sessions
+    assert all(r["total"] == 2 and r["period"] == "P1" for r in sessions["rows"]), sessions
+    assert sessions["rows"][1]["lateMinutes"] == 15, sessions
+    status, roster = attendance_api(f"/faculty/sessions/{STATE['attendance_occurrence_ids'][1]}/roster")
+    assert status == 200 and len(roster["rows"]) == 1, roster
+    row = roster["rows"][0]
+    assert row["method"] == "numeric_code" and row["deviceVerified"] is True and row["timestamp"], roster
+    assert row["name"] == "Attendance Student 0" and row["rollNumber"] == f"TT2A-{RUN_ID}-0", roster
+
+
+def step_attendance_null():
+    for state in ("UNCONDUCTED", "HOLIDAY", "CANCELLED", "SCHEDULED"):
+        status, payload = attendance_api(status=state)
+        assert status == 200 and len(payload["rows"]) == 2, payload
+        assert all(r["present"] == r["conducted"] == 0 and r["percentage"] is None for r in payload["rows"]), payload
+
+
+def step_attendance_downloads():
+    from openpyxl import load_workbook
+    status, payload = attendance_api()
+    assert status == 200, payload
+    expected = payload["rows"]
+    for fmt in ("csv", "xlsx"):
+        headers = {"Authorization": f"Bearer {AUTH['professor_token']}"}
+        with patch("app.services.attendance_portal.utcnow", return_value=STATE["attendance_now"]):
+            response = APP.test_client().get("/api/v1/faculty/attendance", headers=headers,
+                query_string=dict(STATE["attendance_filters"], format=fmt, offset=999, limit=1))
+        assert response.status_code == 200, response.get_data(as_text=True) if fmt == "csv" else response.status_code
+        raw = list(csv.reader(io.StringIO(response.data.decode("utf-8-sig")))) if fmt == "csv" else list(
+            load_workbook(io.BytesIO(response.data), data_only=True).active.values)
+        index = next(i for i, row in enumerate(raw) if row and row[0] == "studentId")
+        columns, rows = raw[index], raw[index + 1:]
+        assert len(rows) == len(expected), (fmt, rows, expected)
+        for downloaded, json_row in zip(rows, expected):
+            assert {key: str(value) for key, value in zip(columns, downloaded)} == {
+                key: str(json_row[key]) for key in columns}, (fmt, downloaded, json_row)
+        assert raw[0][1] == payload["term"]["name"] and raw[3][1] == payload["requestedBy"]["name"], raw[:4]
+    status, page = attendance_api(offset=1, limit=1)
+    assert status == 200 and page["rows"] == expected[1:] and page["total"] == 2, page
+
+
+def step_attendance_scope():
+    for path in ("/faculty/attendance", "/faculty/attendance/matrix", "/faculty/sessions", "/timetable/verify"):
+        status, payload = attendance_api(path, section=STATE["attendance_foreign_section"])
+        assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+        for token in (AUTH["student_token"], AUTH["admin_token"], AUTH["substitute_token"]):
+            status, payload = attendance_api(path, token=token)
+            assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+    status, payload = attendance_api(f"/faculty/sessions/{STATE['attendance_foreign_id']}/roster")
+    assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+    status, payload = attendance_api(token=AUTH["hod_token"])
+    assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    assert not any(character.isdigit() for character in payload["message"]), payload
+    foreign_section = next(resource_id for kind, resource_id, _ in STATE["foreign_resources"] if kind == "sections")
+    # HOD reports are disabled while the institution holds ANY unmapped slotless
+    # row, and the refusal is taken before filters: a foreign section must get
+    # the identical body, so neither the range nor the section can be probed.
+    status, foreign_payload = attendance_api(token=AUTH["hod_token"], section=foreign_section)
+    assert (status, foreign_payload) == (409, payload), (status, foreign_payload, payload)
+    # Legacy ownership is explicit; its term/section must never be inferred.
+    with APP.app_context():
+        day = datetime.fromisoformat(STATE["attendance_filters"]["date_from"]).date() - timedelta(days=7)
+        start, end = occurrences.period_times(day, Period.query.filter_by(ordinal=1).one())
+        course = db.session.get(Course, STATE["attendance_filters"]["course"])
+        course_code = course.code
+        legacy_ids = []
+        for professor_id, term_id in ((AUTH["professor_id"], None),
+                                      (AUTH["professor_id"], STATE["attendance_filters"]["term"]),
+                                      (AUTH["substitute_id"], None)):
+            legacy = ScheduledClass(professor_id=professor_id, term_id=term_id, slot_id=None,
+                                    room="Legacy Room", course_code=course_code, start_time=start, end_time=end)
+            db.session.add(legacy)
+            db.session.flush()
+            legacy_ids.append(legacy.id)
+            STATE["class_ids"].append(legacy.id)
+        for prefix, delta, student_id in (("", timedelta(0), STATE["attendance_student_ids"][0]),
+                                         ("workload-", timedelta(0), STATE["attendance_student_ids"][1]),
+                                         ("", timedelta(days=-1), STATE["attendance_student_ids"][0])):
+            session = AttendanceSession(class_id=f"{prefix}{legacy_ids[0]}", start_time=start + delta,
+                current_nonce=f"tt2-legacy-{RUN_ID}-{prefix}-{delta.days}", nonce_expires_at=end,
+                is_active=False, ended_at=end)
+            db.session.add(session)
+            db.session.flush()
+            STATE["seeded_session_ids"].append(session.id)
+            STATE["legacy_session_ids"].append(session.id)
+            db.session.add(AttendanceCheckIn(session_id=session.id, student_id=student_id,
+                checked_in_at=start + delta, method="numeric_code" if prefix else "qr", device_verified=False))
+        db.session.commit()
+    STATE["legacy_ids"] = legacy_ids
+    STATE["attendance_legacy_day"] = day.isoformat()
+    path = f"/faculty/sessions/{legacy_ids[0]}/roster"
+    status, payload = pattern_api("GET", path, token=AUTH["professor_token"])
+    assert status == 200 and len(payload["rows"]) == 2, payload
+    assert payload["session"]["legacy"] is True and payload["session"]["termId"] is None, payload
+    assert payload["session"]["sectionId"] is None and payload["session"]["total"] is None, payload
+    assert {r["method"] for r in payload["rows"]} == {"qr", "numeric_code"}, payload
+    assert all(r["name"] and r["rollNumber"] and r["timestamp"] and r["deviceVerified"] is False
+               for r in payload["rows"]), payload
+    for token in (AUTH["substitute_token"], AUTH["student_token"], AUTH["admin_token"]):
+        status, payload = pattern_api("GET", path, token=token)
+        assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+    # HOD is refused before the occurrence row is read, so an unmapped id, a
+    # missing id and (below) a mapped id get byte-identical bodies: mapping
+    # state cannot be probed one occurrence at a time either.
+    status, payload = pattern_api("GET", path, token=AUTH["hod_token"])
+    assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    assert not any(character.isdigit() for character in payload["message"]), payload
+    missing = pattern_api("GET", "/faculty/sessions/0/roster", token=AUTH["hod_token"])
+    assert missing == (status, payload), missing
+    status, payload = pattern_api("GET", f"/faculty/sessions/{legacy_ids[2]}/roster", token=AUTH["professor_token"])
+    assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+    for filters in ({"term": STATE["attendance_filters"]["term"]},
+                    {"section": STATE["attendance_filters"]["section"]}, {"status": "CONDUCTED"}):
+        status, payload = pattern_api("GET", path, token=AUTH["professor_token"], query_string=filters)
+        assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    status, payload = pattern_api("GET", f"/faculty/sessions/{legacy_ids[1]}/roster", token=AUTH["professor_token"],
+                                 query_string={"term": STATE["attendance_filters"]["term"]})
+    assert status == 200 and payload["rows"] == [], payload
+    status, payload = attendance_api(f"/faculty/sessions/{STATE['attendance_occurrence_ids'][0]}/roster",
+                                     date_from=day.isoformat())
+    assert status == 200 and len(payload["rows"]) == 2, payload
+    for path in ("/faculty/attendance", "/faculty/attendance/matrix", "/faculty/sessions", "/timetable/verify"):
+        status, payload = attendance_api(path, date_from=day.isoformat(), date_to=day.isoformat())
+        assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    for fmt in ("csv", "xlsx"):
+        status, payload = attendance_api(format=fmt, date_from=day.isoformat(), date_to=day.isoformat())
+        assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    with APP.app_context():
+        assert db.session.get(ScheduledClass, legacy_ids[0]).term_id is None
+        assert all(db.session.get(ScheduledClass, value).slot_id is None for value in legacy_ids)
+
+
+def legacy_day_api(path="/faculty/attendance", token=None, **extra):
+    """A report call for the legacy fixture day only (no attendance section)."""
+    params = {"term": STATE["attendance_filters"]["term"],
+              "date_from": STATE["attendance_legacy_day"],
+              "date_to": STATE["attendance_legacy_day"]}
+    params.update(extra)
+    with patch("app.services.attendance_portal.utcnow", return_value=STATE["attendance_now"]):
+        # pattern_api defaults to the HOD; these calls default to the professor.
+        return pattern_api("GET", path, token=token or AUTH["professor_token"],
+                           query_string=params)
+
+
+def legacy_section_fixture(programme, roll, email):
+    """One owned section + blank offering + student on the attendance term."""
+    section = Section(programme=programme, batch_year=2023, letter="A", department="Computer Science")
+    db.session.add(section)
+    db.session.flush()
+    STATE["master_section_ids"].append(section.id)
+    offering = TermOffering(term_id=STATE["attendance_filters"]["term"], section_id=section.id)
+    db.session.add(offering)
+    db.session.flush()
+    ACCOUNTS[f"legacy_{roll}"] = {"email": email}
+    user = User(role=UserRole.STUDENT, email=email, password_hash=hash_password(PASSWORD),
+                full_name=f"Legacy {roll}", department="Computer Science")
+    db.session.add(user)
+    db.session.flush()
+    db.session.add(StudentProfile(user_id=user.id, roll_number=roll, batch="2023", programme=programme))
+    db.session.add(StudentSection(user_id=user.id, section_id=section.id))
+    return section, offering, user
+
+
+def step_legacy_mapping():
+    """Explicit mapping: reportable, append-only, supersede-only and D15-safe."""
+    legacy_id = STATE["legacy_ids"][0]
+    with APP.app_context():
+        section_a, offering_a, student_a = legacy_section_fixture(
+            f"TT2LM-A-{RUN_ID}", f"TT2LM-A-{RUN_ID}", f"tt2.lm.a.{RUN_ID}@example.edu")
+        section_b, offering_b, student_b = legacy_section_fixture(
+            f"TT2LM-B-{RUN_ID}", f"TT2LM-B-{RUN_ID}", f"tt2.lm.b.{RUN_ID}@example.edu")
+        start = db.session.get(ScheduledClass, legacy_id).start_time
+        for user, method in ((student_a, "qr"), (student_b, "numeric_code")):
+            db.session.add(AttendanceCheckIn(session_id=STATE["legacy_session_ids"][0],
+                student_id=user.id, checked_in_at=start + timedelta(minutes=2),
+                method=method, device_verified=True))
+        first = legacy_mapping.map_occurrence(
+            legacy_id, offering_a.id, "operator:test-run", "section per signed attendance register")
+        second = legacy_mapping.map_occurrence(
+            STATE["legacy_ids"][1], offering_a.id, "operator:test-run", "same signed register")
+        db.session.commit()
+        STATE["legacy_mapping_ids"] += [first.id, second.id]
+        offering_b_id, section_a_id, section_b_id = offering_b.id, section_a.id, section_b.id
+        roll_a, roll_b = f"TT2LM-A-{RUN_ID}", f"TT2LM-B-{RUN_ID}"
+
+    # HOD reports are disabled while ANY unmapped slotless row exists, and the
+    # refusal is taken before filters: no ids, no counts, no range signal.
+    status, payload = legacy_day_api(token=AUTH["hod_token"])
+    assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    assert not any(character.isdigit() for character in payload["message"]), payload
+
+    status, payload = legacy_day_api()
+    assert status == 200, payload
+    by_roll = {row["rollNumber"]: row for row in payload["rows"]}
+    row = by_roll[roll_a]
+    assert row["sectionId"] == section_a_id, row
+    assert (row["present"], row["conducted"], row["scheduled"], row["percentage"]) == (1, 1, 2, 100.0), row
+    status, matrix = legacy_day_api("/faculty/attendance/matrix")
+    assert status == 200 and len(matrix["sessions"]) == 2, matrix
+    states = {session["occurrenceId"]: session["status"] for session in matrix["sessions"]}
+    assert states == {legacy_id: "CONDUCTED", STATE["legacy_ids"][1]: "UNCONDUCTED"}, states
+    assert all(session["slotId"] is None and session["sectionId"] == section_a_id
+               for session in matrix["sessions"]), matrix["sessions"]
+
+    status, payload = legacy_day_api(f"/faculty/sessions/{legacy_id}/roster")
+    assert status == 200 and [row["rollNumber"] for row in payload["rows"]] == [roll_a], payload
+    # Mapped now, so the roster comes from the scoped report path: the payload
+    # carries no unmapped marker and its section comes from the operator's
+    # mapping (the unmapped branch always reports a null section).
+    assert payload["session"].get("legacy") is not True, payload["session"]
+    assert payload["session"]["sectionId"] == section_a_id, payload["session"]
+    # The gate is global: an HOD roster read of a MAPPED occurrence is refused
+    # with the same generic body. Only the owning professor keeps read access.
+    status, payload = legacy_day_api(f"/faculty/sessions/{legacy_id}/roster", token=AUTH["hod_token"])
+    assert_directory_error(status, payload, 409, "attendance", "legacy_scope_unavailable")
+    assert not any(character.isdigit() for character in payload["message"]), payload
+    status, payload = legacy_day_api(f"/faculty/sessions/{legacy_id}/roster", token=AUTH["substitute_token"])
+    assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+
+    # Supersede is the only way to change an authoritative decision.
+    with APP.app_context():
+        replacement = legacy_mapping.supersede(
+            legacy_id, offering_b_id, "operator:test-run", "register corrected to section B")
+        db.session.commit()
+        STATE["legacy_mapping_ids"].append(replacement.id)
+        history = legacy_mapping.history(legacy_id)
+        assert len(history) == 2, [entry.to_dict() for entry in history]
+        assert history[0].superseded_at is not None and history[1].superseded_at is None
+        assert history[1].offering_id == offering_b_id
+    status, payload = legacy_day_api()
+    assert status == 200, payload
+    by_roll = {row["rollNumber"]: row for row in payload["rows"]}
+    # Section A still owns the other mapped occurrence, but no longer this one.
+    assert by_roll[roll_a]["conducted"] == 0 and by_roll[roll_a]["percentage"] is None, by_roll[roll_a]
+    row = by_roll[roll_b]
+    assert row["sectionId"] == section_b_id, row
+    assert (row["present"], row["conducted"], row["scheduled"], row["percentage"]) == (1, 1, 1, 100.0), row
+    status, payload = legacy_day_api(f"/faculty/sessions/{legacy_id}/roster")
+    assert status == 200 and [row["rollNumber"] for row in payload["rows"]] == [roll_b], payload
+
+    # History is append-only: neither an edit nor a delete is accepted.
+    with APP.app_context():
+        for statement, expected in (
+                (text("UPDATE legacy_occurrence_mappings SET reason = 'rewritten' WHERE id = :id"),
+                 ("append-only", "immutable")),
+                (text("DELETE FROM legacy_occurrence_mappings WHERE id = :id"),
+                 ("cannot be deleted",))):
+            try:
+                db.session.execute(statement, {"id": STATE["legacy_mapping_ids"][0]})
+                db.session.flush()
+            except Exception as exc:
+                assert any(token in str(exc) for token in expected), exc
+                db.session.rollback()
+            else:
+                db.session.rollback()
+                raise AssertionError(f"mapping history accepted a forbidden write: {statement}")
+        assert len(legacy_mapping.history(legacy_id)) == 2, "a rejected write changed the history"
+
+    # Phase 2.5 D15: a closure still deletes a future unstarted occurrence, and
+    # the mapping survives as history (no FK, no active row blocks the delete).
+    with APP.app_context():
+        operator = User(role=UserRole.FACULTY, email=f"tt2.lm.operator.{RUN_ID}@example.edu",
+                        password_hash=hash_password(PASSWORD), full_name="TT2 Legacy Operator",
+                        department=f"TT2 Legacy Mapping {RUN_ID}", is_active=True)
+        db.session.add(operator)
+        db.session.flush()
+        ACCOUNTS["legacy_operator"] = {"email": operator.email}
+        future_day = occurrences.today() + timedelta(days=1)
+        start_time, end_time = occurrences.period_times(
+            future_day, Period.query.filter_by(ordinal=1).one())
+        future = ScheduledClass(professor_id=operator.id, term_id=None, slot_id=None,
+                                room="Legacy Room", course_code="TT2-LM-FUTURE",
+                                start_time=start_time, end_time=end_time)
+        db.session.add(future)
+        db.session.flush()
+        mapped = legacy_mapping.map_occurrence(
+            future.id, offering_b_id, "operator:test-run", "future occurrence for D15")
+        db.session.commit()
+        future_id = future.id
+        STATE["legacy_future_id"] = future_id
+        closure, counts = occurrences.mark_closure(
+            {"date_from": future_day.isoformat(), "date_to": future_day.isoformat(),
+             "scope": "DEPARTMENT", "department": operator.department,
+             "reason": f"legacy mapping D15 fixture {RUN_ID}"},
+            db.session.get(User, AUTH["admin_id"]))
+        db.session.commit()
+        assert counts["removed"] == 1, counts
+        assert db.session.get(ScheduledClass, future_id) is None, "D15 did not delete the mapped occurrence"
+        kept = legacy_mapping.history(future_id)
+        assert len(kept) == 1 and kept[0].id == mapped.id, [entry.to_dict() for entry in kept]
+        assert kept[0].superseded_at is not None, kept[0].to_dict()
+        assert closure.id is not None
+
+
+def step_mapping_offering_guard():
+    """An ACTIVE mapping blocks its offering's delete; superseded history does not."""
+    term_id = STATE["attendance_filters"]["term"]
+    with APP.app_context():
+        day = datetime.fromisoformat(STATE["attendance_filters"]["date_to"]).date() + timedelta(days=30)
+        start, end = occurrences.period_times(day, Period.query.filter_by(ordinal=2).one())
+        section = Section(programme=f"TT2OFF-{RUN_ID}", batch_year=2023, letter="A",
+                          department=ACCOUNTS["hod"]["department"])
+        db.session.add(section)
+        db.session.flush()
+        STATE["master_section_ids"].append(section.id)
+        offering = TermOffering(term_id=term_id, section_id=section.id)
+        row = ScheduledClass(professor_id=AUTH["professor_id"], term_id=term_id, slot_id=None,
+                             room="Legacy Room", course_code=f"TT2OFF-{RUN_ID}",
+                             start_time=start, end_time=end)
+        db.session.add_all([offering, row])
+        db.session.flush()
+        STATE["class_ids"].append(row.id)
+        entry = legacy_mapping.map_occurrence(row.id, offering.id, "operator:test-run",
+                                              "offering delete guard fixture")
+        db.session.commit()
+        STATE["legacy_mapping_ids"].append(entry.id)
+        offering_id, occurrence_id = offering.id, row.id
+
+    # ACTIVE mapping: the database itself refuses to orphan it, whatever path
+    # issues the DELETE (ORM or raw SQL).
+    with APP.app_context():
+        try:
+            db.session.execute(text("DELETE FROM term_offerings WHERE id = :id"), {"id": offering_id})
+            db.session.flush()
+        except Exception as exc:
+            assert ("active legacy occurrence mapping" in str(exc) or
+                    "ck_term_offerings_active_legacy_mapping" in str(exc)), exc
+            db.session.rollback()
+        else:
+            db.session.rollback()
+            raise AssertionError("an offering with an active legacy mapping was deleted")
+        assert db.session.query(TermOffering.id).filter_by(id=offering_id).count() == 1, (
+            "the refused delete removed the offering")
+
+    # D15 still deletes the occurrence; that supersedes the mapping, which then
+    # no longer protects the offering, and the history row survives the delete.
+    with APP.app_context():
+        db.session.execute(text("DELETE FROM scheduled_classes WHERE id = :id"), {"id": occurrence_id})
+        db.session.commit()
+        kept = legacy_mapping.history(occurrence_id)
+        assert len(kept) == 1 and kept[0].superseded_at is not None, [item.to_dict() for item in kept]
+        deleted = db.session.execute(text("DELETE FROM term_offerings WHERE id = :id"), {"id": offering_id})
+        db.session.commit()
+        assert deleted.rowcount == 1, deleted.rowcount
+        assert db.session.query(TermOffering.id).filter_by(id=offering_id).count() == 0, (
+            "superseded history blocked the offering delete")
+        assert legacy_mapping.history(occurrence_id)[0].offering_id == offering_id, "history was not kept"
+    print(f"   offering {offering_id}: refused while active, deletable after the D15 release, history kept")
+
+
+def step_mapping_offering_concurrency():
+    """A blocked DELETE or scope UPDATE is refused after the mapping commits.
+
+    Two real connections per race. Connection A inserts an active mapping and
+    keeps its transaction open, so the insert guard's FOR SHARE lock on the
+    offering is live. Connection B starts the DELETE (and, for a second
+    offering, the term/section UPDATE) on its own connection and genuinely
+    blocks on that row lock: no NOWAIT and lock_timeout = 0, so it keeps the
+    statement snapshot taken before A committed. A then commits and B resumes.
+    B's older snapshot cannot see the new active row, so either the immediate
+    guard or, at B's COMMIT, the deferred constraint trigger refuses the
+    mutation. After the rollback the offering, its active mapping and its
+    term/section are all unchanged, which is what "never orphan" means.
+
+    Every wait is bounded (and B carries a statement_timeout longer than the
+    bound), so a harness that no longer blocks fails the step instead of hanging.
+    """
+    # Bounded synchronization: B must be *seen* waiting on the row lock, and no
+    # wait may outlive BLOCK_SECONDS unless the assertion is what ends it.
+    BLOCK_SECONDS = 15.0
+    STATEMENT_TIMEOUT = "30s"  # longer than BLOCK_SECONDS: it can only fire on a broken run
+    term_id = STATE["attendance_filters"]["term"]
+    with APP.app_context():
+        engine = db.engine
+        if engine.dialect.name != "postgresql":
+            print("   skipped: the offering/mapping locks are PostgreSQL triggers")
+            return
+        day = datetime.fromisoformat(STATE["attendance_filters"]["date_to"]).date() + timedelta(days=45)
+        start, end = occurrences.period_times(day, Period.query.filter_by(ordinal=2).one())
+        # One offering per race (a distinct row means a distinct lock) and a
+        # third, unused section as the scope-change target, so the UPDATE can
+        # never fail on the (term_id, section_id) unique constraint instead.
+        sections = [
+            Section(programme=f"TT2RACE-{RUN_ID}-{suffix}", batch_year=2023, letter="A",
+                    department=ACCOUNTS["hod"]["department"])
+            for suffix in ("DELETE", "SCOPE", "TARGET")
+        ]
+        db.session.add_all(sections)
+        db.session.flush()
+        STATE["master_section_ids"] += [section.id for section in sections]
+        delete_course, scope_course = f"TT2RACE-DEL-{RUN_ID}", f"TT2RACE-SCOPE-{RUN_ID}"
+        race_rows = [
+            ScheduledClass(professor_id=AUTH["professor_id"], term_id=term_id, slot_id=None,
+                           room="Race Room", course_code=course, start_time=start, end_time=end)
+            for course in (delete_course, scope_course)
+        ]
+        offerings = [TermOffering(term_id=term_id, section_id=sections[index].id) for index in (0, 1)]
+        db.session.add_all([*offerings, *race_rows])
+        db.session.flush()
+        STATE["class_ids"] += [row.id for row in race_rows]
+        delete_occurrence_id, scope_occurrence_id = race_rows[0].id, race_rows[1].id
+        delete_offering_id, scope_offering_id = offerings[0].id, offerings[1].id
+        delete_section_id, scope_section_id, target_section_id = (section.id for section in sections)
+        db.session.commit()
+
+        def sqlstate(exc):
+            original = getattr(exc, "orig", None) or exc
+            return (getattr(original, "pgcode", None),
+                    getattr(getattr(original, "diag", None), "constraint_name", None))
+
+        def insert_mapping(connection, params):
+            """The guard on this INSERT is what takes the offering FOR SHARE lock."""
+            connection.execute(text(
+                "INSERT INTO legacy_occurrence_mappings (occurrence_id, offering_id, "
+                "occurrence_start_time, occurrence_course_code, mapped_by, mapped_at, reason) "
+                "VALUES (:occurrence, :offering, :start, :course, 'operator:test-run', "
+                "now() AT TIME ZONE 'UTC', 'concurrency fixture: hold the offering lock')"), params)
+
+        # Read-only observer, autocommit, so polling holds no transaction itself.
+        monitor = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+        # The driver reports the constraint name for a trigger-raised error; the
+        # message fragment keeps the assertion meaningful if it does not.
+        fragments = {
+            "ck_term_offerings_active_legacy_mapping": "still has an active legacy occurrence mapping",
+            "ck_term_offerings_scope_legacy_mapping": "term/section is fixed while",
+        }
+
+        def wait_until_blocked(pid, writer_pid, thread, label):
+            """Bounded: B must be waiting on A, the FOR SHARE holder, not finishing.
+
+            A row lock is recorded in the tuple header, so the waiter waits on
+            the holder's transaction id rather than on a tuple lock; asking for
+            the blocking PIDs is the lock-type-independent check.
+            """
+            deadline = time.monotonic() + BLOCK_SECONDS
+            state = None
+            while time.monotonic() < deadline:
+                row = monitor.execute(text(
+                    "SELECT a.wait_event_type, a.wait_event, pg_blocking_pids(a.pid) "
+                    "FROM pg_stat_activity a WHERE a.pid = :pid"), {"pid": pid}).first()
+                if row is None:
+                    break
+                blockers = list(row[2] or ())
+                state = (row[0], row[1], blockers)
+                if writer_pid in blockers:
+                    return state
+                if not thread.is_alive():
+                    break
+                time.sleep(0.02)
+            raise AssertionError(
+                f"{label}: the rival was never blocked by the mapping transaction within "
+                f"{BLOCK_SECONDS}s (last wait state {state}); the insert guard is not holding FOR SHARE")
+
+        def race(label, mapping, statement, params, constraint, section_id):
+            """A holds the lock, B blocks then resumes, and the outcome is asserted."""
+            writer = engine.connect()
+            held = writer.begin()
+            ready = threading.Event()
+            outcome = {}
+            thread = None
+            try:
+                insert_mapping(writer, mapping)
+                writer_pid = writer.execute(text("SELECT pg_backend_pid()")).scalar_one()
+
+                def rival():
+                    connection = None
+                    try:
+                        connection = engine.connect()
+                        transaction = connection.begin()
+                        # A blocked statement, not a fast failure and not a retry:
+                        # lock_timeout disabled and only a broken run hits the cap.
+                        connection.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"))
+                        connection.execute(text("SET LOCAL lock_timeout = 0"))
+                        outcome["pid"] = connection.execute(text("SELECT pg_backend_pid()")).scalar_one()
+                        ready.set()
+                        try:
+                            connection.execute(text(statement), params)
+                        except Exception as exc:  # noqa: BLE001 - the SQLSTATE is the assertion
+                            outcome.update(stage="statement", error=exc)
+                            transaction.rollback()
+                            return
+                        try:
+                            transaction.commit()
+                        except Exception as exc:  # noqa: BLE001 - deferred check fires here
+                            outcome.update(stage="commit", error=exc)
+                            try:
+                                connection.rollback()
+                            except Exception:  # noqa: BLE001 - the server already rolled back
+                                pass
+                            return
+                        outcome["stage"] = "committed"
+                    except Exception as exc:  # noqa: BLE001 - surfaced by the main thread
+                        outcome["fatal"] = exc
+                    finally:
+                        ready.set()
+                        if connection is not None:
+                            connection.close()
+
+                thread = threading.Thread(target=rival, name=f"mapping-race-{label}", daemon=True)
+                thread.start()
+                if not ready.wait(BLOCK_SECONDS):
+                    raise AssertionError(f"{label}: the rival connection never started")
+                if "fatal" in outcome:
+                    raise AssertionError(f"{label}: the rival connection failed: {outcome['fatal']!r}")
+                waited = wait_until_blocked(outcome["pid"], writer_pid, thread, label)
+
+                # A commits while B is waiting. B's statement keeps the snapshot
+                # it took before this commit and cannot see the new active row.
+                held.commit()
+                thread.join(BLOCK_SECONDS)
+                assert not thread.is_alive(), (
+                    f"{label}: still blocked {BLOCK_SECONDS}s after the mapping committed "
+                    f"(wait state {waited})")
+                assert "error" in outcome, f"{label}: the rival {outcome.get('stage')} the mutation"
+                code, name = sqlstate(outcome["error"])
+                assert code == "23503", (label, outcome["stage"], code, outcome["error"])
+                assert (name == constraint or constraint in str(outcome["error"])
+                        or fragments[constraint] in str(outcome["error"])), (
+                    label, outcome["stage"], name, outcome["error"])
+
+                # B rolled back: offering, active mapping and scope all survive.
+                surviving = monitor.execute(text(
+                    "SELECT o.section_id, "
+                    "(SELECT count(*) FROM legacy_occurrence_mappings m "
+                    " WHERE m.offering_id = o.id AND m.superseded_at IS NULL) "
+                    "FROM term_offerings o WHERE o.id = :offering"),
+                    {"offering": params["offering"]}).first()
+                assert surviving is not None, f"{label}: the offering is gone after the rollback"
+                assert surviving[0] == section_id, (label, "scope", surviving[0], section_id)
+                assert surviving[1] == 1, (label, "active mappings", surviving[1])
+                return outcome["stage"]
+            finally:
+                if held.is_active:
+                    held.rollback()
+                if thread is not None:
+                    thread.join(BLOCK_SECONDS)
+                writer.close()
+
+        try:
+            delete_stage = race(
+                "offering delete",
+                {"occurrence": delete_occurrence_id, "offering": delete_offering_id,
+                 "start": start, "course": delete_course},
+                "DELETE FROM term_offerings WHERE id = :offering",
+                {"offering": delete_offering_id},
+                "ck_term_offerings_active_legacy_mapping", delete_section_id)
+            scope_stage = race(
+                "offering term/section update",
+                {"occurrence": scope_occurrence_id, "offering": scope_offering_id,
+                 "start": start, "course": scope_course},
+                "UPDATE term_offerings SET section_id = :section WHERE id = :offering",
+                {"section": target_section_id, "offering": scope_offering_id},
+                "ck_term_offerings_scope_legacy_mapping", scope_section_id)
+
+            # The commit-time backstop must exist in its deferred form, and the
+            # insert guard must be the locking read the race depends on.
+            guards = dict(monitor.execute(text(
+                "SELECT tgname, tgdeferrable AND tginitdeferred FROM pg_trigger "
+                "WHERE tgrelid = 'term_offerings'::regclass AND NOT tgisinternal")).all())
+            guard_body = monitor.execute(text(
+                "SELECT pg_get_functiondef('legacy_occurrence_mapping_guard'::regproc)")).scalar_one()
+            assert guards.get("term_offerings_active_mapping_commit_check") is True, guards
+            assert {"term_offerings_active_mapping_guard", "term_offerings_scope_guard"} <= set(guards), guards
+            assert "FROM term_offerings WHERE id = NEW.offering_id FOR SHARE" in guard_body, guard_body
+
+            # Superseding is the only release: deleting the occurrences fires the
+            # D15 release trigger, after which both offerings are deletable and
+            # the audit rows stay behind as history.
+            for occurrence_id in (delete_occurrence_id, scope_occurrence_id):
+                monitor.execute(text("DELETE FROM scheduled_classes WHERE id = :id"),
+                                {"id": occurrence_id})
+            for offering_id in (delete_offering_id, scope_offering_id):
+                deleted = monitor.execute(text("DELETE FROM term_offerings WHERE id = :id"),
+                                          {"id": offering_id})
+                assert deleted.rowcount == 1, (offering_id, deleted.rowcount)
+            kept = monitor.execute(text(
+                "SELECT offering_id, superseded_at FROM legacy_occurrence_mappings "
+                "WHERE occurrence_id IN (:delete_id, :scope_id) ORDER BY offering_id"),
+                {"delete_id": delete_occurrence_id, "scope_id": scope_occurrence_id}).all()
+            assert len(kept) == 2 and all(row[1] is not None for row in kept), kept
+            assert {row[0] for row in kept} == {delete_offering_id, scope_offering_id}, kept
+        finally:
+            monitor.close()
+    print(f"   offering {delete_offering_id}: DELETE blocked, refused at {delete_stage}; "
+          f"offering {scope_offering_id}: section UPDATE blocked, refused at {scope_stage}; "
+          f"supersede released both, history kept")
+
+
+def step_attendance_scope_positive():
+    """Positive Phase 2.9 scope once the global legacy backlog is empty."""
+    term_id = STATE["attendance_filters"]["term"]
+    own_section = STATE["attendance_filters"]["section"]
+    department = ACCOUNTS["hod"]["department"]
+    with APP.app_context():
+        assert legacy_mapping.unmapped_total() > 0, "the fixture expected a backlog before this step"
+        # Destination for the backlog: a section in the HOD's own department with
+        # no roster and no slots, so mapping the remaining legacy rows changes no
+        # other section's denominators. Mapping is APPEND-ONLY: not one audit row
+        # is deleted to lift the global gate.
+        dest = Section(programme=f"TT2SCOPE-{RUN_ID}", batch_year=2023, letter="A",
+                       department=department)
+        db.session.add(dest)
+        db.session.flush()
+        STATE["master_section_ids"].append(dest.id)
+        offering = TermOffering(term_id=term_id, section_id=dest.id)
+        db.session.add(offering)
+        db.session.flush()
+        pending = legacy_mapping.unmapped_occurrences(datetime(1970, 1, 1), datetime(2100, 1, 1))
+        for legacy_row in pending:
+            # Every remaining slotless row is term-less; a term-bearing row would
+            # need an offering of that same term.
+            assert legacy_row.term_id in (None, term_id), (legacy_row.id, legacy_row.term_id)
+            mapped = legacy_mapping.map_occurrence(
+                legacy_row.id, offering.id, "operator:test-run",
+                "fixture: clear the global backlog without deleting history")
+            db.session.flush()
+            STATE["legacy_mapping_ids"].append(mapped.id)
+        db.session.commit()
+        mapped_count = len(pending)
+        assert legacy_mapping.unmapped_total() == 0, legacy_mapping.unmapped_total()
+        departments = {row.id: row.department for row in Section.query.all()}
+    print(f"   {mapped_count} slotless occurrence(s) mapped append-only; global backlog now 0")
+
+    # The gate is genuinely open: the very HOD call step 66 refused with a
+    # generic 409 now reaches the real section/department scope, so the tests
+    # below exercise the scoped report paths rather than the backlog refusal.
+    foreign_section = next(resource_id for kind, resource_id, _ in STATE["foreign_resources"]
+                           if kind == "sections")
+    status, payload = attendance_api(token=AUTH["hod_token"], section=foreign_section)
+    assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+
+    # 1. HOD receives its own department's rows for the very filters FACULTY use.
+    status, professor_view = attendance_api()
+    assert status == 200, professor_view
+    status, hod_view = attendance_api(token=AUTH["hod_token"])
+    assert status == 200, hod_view
+    keys = ("studentId", "present", "conducted", "scheduled", "percentage")
+    assert [tuple(row[key] for key in keys) for row in hod_view["rows"]] == [
+        tuple(row[key] for key in keys) for row in professor_view["rows"]], (
+            hod_view["rows"], professor_view["rows"])
+    assert len(hod_view["rows"]) == 2, hod_view["rows"]
+    assert all(row["sectionId"] == own_section for row in hod_view["rows"]), hod_view["rows"]
+    status, hod_sessions = attendance_api("/faculty/sessions", token=AUTH["hod_token"])
+    assert status == 200, hod_sessions
+    assert set(STATE["attendance_occurrence_ids"]) <= {
+        row["occurrenceId"] for row in hod_sessions["rows"] if row["occurrenceId"]}, hod_sessions["rows"]
+    assert all(departments[row["sectionId"]] == department for row in hod_sessions["rows"]), (
+        hod_sessions["rows"])
+
+    # 2. A different department's HOD is refused by the real department scope,
+    #    not by the generic backlog gate (which is open now).
+    with APP.app_context():
+        foreign = User(role=UserRole.HOD, email=f"tt2.foreign.hod.{RUN_ID}@example.edu",
+                       password_hash=hash_password(PASSWORD), full_name="TT2 Foreign HOD",
+                       department=f"Physics {RUN_ID}", is_active=True)
+        db.session.add(foreign)
+        db.session.commit()
+        ACCOUNTS["foreign_hod"] = {"email": foreign.email}
+    status, payload = api("POST", "/auth/login",
+                          json={"email": ACCOUNTS["foreign_hod"]["email"], "password": PASSWORD})
+    assert status == 200, f"foreign HOD login failed: {status}: {payload}"
+    foreign_token = payload["token"]
+    status, payload = attendance_api(token=foreign_token)
+    assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+    status, payload = attendance_api(f"/faculty/sessions/{STATE['attendance_occurrence_ids'][0]}/roster",
+                                     token=foreign_token)
+    assert_directory_error(status, payload, 403, "attendance", "out_of_scope")
+    with patch("app.services.attendance_portal.utcnow", return_value=STATE["attendance_now"]):
+        status, payload = pattern_api("GET", "/faculty/attendance", token=foreign_token,
+                                      query_string={"term": term_id})
+    assert status == 200 and payload["rows"] == [] and payload["total"] == 0, payload
+
+    # 3. FACULTY scope is unchanged: each teacher sees only their own classes.
+    with patch("app.services.attendance_portal.utcnow", return_value=STATE["attendance_now"]):
+        status, professor_all = pattern_api("GET", "/faculty/sessions",
+                                            token=AUTH["professor_token"],
+                                            query_string={"term": term_id})
+        substitute_status, substitute_all = pattern_api("GET", "/faculty/sessions",
+                                                        token=AUTH["substitute_token"],
+                                                        query_string={"term": term_id})
+    assert status == substitute_status == 200, (professor_all, substitute_all)
+    professor_ids = {row["occurrenceId"] for row in professor_all["rows"] if row["occurrenceId"]}
+    substitute_ids = {row["occurrenceId"] for row in substitute_all["rows"] if row["occurrenceId"]}
+    assert set(STATE["attendance_occurrence_ids"]) <= professor_ids, professor_ids
+    assert STATE["attendance_foreign_id"] not in professor_ids, professor_ids
+    assert substitute_ids == {STATE["attendance_foreign_id"]}, substitute_ids
+    print("   HOD own department rows match; foreign HOD 403; faculty see only their own classes")
+
+
+def step_attendance_verify():
+    ledger = STATE["attendance_ledger"]
+    read = lambda student_id, session_id: (student_id, session_id) in ledger
+    with patch("app.services.attendance_portal.blockchain.is_locked", side_effect=read), patch(
+            "app.services.attendance_portal.blockchain.lock_attendance", side_effect=AssertionError("verify wrote chain")):
+        status, payload = attendance_api("/timetable/verify")
+        assert status == 200 and payload == {"verified": 3, "mismatches": []}, payload
+        with APP.app_context():
+            capture = db.session.get(AttendanceCheckIn, STATE["attendance_capture_id"])
+            saved = {key: getattr(capture, key) for key in ("id", "session_id", "student_id", "checked_in_at",
+                                                          "onchain_tx_hash", "method", "device_verified")}
+            db.session.delete(capture)
+            db.session.commit()
+        try:
+            status, payload = attendance_api("/timetable/verify")
+            assert status == 200 and payload["verified"] == 2 and len(payload["mismatches"]) == 1, payload
+            mismatch = payload["mismatches"][0]
+            assert mismatch == {"studentId": saved["student_id"], "sessionId": saved["session_id"],
+                "occurrenceId": STATE["attendance_occurrence_ids"][0], "databasePresent": False, "ledgerPresent": True}, payload
+            with APP.app_context():
+                assert db.session.get(AttendanceCheckIn, saved["id"]) is None, "verify repaired the DB"
+        finally:
+            with APP.app_context():
+                db.session.add(AttendanceCheckIn(**saved))
+                db.session.commit()
+        # An UPDATE can hide a genuine capture and forge another student's
+        # presence at once. Verify must report both, never repair either.
+        with APP.app_context():
+            altered = db.session.get(AttendanceCheckIn, STATE["attendance_alter_capture_id"])
+            original_student, session_id = altered.student_id, altered.session_id
+            forged_student = STATE["attendance_student_ids"][1]
+            altered.student_id = forged_student
+            db.session.commit()
+        try:
+            status, payload = attendance_api("/timetable/verify")
+            assert status == 200 and payload["verified"] == 2 and len(payload["mismatches"]) == 2, payload
+            assert {(m["studentId"], m["sessionId"], m["databasePresent"], m["ledgerPresent"])
+                    for m in payload["mismatches"]} == {
+                        (original_student, session_id, False, True),
+                        (forged_student, session_id, True, False)}, payload
+            with APP.app_context():
+                assert db.session.get(AttendanceCheckIn, STATE["attendance_alter_capture_id"]).student_id == forged_student
+        finally:
+            with APP.app_context():
+                db.session.get(AttendanceCheckIn, STATE["attendance_alter_capture_id"]).student_id = original_student
+                db.session.commit()
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 STEPS = [
@@ -2087,6 +3217,17 @@ STEPS = [
     ("Foreign-department HOD: reads 200, writes 403", step_view_hod_foreign_reads),
     ("Student shortcut: permanent section's current-term non-empty week", step_student_timetable_assigned),
     ("Student shortcut: no section -> 200 empty week with section_unassigned note", step_student_timetable_unassigned),
+    ("Attendance: hand-built present/conducted percentages", step_attendance_percentage),
+    ("Attendance: excluded states/future never change percentage; matrix and search", step_attendance_excluded),
+    ("Attendance: completed started zero counts; sessions and roster fields", step_attendance_zero_denominator),
+    ("Attendance: no conducted classes -> null percentage", step_attendance_null),
+    ("Attendance: JSON/CSV/XLSX share ordered rows; download ignores paging", step_attendance_downloads),
+    ("Attendance: own faculty/department only; unauthorized reads -> 403", step_attendance_scope),
+    ("Legacy mapping: explicit, append-only, supersede-only, D15-safe", step_legacy_mapping),
+    ("Mapping guard: active mapping blocks offering delete, history does not", step_mapping_offering_guard),
+    ("Mapping race: blocked delete/scope update refused after the mapping commits", step_mapping_offering_concurrency),
+    ("Attendance scope: HOD own department, foreign HOD 403, faculty own classes", step_attendance_scope_positive),
+    ("Attendance verify: clean snapshot, missing mirror discrepancy, no writes", step_attendance_verify),
 ]
 
 
@@ -2095,9 +3236,6 @@ def run_steps() -> int:
         print(f"\n{index}. {title}")
         try:
             action()
-        except requests.RequestException as exc:
-            print(f"   \u274c FAIL: cannot reach the backend at {BASE_URL} ({exc})")
-            print("      start it first:  .\\venv\\Scripts\\python.exe run.py   (from backend/)")
         except AssertionError as exc:
             print(f"   \u274c FAIL: {exc}")
         except Exception as exc:
@@ -2116,10 +3254,13 @@ def main() -> int:
     print("=" * 60)
     print("   TIMETABLE V2 WORKLOAD + MASTER-DATA TESTS (test_timetable_v2.py)")
     print("=" * 60)
-    try:
-        result = run_steps()
-    finally:
-        error = cleanup()
+    # No IPFS upload and no ledger write may escape this process.
+    with CHAIN, patch("app.services.profile_metadata.pin", return_value=None):
+        try:
+            result = run_steps()
+        finally:
+            error = cleanup()
+    print(f"\n   chain double: {CHAIN.summary()}")
     if error:
         print(f"\n   \u274c FAIL: cleanup: {error}")
         return 1
