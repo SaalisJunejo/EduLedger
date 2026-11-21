@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useOutletContext, useSearchParams } from "react-router-dom";
 import PageLayout from "../components/PageLayout.jsx";
 import Button from "../components/ui/Button.jsx";
@@ -6,6 +6,7 @@ import Card from "../components/ui/Card.jsx";
 import Spinner from "../components/ui/Spinner.jsx";
 import StatusBanner from "../components/ui/StatusBanner.jsx";
 import { api } from "../lib/api.js";
+import { DatedTimetable, HolidayTools, timetableToday, weekMonday } from "../components/TimetableOccurrenceTools.jsx";
 
 const TABS = [
   { view: "class", label: "By class", picker: "Class" },
@@ -54,7 +55,7 @@ async function classWeeks(offerings, term, isActive) {
 async function loadCatalog(user, requestedTerm, isActive) {
   const query = requestedTerm ? `?${new URLSearchParams({ term: requestedTerm })}` : "";
   const response = await api(`/timetable/offerings${query}`);
-  const offerings = response.offerings.map((entry) => ({ id: entry.id, label: entry.sectionLabel }));
+  const offerings = response.offerings.map((entry) => ({ id: entry.id, label: entry.sectionLabel, department: entry.section.department }));
   if (user.role === "FACULTY") {
     return {
       term: response.term, offerings, weeks: new Map(), rooms: [], notice: null,
@@ -228,6 +229,10 @@ export default function Timetable() {
   const [periodState, setPeriodState] = useState({ rows: null, error: null });
   const [gridAttempt, setGridAttempt] = useState(0);
   const [gridState, setGridState] = useState({ key: null, data: null, error: null });
+  const dated = params.get("mode") === "dated";
+  const datedFrom = weekMonday(params.get("week") || timetableToday());
+  const [occurrenceRevision, setOccurrenceRevision] = useState(0);
+  const refreshOccurrences = useCallback(() => setOccurrenceRevision((value) => value + 1), []);
 
   useEffect(() => {
     let active = true;
@@ -325,7 +330,7 @@ export default function Timetable() {
 
   return (
     <PageLayout role={user.role} title="Timetable" wide
-      description="Read-only weekly teaching pattern. Share this page's URL to reopen the same view, selection and term. Times are shown in Asia/Karachi.">
+      description="View the repeating teaching pattern or a dated week. Holiday and single-occurrence changes never edit the pattern. Share this page's URL to restore the view, selection, term and dated week. Times are shown in Asia/Karachi.">
       <Card>
         <div role="tablist" aria-label="Timetable views" className="flex flex-wrap gap-2">
           {TABS.map((entry, index) => (
@@ -374,8 +379,21 @@ export default function Timetable() {
         </div>
       </Card>
 
+      <HolidayTools user={user} onChanged={refreshOccurrences} />
+
       <Card title="Weekly timetable">
-        <section aria-labelledby="timetable-legend" className="mb-4">
+        <div className="mb-4 space-y-3">
+          <div role="group" aria-label="Timetable layer" className="flex flex-wrap gap-2">
+            <Button variant={dated ? "secondary" : "primary"} aria-pressed={!dated} onClick={() => changeParam("mode", "pattern")}>Repeating pattern</Button>
+            <Button variant={dated ? "primary" : "secondary"} aria-pressed={dated} onClick={() => changeParam("mode", "dated")}>Dated week</Button>
+          </div>
+          {dated ? <label className="block max-w-xs text-xs font-bold uppercase tracking-wide text-ink-muted" htmlFor="timetable-dated-week">
+            Week containing date
+            <input id="timetable-dated-week" type="date" className={`mt-2 ${SELECT_STYLE}`} value={datedFrom}
+              onChange={(event) => { if (event.target.value) changeParam("week", weekMonday(event.target.value)); }} />
+          </label> : <p className="text-xs text-ink-muted">This is the repeating pattern, not dated occurrences. Open Dated week to select an occurrence and view its details.</p>}
+        </div>
+        {!dated ? <section aria-labelledby="timetable-legend" className="mb-4">
           <h3 id="timetable-legend" className="text-xs font-bold uppercase tracking-wide text-ink-muted">Legend · {colourBy}</h3>
           {legend.length ? (
             <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-2">
@@ -388,8 +406,8 @@ export default function Timetable() {
             </ul>
           ) : <p className="mt-2 text-xs text-ink-muted">No scheduled items on screen.</p>}
           <p className="mt-2 text-xs text-ink-muted">Course codes always identify classes. Double borders mark clashes or room-type warnings, never colour categories.</p>
-        </section>
-        {warnings.length ? (
+        </section> : null}
+        {!dated && warnings.length ? (
           <p role="status" className="mb-4 rounded-lg border-4 border-double border-ink bg-surface-muted px-3 py-2 text-sm text-ink">
             {warnings.length} timetable warning{warnings.length === 1 ? "" : "s"}. Outlined blocks are affected; term-wide warnings may involve other views.
           </p>
@@ -412,7 +430,10 @@ export default function Timetable() {
         ) : catalog && targetId && !roomRestricted && !week ? (
           <p role="status" className="mt-3 flex items-center gap-2 text-sm text-ink-muted"><Spinner /> Loading the complete week…</p>
         ) : null}
-        {week && periodsComplete ? <WeekGrid week={week} periods={periods} view={view} colourBy={colourBy} /> : null}
+        {week && periodsComplete ? (dated
+          ? <DatedTimetable key={`${gridKey}:${datedFrom}`} user={user} week={week} periods={periods} from={datedFrom}
+              offerings={catalog.offerings} metadataWeeks={catalog.weeks} revision={occurrenceRevision} onChanged={refreshOccurrences} />
+          : <WeekGrid week={week} periods={periods} view={view} colourBy={colourBy} />) : null}
       </Card>
     </PageLayout>
   );
