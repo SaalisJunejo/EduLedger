@@ -182,6 +182,71 @@ future, while the overdue slot will auto-flag after Flask starts. The seeder
 still prints obsolete `MOCK_CLASSES` instructions: **ignore them**. The frontend
 now loads real classes; do not edit frontend ids, labels or times.
 
+## Stage 2 - timetable and attendance seeds, then cold-start order
+
+**Stage 2 requires no contract changes, contract redeploy or Hardhat restart.**
+An existing healthy chain and its five configured addresses must be preserved.
+Do not use the full-reset steps 3/5/6 merely to install or demonstrate Stage 2.
+The earlier fresh-chain procedure is only for a deliberately requested complete
+cold reset; its existing chain/DB lifecycle warnings still apply.
+
+Have the operator apply the Stage 2 additive migrations in phase order,
+including the Phase 2.9 mapping guards and capture-evidence columns, before
+seeding. The app factory is not a substitute for migrating existing tables.
+Keep Flask/schedulers stopped while seeding. After the existing whitelist,
+workload and grades seeds have succeeded, append these commands in this order:
+
+```powershell
+Set-Location "$Repo\backend"
+.\venv\Scripts\python.exe seed_timetable_demo.py
+if ($LASTEXITCODE -ne 0) { throw "Timetable seed failed; stop and inspect the error." }
+.\venv\Scripts\python.exe seed_attendance_demo.py
+if ($LASTEXITCODE -ne 0) { throw "Attendance seed failed; reconcile before retrying." }
+```
+
+The complete seed order is `seed_whitelist_demo.py` ->
+`seed_workload_demo.py` -> `seed_grades_demo.py` -> `seed_timetable_demo.py` ->
+`seed_attendance_demo.py`. The grades seed still requires an already registered
+student (see step 6). If registration must be completed first, defer grades,
+complete directory-gated registration, then stop Flask and complete grades
+and both Stage 2 seeds in that order. These instructions do not migrate the
+old registration callers or toggle `GRANDFATHER_OPEN_REGISTRATION`.
+
+The timetable seed supplies periods/master data and blank offerings, reusing
+an active term; it does not import a pattern or materialize occurrences.
+The attendance seed defaults to local-only synthetic captures in its own
+inactive historical term and isolated department. Do not add its optional
+chain-write flag for the Stage 2 sample. Its verify discrepancies are expected:
+synthetic captures are not proof of identity checks or on-chain attendance.
+A later live Flask scheduler can still resolve overdue sample classes on-chain;
+local-only seeding is not a global chain-isolation switch. Select the term id
+printed by the attendance seed when viewing its faculty report. A partial seed
+must be reconciled, not blindly rerun. Existing legacy upload instructions
+below are retained for the operator's decision, not migrated by this phase.
+
+Cold-start order with the existing chain: PostgreSQL -> Redis -> ensure the
+existing Hardhat node and Kubo daemon are available without resetting either ->
+operator-applied Stage 2 schema -> existing seeds followed by timetable and
+attendance seeds -> Flask -> Vite -> log in to the existing bootstrapped ADMIN
+(do not repeat bootstrap) -> Expo if needed -> authorized verification.
+For an explicitly requested fresh-chain reset, follow steps 1-6 first,
+including all five deployments and address updates, append the Stage 2 seeds,
+then start Flask/Vite and bootstrap the intended real ADMIN before any tests.
+Stage 2 itself does not require that reset.
+
+The expanded `smoke_test_full.py` defines 32 checks (the original 27 unchanged
+plus 5 Stage 2 checks). Activation and stale-start fixtures are rollback-only
+so the live scheduler cannot see them; the synthetic percentage check uses
+the real local read route and rolls back, without ledger verification. Pattern
+import and isolated closure checks use the live HTTP API. The script still
+uses legacy open registration and requires the development-only compatibility
+flag on the live backend until those callers are separately migrated.
+The earlier 27/27 text describes the historical Stage 1 baseline only: the
+expanded smoke and full regression suite have not been run for Phase 2.12.
+Phase 2.11 UI checking used a mock; real backend/browser integration remains
+unverified. The closure API currently requires a trimmed reason of at least
+3 characters, even though the Phase 2.11 guide calls it optional.
+
 ## 7. Terminal C - start Flask (keep open)
 
 ```powershell

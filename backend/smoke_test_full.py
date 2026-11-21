@@ -1,4 +1,4 @@
-"""EduLedger full-stack smoke test - Stage 1 in one run.
+"""EduLedger full-stack smoke test - Stages 1 and 2 in one run.
 
 The pre-demo safety net: ONE command that exercises every module against the
 LIVE stack (Flask + Hardhat + local IPFS daemon + Redis), prints an unambiguous
@@ -68,16 +68,28 @@ Steps
     M4.1  enroll the device secret -> challenge -> correct HMAC gives a
           token; a wrong HMAC is refused
 
+  Module 5 - Stage 2 Timetable
+    M5.1  term activation creates blank offerings for every section
+    M5.2  pattern import/read/re-import preserves slot ids and values
+    M5.3  isolated closure removes an unstarted class, retains a started one
+    M5.4  attendance percentages match independently known present/conducted
+    M5.5  stale class start is refused with schedule/too_late
+
   Cleanup
     C1    remove this run's fixtures and unpin its evidence
 
-Total: 27/27 checks on success (2 setup + 10 attendance + 6 audit trail
-+ 7 workload + 1 credential + cleanup). The health gate remains separate
-from the numbered checks.
+Total: 32 checks on success (the original 27 plus 5 Stage 2 checks). This
+is a defined check count, not a claim that this expanded script has passed.
+The health gate remains separate from the numbered checks. Stage 2 pattern
+and closure checks use the live HTTP API. Activation, synthetic attendance
+reporting and the stale-start route use rollback-only local transactions:
+they do not expose active-term changes or overdue fixtures to the live
+scheduler. Synthetic captures test the report fallback, not identity or
+ledger verification. Stage 2 needs no contract redeploy.
 
 Failure isolation
 -----------------
-The four modules run in sequence, but a failing module never stops the next
+The five modules run in sequence, but a failing module never stops the next
 one, and within a module the steps that depend on a failed step are SKIPped
 - one run always gives the full picture. Shared auth or health failure
 skips module steps that cannot run, with the exact infrastructure error.
@@ -91,6 +103,7 @@ into reports); the stdout UTF-8 guard below follows the project convention.
 """
 
 import base64
+import csv
 import hashlib
 import hmac
 import io
@@ -100,6 +113,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -180,6 +194,12 @@ STATE = {
     # JSON) - cleanup unpins them all.
     "extra_cids": [],
 }
+
+STAGE2_CODE = f"S2-{RUN_ID[:24]}"
+STAGE2_PROGRAMME = f"Smoke Stage 2 {RUN_ID}"
+STAGE2_DEPARTMENT = f"Smoke Closure {RUN_ID}"
+STAGE2_REASON = f"Smoke holiday {RUN_ID}"
+STAGE2 = {}
 
 # What the summary table is built from: (step key, label, status, detail).
 RESULTS: list[tuple[str, str, str, str]] = []
@@ -1352,6 +1372,243 @@ def m4_device_credential() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Module 5 - Stage 2 Timetable
+# ---------------------------------------------------------------------------
+def m5_term_activation() -> str:
+    """Exercise real activation without publishing a different active term."""
+    from app.extensions import db
+    from app.models import Course, Room, Section, Term, TermOffering, TimetableSlot
+    from app.services.occurrences import today
+    from app.services.timetable import activate_term
+
+    STAGE2["admin_token"] = temp_admin_token()
+    with APP.app_context():
+        day = today()
+        term = Term(name=f"Smoke Stage 2 {RUN_ID}", start_date=day - timedelta(days=21),
+                    end_date=day + timedelta(days=21), is_active=False)
+        sections = [Section(programme=STAGE2_PROGRAMME, batch_year=day.year, letter=letter,
+                            department=department) for letter, department in (
+                                ("A", ACCOUNTS["hod"]["department"]), ("B", STAGE2_DEPARTMENT))]
+        course = Course(code=STAGE2_CODE, title="Smoke Stage 2", is_lab=False,
+                        department=ACCOUNTS["hod"]["department"])
+        room = Room(name=f"Smoke Stage 2 {RUN_ID}", type="LECTURE",
+                    department=ACCOUNTS["hod"]["department"])
+        db.session.add_all([term, *sections, course, room])
+        db.session.flush()
+        STAGE2.update(term_id=term.id, section_ids=[row.id for row in sections],
+                      course_id=course.id, room_id=room.id, room_name=room.name)
+        db.session.commit()
+        term_id = STAGE2["term_id"]
+        prior_active = [row.id for row in Term.query.filter_by(is_active=True).all()]
+        section_ids = {row.id for row in Section.query.all()}
+        assert TermOffering.query.filter_by(term_id=term_id).count() == 0, "new term is not blank"
+        try:
+            created, deactivated = activate_term(db.session.get(Term, term_id))
+            offerings = TermOffering.query.filter_by(term_id=term_id).all()
+            assert created == len(section_ids), f"activation created {created}, expected {len(section_ids)}"
+            assert len(offerings) == len(section_ids), "not one offering per section"
+            assert {row.section_id for row in offerings} == section_ids, "offering coverage differs"
+            assert sorted(deactivated) == sorted(prior_active), "incorrect active-term transition"
+            assert [row.id for row in Term.query.filter_by(is_active=True)] == [term_id]
+            assert TimetableSlot.query.join(TermOffering).filter(TermOffering.term_id == term_id).count() == 0
+            before = sorted(row.id for row in offerings)
+            assert activate_term(db.session.get(Term, term_id)) == (0, []), "activation is not idempotent"
+            assert sorted(row.id for row in TermOffering.query.filter_by(term_id=term_id)) == before
+        finally:
+            db.session.rollback()
+        assert [row.id for row in Term.query.filter_by(is_active=True)] == prior_active
+        assert TermOffering.query.filter_by(term_id=term_id).count() == 0, "activation escaped rollback"
+        # Only our inactive term's two offerings persist for the remaining checks.
+        offerings = [TermOffering(term_id=term_id, section_id=value) for value in STAGE2["section_ids"]]
+        db.session.add_all(offerings)
+        db.session.flush()
+        STAGE2["offering_ids"] = [row.id for row in offerings]
+        db.session.commit()
+    return f"{created} blank offerings checked; activation rolled back, demo active term unchanged"
+
+
+def stage2_pattern_snapshot() -> list:
+    from app.models import TermOffering, TimetableSlot
+
+    with APP.app_context():
+        return [row.to_dict() for row in TimetableSlot.query.join(TermOffering).filter(
+            TermOffering.term_id == STAGE2["term_id"]).order_by(TimetableSlot.id).all()]
+
+
+def m5_pattern_roundtrip() -> str:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=(
+        "section", "course_code", "faculty_employee_id", "room", "day", "period"))
+    writer.writeheader()
+    writer.writerow(dict(section=STAGE2["section_ids"][0], course_code=STAGE2_CODE,
+                         faculty_employee_id=ACCOUNTS["professor"]["employee_id"],
+                         room=STAGE2["room_name"], day="MON", period="1"))
+    data = output.getvalue().encode("utf-8")
+
+    def upload():
+        return api("POST", "/hod/timetable/import", token=AUTH["hod_token"],
+                   data={"term_id": str(STAGE2["term_id"])},
+                   files={"file": ("smoke-pattern.csv", data, "text/csv")})
+
+    status, payload = upload()
+    assert status == 200, f"pattern import failed: {status}: {payload}"
+    assert payload["applied"] is True and payload["dry_run"] is False, payload
+    assert (payload["rows_created"], payload["rows_updated"], payload["rows_unchanged"]) == (1, 0, 0), payload
+    assert payload["violations"] == [], payload
+    before = stage2_pattern_snapshot()
+    assert len(before) == 1, f"expected one persisted slot: {before}"
+    slot = before[0]
+    assert (slot["offeringId"], slot["courseId"], slot["facultyId"], slot["roomId"],
+            slot["dayOfWeek"], slot["periodOrdinal"]) == (
+                STAGE2["offering_ids"][0], STAGE2["course_id"], PROFESSOR_ID, STAGE2["room_id"], 0, 1), slot
+    path = f"/timetable/slots?offering_id={STAGE2['offering_ids'][0]}"
+    status, view = api("GET", path, token=AUTH["hod_token"])
+    assert status == 200 and view["count"] == 1, view
+    assert [{key: item[key] for key in slot} for item in view["slots"]] == before, view
+    status, payload = upload()
+    assert status == 200, f"pattern re-import failed: {status}: {payload}"
+    assert payload["applied"] is True and payload["dry_run"] is False, payload
+    assert (payload["rows_created"], payload["rows_updated"], payload["rows_unchanged"]) == (0, 0, 1), payload
+    assert payload["violations"] == [] and payload["proposed_changes"] == [], payload
+    assert stage2_pattern_snapshot() == before, "re-import changed slot ids or values"
+    STAGE2["pattern_slot_id"] = slot["id"]
+    return "one CSV slot imported/read/re-imported; zero changes, identical persisted id and values"
+
+
+def m5_closure_retention() -> str:
+    from app.extensions import db
+    from app.models import AttendanceSession, Period, ScheduledClass, SessionLog, TimetableSlot
+    from app.services import occurrences
+    from app.util import utcnow
+
+    with APP.app_context():
+        day = occurrences.today() + timedelta(days=1)
+        while day.weekday() > 4:
+            day += timedelta(days=1)
+        rows = []
+        for ordinal in (1, 2):
+            period = Period.query.filter_by(ordinal=ordinal, is_break=False).one()
+            slot = TimetableSlot(offering_id=STAGE2["offering_ids"][1], course_id=STAGE2["course_id"],
+                                 faculty_id=PROFESSOR_ID, room_id=STAGE2["room_id"],
+                                 day_of_week=day.weekday(), period_id=period.id)
+            db.session.add(slot)
+            db.session.flush()
+            start, end = occurrences.period_times(day, period)
+            row = ScheduledClass(slot_id=slot.id, term_id=STAGE2["term_id"], professor_id=PROFESSOR_ID,
+                                 course_code=STAGE2_CODE, room=STAGE2["room_name"],
+                                 day_of_week=day.weekday(), start_time=start, end_time=end)
+            db.session.add(row)
+            db.session.flush()
+            assert not occurrences.has_session(row), "recycled class id has retained session evidence"
+            assert SessionLog.query.filter_by(class_id=row.id).count() == 0, "fixture has an old workload log"
+            rows.append(row)
+        kept_id, removed_id = [row.id for row in rows]
+        now = utcnow()
+        session = AttendanceSession(class_id=str(kept_id), start_time=now, is_active=False, ended_at=now)
+        session.rotate_nonce(now=now, ttl_seconds=APP.config["ATTENDANCE_ROTATION_SECONDS"])
+        db.session.add(session)
+        db.session.flush()
+        session_id = session.id
+        kept_before = rows[0].to_dict()
+        db.session.commit()
+    before = stage2_pattern_snapshot()
+    status, payload = api("POST", "/closures", token=STAGE2["admin_token"], json={
+        "date_from": day.isoformat(), "date_to": day.isoformat(), "scope": "DEPARTMENT",
+        "department": STAGE2_DEPARTMENT, "reason": STAGE2_REASON})
+    assert status == 201, f"closure failed: {status}: {payload}"
+    assert (payload["removed"], payload["kept_started"], payload["kept_logged"]) == (1, 1, 0), payload
+    with APP.app_context():
+        assert db.session.get(ScheduledClass, removed_id) is None, "unstarted occurrence survived"
+        kept = db.session.get(ScheduledClass, kept_id)
+        assert kept is not None and kept.to_dict() == kept_before, "started occurrence changed or disappeared"
+        assert db.session.get(AttendanceSession, session_id) is not None, "started session evidence disappeared"
+    assert stage2_pattern_snapshot() == before, "closure changed the repeating pattern"
+    return f"isolated department: removed class #{removed_id}, retained started class #{kept_id}; pattern unchanged"
+
+
+def m5_attendance_percentage() -> str:
+    """Two completed, synthetic sessions; rollback prevents scheduler/ledger writes."""
+    from app.extensions import db
+    from app.models import AttendanceCheckIn, AttendanceSession, ScheduledClass, SessionLog, StudentSection, TimetableSlot
+    from app.services import occurrences
+
+    with APP.app_context():
+        try:
+            for student_id in (STUDENT_ID, STUDENT2_ID):
+                assert db.session.get(StudentSection, student_id) is None, "refusing to replace section membership"
+                db.session.add(StudentSection(user_id=student_id, section_id=STAGE2["section_ids"][0]))
+            slot = db.session.get(TimetableSlot, STAGE2["pattern_slot_id"])
+            today = occurrences.today()
+            for index, weeks in enumerate((2, 1)):
+                day = today - timedelta(days=today.weekday() + weeks * 7)
+                start, end = occurrences.period_times(day, slot.period)
+                row = ScheduledClass(slot_id=slot.id, term_id=STAGE2["term_id"], professor_id=PROFESSOR_ID,
+                                     course_code=STAGE2_CODE, room=STAGE2["room_name"],
+                                     day_of_week=0, start_time=start, end_time=end)
+                db.session.add(row)
+                db.session.flush()
+                assert not occurrences.has_session(row), "recycled class id has retained session evidence"
+                assert SessionLog.query.filter_by(class_id=row.id).count() == 0, "fixture has an old workload log"
+                session = AttendanceSession(class_id=str(row.id), start_time=start, is_active=False,
+                                            ended_at=end, current_nonce=f"s2-{RUN_ID}-{index}", nonce_expires_at=end)
+                db.session.add(session)
+                db.session.flush()
+                for sid in ((STUDENT_ID, STUDENT2_ID) if index == 0 else (STUDENT2_ID,)):
+                    db.session.add(AttendanceCheckIn(session_id=session.id, student_id=sid,
+                                                    checked_in_at=start, method="qr", device_verified=False))
+            db.session.flush()
+            response = APP.test_client().get("/api/v1/faculty/attendance", headers={
+                "Authorization": f"Bearer {AUTH['professor_token']}"}, query_string={
+                    "term": STAGE2["term_id"], "section": STAGE2["section_ids"][0],
+                    "course": STAGE2["course_id"], "date_from": (today - timedelta(days=21)).isoformat(),
+                    "date_to": today.isoformat()})
+            payload = response.get_json()
+            assert response.status_code == 200 and payload["total"] == 2, payload
+            rows = {row["studentId"]: row for row in payload["rows"]}
+            assert set(rows) == {STUDENT_ID, STUDENT2_ID}, rows
+            for sid, present, percentage in ((STUDENT_ID, 1, 50.0), (STUDENT2_ID, 2, 100.0)):
+                row = rows[sid]
+                assert (row["present"], row["conducted"], row["percentage"]) == (present, 2, percentage), row
+                assert row["percentage"] == round(present / 2 * 100, 1), row
+        finally:
+            db.session.rollback()
+    return "synthetic completed-session report: 1/2 = 50.0%, 2/2 = 100.0%; fixtures rolled back, no ledger claim"
+
+
+def m5_too_late() -> str:
+    """Use the real start route, keeping a stale fixture invisible to the live sweep."""
+    from app.extensions import db
+    from app.models import AttendanceSession, ScheduledClass, SessionLog, WorkloadSession
+    from app.util import utcnow
+
+    with APP.app_context():
+        try:
+            now = utcnow()
+            row = ScheduledClass(professor_id=PROFESSOR_ID, course_code=STAGE2_CODE,
+                                 room=STAGE2["room_name"], start_time=now - timedelta(minutes=60),
+                                 end_time=now - timedelta(minutes=10), day_of_week=None)
+            db.session.add(row)
+            db.session.flush()
+            names = [str(row.id), f"workload-{row.id}"]
+            assert AttendanceSession.query.filter(AttendanceSession.class_id.in_(names)).count() == 0
+            assert WorkloadSession.query.filter_by(class_id=row.id).count() == 0
+            assert SessionLog.query.filter_by(class_id=row.id).count() == 0
+            # Even a broken gate must not commit an overdue class or a new session.
+            with patch.object(db.session, "commit", side_effect=db.session.flush):
+                response = APP.test_client().post("/api/v1/session/start", json={"class_id": row.id},
+                                                 headers={"Authorization": f"Bearer {AUTH['professor_token']}"})
+            payload = response.get_json()
+            assert response.status_code == 403, f"stale start returned {response.status_code}: {payload}"
+            assert payload.get("check") == "schedule" and payload.get("error") == "too_late", payload
+            assert AttendanceSession.query.filter(AttendanceSession.class_id.in_(names)).count() == 0
+            assert WorkloadSession.query.filter_by(class_id=row.id).count() == 0
+            assert SessionLog.query.filter_by(class_id=row.id).count() == 0
+        finally:
+            db.session.rollback()
+    return "real start route -> 403 schedule/too_late; no session/log created, stale fixture rolled back"
+
+
+# ---------------------------------------------------------------------------
 # Cleanup - only this run's local fixtures, never table truncation or sequence reset
 # ---------------------------------------------------------------------------
 def cleanup() -> str:
@@ -1360,9 +1617,10 @@ def cleanup() -> str:
     if APP is not None and ACCOUNTS:
         from app.extensions import db
         from app.models import (
-            AttendanceSession, FacultyProfile, Grade, InstitutionWhitelist, Proposal,
-            ScheduledClass, SessionLog, Student, StudentProfile, SubstituteToken,
-            User, WorkloadSession,
+            AttendanceSession, CalendarClosure, Course, FacultyProfile, Grade,
+            InstitutionWhitelist, OccurrenceAudit, Proposal, Room, ScheduledClass,
+            Section, SessionLog, Student, StudentProfile, StudentSection, SubstituteToken,
+            Term, TermOffering, TimetableSlot, User, WorkloadSession,
         )
 
         try:
@@ -1375,7 +1633,7 @@ def cleanup() -> str:
                 user_ids = [user.id for user in User.query.filter(User.email.in_(emails)).all()]
                 class_ids = [row.id for row in ScheduledClass.query.filter(
                     ScheduledClass.professor_id.in_(user_ids),
-                    ScheduledClass.course_code.in_(COURSES + [SOCKET_COURSE]),
+                    ScheduledClass.course_code.in_(COURSES + [SOCKET_COURSE, STAGE2_CODE]),
                 ).all()]
                 session_names = [str(class_id) for class_id in class_ids]
                 session_names += [f"workload-{class_id}" for class_id in class_ids]
@@ -1413,6 +1671,31 @@ def cleanup() -> str:
                     removed += Student.query.filter_by(id=STUDENT2_ID).delete(
                         synchronize_session=False,
                     )
+                # Stage 2 children must precede their faculty, section and term.
+                removed += OccurrenceAudit.query.filter(
+                    OccurrenceAudit.actor_id.in_(user_ids), OccurrenceAudit.reason == STAGE2_REASON,
+                ).delete(synchronize_session=False)
+                removed += CalendarClosure.query.filter(
+                    CalendarClosure.created_by.in_(user_ids), CalendarClosure.reason == STAGE2_REASON,
+                ).delete(synchronize_session=False)
+                owned_offerings = db.session.query(TermOffering.id).filter(
+                    TermOffering.term_id == STAGE2.get("term_id"))
+                removed += TimetableSlot.query.filter(
+                    TimetableSlot.offering_id.in_(owned_offerings),
+                ).delete(synchronize_session=False)
+                removed += StudentSection.query.filter(
+                    StudentSection.user_id.in_(user_ids),
+                ).delete(synchronize_session=False)
+                removed += TermOffering.query.filter(
+                    TermOffering.term_id == STAGE2.get("term_id"),
+                ).delete(synchronize_session=False)
+                removed += Section.query.filter_by(programme=STAGE2_PROGRAMME).delete(synchronize_session=False)
+                removed += Course.query.filter_by(code=STAGE2_CODE).delete(synchronize_session=False)
+                removed += Room.query.filter_by(name=f"Smoke Stage 2 {RUN_ID}").delete(synchronize_session=False)
+                term = db.session.get(Term, STAGE2["term_id"]) if STAGE2.get("term_id") else None
+                if term is not None:
+                    assert term.is_active is False, "another process activated the smoke term; refusing to delete it"
+                    db.session.delete(term)
                 for model in (FacultyProfile, StudentProfile):
                     removed += model.query.filter(model.user_id.in_(user_ids)).delete(
                         synchronize_session=False,
@@ -1480,6 +1763,7 @@ def print_summary() -> None:
         "M2": "Module 2 - Multi-Sig Audit Trail",
         "M3": "Module 3 - Faculty Workload Ledger",
         "M4": "Module 4 - Device-Bound Biometric Credential",
+        "M5": "Module 5 - Stage 2 Timetable",
         "C": "Cleanup - this run's local fixtures",
         "F": "Unexpected runner failure",
     }
@@ -1521,14 +1805,14 @@ def print_summary() -> None:
         print(f"  RESULT: FAILED - {passed}/{total} steps passed. Failed: {names}")
         print("          (details under 'Failures' above; fix and re-run)")
     else:
-        print(f"  RESULT: PASSED - {passed}/{total} steps, all four modules verified.")
+        print(f"  RESULT: PASSED - {passed}/{total} steps, all five modules verified.")
         print("          The stack is demo-ready.")
     print(rule)
 
 
 def main() -> int:
     print("=" * 78)
-    print("  EDULEDGER FULL-STACK SMOKE TEST (Stage 1 - four modules)")
+    print("  EDULEDGER FULL-STACK SMOKE TEST (Stages 1 and 2 - five modules)")
     print(f"  backend: {BASE_URL}")
     print("=" * 78)
 
@@ -1548,7 +1832,7 @@ def main() -> int:
         setup.step("S1", "GET governance/status -> 200 (read-only)", governance_status)
 
         # A failed governance read still lets the independent modules run.
-        # Shared auth/health failure is the only reason to skip all four.
+        # Shared auth/health failure is the only reason to skip all five.
         module1 = Module(1, "Zero-Proxy Attendance")
         module1.failed = not ready
         module1.step("M1.1", "enroll smoke student face", m1_enroll_face)
@@ -1585,12 +1869,20 @@ def main() -> int:
         module4.failed = not ready
         module4.step("M4.1", "enroll secret, correct HMAC -> token, wrong HMAC -> 401",
                      m4_device_credential)
+
+        module5 = Module(5, "Stage 2 Timetable")
+        module5.failed = not ready
+        module5.step("M5.1", "activation creates blank offerings (rollback-only)", m5_term_activation)
+        module5.step("M5.2", "pattern import round-trip is idempotent", m5_pattern_roundtrip)
+        module5.step("M5.3", "closure deletes unstarted, keeps started", m5_closure_retention)
+        module5.step("M5.4", "attendance percentage = present/conducted", m5_attendance_percentage)
+        module5.step("M5.5", "stale class -> strict too_late refusal", m5_too_late)
     except Exception as exc:
         detail = _reason(exc)
         RESULTS.append(("F0", "unexpected runner failure", "FAIL", detail))
         print(f"  FAIL  F0 {detail}")
     finally:
-        Module(5, "Cleanup").step("C1", "remove own fixtures; preserve ID sequences", cleanup)
+        Module(6, "Cleanup").step("C1", "remove own fixtures; preserve ID sequences", cleanup)
 
     print_summary()
     return 1 if any(row[2] != "PASS" for row in RESULTS) else 0

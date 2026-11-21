@@ -708,8 +708,19 @@ def main():
         from app.config import TestingConfig
         from app.extensions import db
 
+        create_all = db.create_all
+
+        def create_sqlite_schema():
+            # PostgreSQL's one-argument btrim removes spaces and preserves NULL.
+            with db.engine.connect() as connection:
+                connection.connection.driver_connection.create_function(
+                    "btrim", 1, lambda text: None if text is None else text.strip(" "),
+                )
+            create_all()
+
         # The factory initializes SQLAlchemy immediately: isolate BEFORE it runs.
-        with patch.multiple(TestingConfig, DB_URL="sqlite:///:memory:", SCHEDULER_ENABLED=False):
+        with patch.multiple(TestingConfig, DB_URL="sqlite:///:memory:", SCHEDULER_ENABLED=False), \
+                patch.object(db, "create_all", side_effect=create_sqlite_schema):
             app = create_app("testing")
         app.config.update(TIMETABLE_TIMEZONE="Asia/Karachi", SESSION_START_GRACE_MINUTES=5,
                           SCHEDULER_ENABLED=False)
