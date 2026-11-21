@@ -41,6 +41,10 @@ export default function PageLayout({ role, title, description, features = [], wi
         <nav aria-label="Staff navigation" className="mb-5 flex flex-wrap gap-2">
           <NavLink to={getRolePath(user.role)} end className={navClass}>Dashboard</NavLink>
           <NavLink to="/timetable" className={navClass}>Timetable</NavLink>
+          {/* Attendance reports are scoped to FACULTY and own-department HOD. */}
+          {["FACULTY", "HOD"].includes(user?.role) ? (
+            <NavLink to="/attendance" className={navClass}>Attendance</NavLink>
+          ) : null}
         </nav>
       ) : null}
 

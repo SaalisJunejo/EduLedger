@@ -13,6 +13,7 @@ import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import SetupPage from './pages/SetupPage';
 import Timetable from './pages/Timetable.jsx';
+import Attendance from './pages/Attendance.jsx';
 
 function ProtectedRoutes() {
   const navigate = useNavigate();
@@ -93,6 +94,8 @@ function App() {
         <Route path="/hod" element={<RoleRoute role="HOD"><HodPage /></RoleRoute>} />
         <Route path="/admin" element={<RoleRoute role="ADMIN"><AdminPage /></RoleRoute>} />
         <Route path="/timetable" element={<RoleRoute role={['HOD', 'ADMIN', 'FACULTY']}><Timetable /></RoleRoute>} />
+        {/* The Phase 2.9 report API admits FACULTY and own-department HOD only. */}
+        <Route path="/attendance" element={<RoleRoute role={['FACULTY', 'HOD']}><Attendance /></RoleRoute>} />
       </Route>
       <Route path="*" element={<Navigate to="/login" replace />} />
     </Routes>
