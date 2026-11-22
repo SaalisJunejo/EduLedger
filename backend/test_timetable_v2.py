@@ -128,6 +128,16 @@ Steps:
                             department HOD is refused, and FACULTY still sees
                             only its own classes.
    71. attendance verify - clean snapshot, missing mirror discrepancy, no writes.
+   72. closure reason    - omitted/null/blank closure reasons persist "" in the
+                            closure and its audit; a valid reason is trimmed; a
+                            short one is refused. Internal whitespace does not
+                            count ("a b" refused, "ab c" accepted and stored
+                            with its inner space). Closures keep the started and
+                            a locally logged occurrence and never touch the
+                            pattern. Cancel/move still refuse missing or short
+                            reasons, including "a b", and accept "ab c". Two
+                            slot-less future fixtures prove a refused cancel/
+                            move writes nothing and a valid one audits "ab c".
 
 Notes:
     - SCHEDULER_ENABLED=false is set before importing `app`, so this process
@@ -2032,6 +2042,262 @@ def step_occurrence_reopen_closure():
     assert occurrence_generate()["created"] == 0, "reopening is not idempotent"
 
 
+def frontend_reason_space():
+    """Decode the SPACE regex class straight from the frontend source (no JS engine).
+
+    Only the escapes the constant uses are understood; anything else fails loudly
+    rather than being misread.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "frontend", "src",
+                        "components", "TimetableOccurrenceTools.jsx")
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    found = re.findall(r'^const SPACE = "((?:[^"\\\n]|\\.)*)";$', source, re.MULTILINE)
+    assert len(found) == 1, f"expected one SPACE string literal, found {len(found)}"
+    # Textual pins: SPACE must drive both trimming and counting, and counting is by code point.
+    for usage in ("new RegExp(`^[${SPACE}]+|[${SPACE}]+$`, \"g\")", "new RegExp(`[${SPACE}]`, \"g\")",
+                  'value.replace(EDGE_SPACE, "")', '[...value.replace(ANY_SPACE, "")].length >= 3'):
+        assert usage in source, f"frontend reason helpers no longer use {usage}"
+    # JS string literal -> regex source; only \\ and \" are expected.
+    literal, chars, at = found[0], [], 0
+    while at < len(literal):
+        if literal[at] == "\\":
+            assert literal[at + 1] in "\\\"", f"unsupported JS string escape \\{literal[at + 1]}"
+            chars.append(literal[at + 1])
+            at += 2
+        else:
+            chars.append(literal[at])
+            at += 1
+    pattern = "".join(chars)
+    controls = {"t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r"}
+
+    def atom(at):
+        if pattern[at] != "\\":
+            assert pattern[at] not in "[]^-", f"unsupported literal {pattern[at]!r} in SPACE"
+            return pattern[at], at + 1
+        kind = pattern[at + 1]
+        if kind in controls:
+            return controls[kind], at + 2
+        width = {"x": 2, "u": 4}.get(kind)
+        digits = pattern[at + 2:at + 2 + width] if width else ""
+        assert width and len(digits) == width and re.fullmatch(r"[0-9a-fA-F]+", digits), \
+            f"unsupported regex escape \\{kind}{digits}"
+        return chr(int(digits, 16)), at + 2 + width
+
+    # Regex character-class body -> set of characters, expanding a-b ranges.
+    space, at = set(), 0
+    while at < len(pattern):
+        low, at = atom(at)
+        if pattern.startswith("-", at) and at + 1 < len(pattern):
+            high, at = atom(at + 1)
+            assert low <= high, f"reversed range {low!r}-{high!r} in SPACE"
+            space.update(chr(code) for code in range(ord(low), ord(high) + 1))
+        else:
+            space.add(low)
+    return space
+
+
+def step_occurrence_optional_closure_reason():
+    # The validator shared by closure, cancel and move counts non-whitespace
+    # characters, so inner spaces never pad a short reason; only edges are trimmed.
+    assert occurrences.reason_text("  ab c  ") == "ab c", "reason_text lost the inner space"
+    assert occurrences.closure_reason_text(" ab c ") == "ab c", "closure_reason_text lost the inner space"
+    for value in ("a b", " a  b ", "a\tb", "a\u00a0b"):
+        for check in (occurrences.reason_text, occurrences.closure_reason_text):
+            try:
+                check(value)
+            except occurrences.OccurrenceError as error:
+                assert error.error == "invalid_reason", error.error
+            else:
+                raise AssertionError(f"{check.__name__} accepted {value!r}")
+    # Decoded from TimetableOccurrenceTools.jsx itself, so a frontend SPACE edit fails here.
+    assert frontend_reason_space() == {chr(code) for code in range(0x110000) if chr(code).isspace()}, \
+        "frontend SPACE differs from Python str.isspace()"
+
+    term_id, kept_id = STATE["occurrence_term_ids"][0], STATE["occurrence_kept_id"]
+    day = STATE["occurrence_closed_date"]
+    refused = (None, "", "   ", "ab", " ab ", "a b", "  a b  ", "a\tb")
+    # Assigned only once their rows exist; the finally tolerates any still unset.
+    log_id, fixture_ids, closure_ids = None, [], []
+    try:
+        with APP.app_context():
+            others = [row for row in ScheduledClass.query.filter_by(term_id=term_id, day_of_week=2).all()
+                      if occurrences.local_date(row.start_time) == day and row.id != kept_id]
+            assert len(others) == 1, "fixture needs one unstarted occurrence beside the started one"
+            # A local outcome row (no ledger write): closures must keep logged history too.
+            log = SessionLog(class_id=others[0].id, status="CONDUCTED", professor_id=others[0].professor_id,
+                             conducted_by=others[0].professor_id, onchain_tx_hash="0x" + "ef" * 32)
+            db.session.add(log)
+            db.session.flush()
+            logged_id, log_id = others[0].id, log.id
+            db.session.commit()
+            period_id = Period.query.filter_by(is_break=False).first().id
+
+        def history():
+            with APP.app_context():
+                ids = [kept_id, logged_id]
+                return ([db.session.get(ScheduledClass, value).to_dict() for value in ids],
+                        [(s.id, s.start_time, s.ended_at, s.is_active) for s in AttendanceSession.query.filter(
+                            AttendanceSession.class_id.in_([str(value) for value in ids])).order_by(AttendanceSession.id)],
+                        [(r.id, r.class_id, r.status, r.onchain_tx_hash) for r in SessionLog.query.filter(
+                            SessionLog.class_id.in_(ids)).order_by(SessionLog.id)])
+
+        pattern_before, history_before = pattern_snapshot(term_id), history()
+        base = {"date_from": day.isoformat(), "date_to": day.isoformat(), "scope": "DEPARTMENT",
+                "department": f"Occurrence Test {RUN_ID}"}
+        for label, extra, expected in (("omitted", {}, ""), ("null", {"reason": None}, ""),
+                                       ("empty", {"reason": ""}, ""), ("whitespace", {"reason": " \t "}, ""),
+                                       ("valid", {"reason": "  Exam day  "}, "Exam day"),
+                                       ("inner space", {"reason": "  ab c  "}, "ab c")):
+            status, payload = occurrence_api("POST", "/closures", token=AUTH["admin_token"], json=dict(base, **extra))
+            assert status == 201, f"{label} reason closure failed: {status}: {payload}"
+            assert (payload["removed"], payload["kept_started"], payload["kept_logged"]) == (0, 1, 1), f"{label}: {payload}"
+            closure_id = payload["closure"]["id"]
+            closure_ids.append(closure_id)
+            with APP.app_context():
+                assert db.session.get(CalendarClosure, closure_id).reason == expected, f"{label} closure reason"
+                entry = OccurrenceAudit.query.filter_by(action="CLOSURE_CREATE", closure_id=closure_id).one()
+                assert entry.reason == expected, f"{label} closure audit reason"
+            assert pattern_snapshot(term_id) == pattern_before, f"{label} closure touched pattern"
+            assert history() == history_before, f"{label} closure touched started/logged history"
+            status, payload = occurrence_api("DELETE", f"/closures/{closure_id}", token=AUTH["admin_token"])
+            assert status == 200 and payload["deleted"], payload
+            with APP.app_context():
+                assert db.session.get(CalendarClosure, closure_id) is None, f"{label} closure survived DELETE"
+        with APP.app_context():
+            counts = (CalendarClosure.query.count(), OccurrenceAudit.query.count())
+        for reason in ("ab", "  ab  ", "a b", "  a b  ", "a\tb"):
+            status, payload = occurrence_api("POST", "/closures", token=AUTH["admin_token"], json=dict(base, reason=reason))
+            assert_directory_error(status, payload, 400, "timetable", "invalid_reason")
+        with APP.app_context():
+            assert (CalendarClosure.query.count(), OccurrenceAudit.query.count()) == counts, "short reason wrote rows"
+        # Scoped to this step: none of its closures remain, and no refused request
+        # left a closure for this run's department and date.
+        with APP.app_context():
+            assert CalendarClosure.query.filter(CalendarClosure.id.in_(closure_ids)).count() == 0, \
+                "a step closure survived"
+            assert CalendarClosure.query.filter(CalendarClosure.department == base["department"],
+                CalendarClosure.date_from <= day, CalendarClosure.date_to >= day).count() == 0, \
+                "a closure remains on the step date"
+        assert pattern_snapshot(term_id) == pattern_before and history() == history_before, "closure state leaked"
+
+        # Cancel/move keep the required reason. The cancelled tombstone is otherwise
+        # editable, so the controls prove the reason gate is what refuses.
+        target = STATE["occurrence_cancelled_id"]
+        move = {"day_of_week": 0, "period_id": period_id, "room_id": STATE["occurrence_room_ids"][0]}
+        with APP.app_context():
+            before = (db.session.get(ScheduledClass, target).to_dict(),
+                      OccurrenceAudit.query.filter_by(occurrence_id=target).count())
+        for action, body in (("cancel", {}), ("move", move)):
+            for reason in refused:
+                status, payload = occurrence_api("POST", f"/faculty/occurrences/{target}/{action}",
+                    token=AUTH["professor_token"], json=body if reason is None else dict(body, reason=reason))
+                assert_directory_error(status, payload, 400, "timetable", "invalid_reason")
+        # "ab c" has exactly 3 non-whitespace characters, so it passes the gate.
+        for reason in ("Still cancelled", "  ab c  "):
+            status, payload = occurrence_api("POST", f"/faculty/occurrences/{target}/cancel",
+                                            token=AUTH["professor_token"], json={"reason": reason})
+            assert status == 200 and payload["occurrence"]["state"] == "CANCELLED", f"{reason!r}: {payload}"
+            status, payload = occurrence_api("POST", f"/faculty/occurrences/{target}/move",
+                                            token=AUTH["professor_token"], json=dict(move, reason=reason))
+            assert_directory_error(status, payload, 409, "timetable", "occurrence_cancelled")
+        with APP.app_context():
+            assert (db.session.get(ScheduledClass, target).to_dict(),
+                    OccurrenceAudit.query.filter_by(occurrence_id=target).count()) == before, "refused edit wrote rows"
+
+        # Persistence needs editable rows: two slot-less, unstarted occurrences in
+        # weeks past every term and dated fixture of this run, so no pattern slot,
+        # clash or closure applies. No session, log or ledger write is involved.
+        with APP.app_context():
+            owned = [STATE["master_term_id"], *STATE["pattern_copy_term_ids"], *STATE["occurrence_term_ids"]]
+            horizon = max([occurrences.local_date(STATE["occurrence_anchor"]) + timedelta(days=98)] +
+                          [term.end_date + timedelta(days=7) for term in Term.query.filter(Term.id.in_(owned))])
+            week = horizon + timedelta(days=7 - horizon.weekday())
+            # Latest teaching period, chosen deterministically; ordinal 6 may be a break.
+            period = Period.query.filter(Period.is_break.is_(False)).order_by(
+                Period.ordinal.desc().nulls_last(), Period.id.desc()).first()
+            assert period is not None, "no non-break period for the move fixture"
+            room = db.session.get(Room, STATE["occurrence_room_ids"][0])
+            moved = {"day_of_week": 2, "period_id": period.id, "room_id": room.id}
+            for day_value in (week, week + timedelta(days=7)):
+                start, end = occurrences.period_times(day_value, period)
+                row = ScheduledClass(professor_id=AUTH["professor_id"], term_id=None, slot_id=None,
+                                     room=room.name, course_code=STATE["pattern_courses"][0], day_of_week=0,
+                                     start_time=start, end_time=end)
+                db.session.add(row)
+                db.session.flush()
+                fixture_ids.append(row.id)
+                STATE["class_ids"].append(row.id)
+            db.session.commit()
+            first, last = occurrences.utc_bounds(week, week + timedelta(days=13))
+            assert ScheduledClass.query.filter(ScheduledClass.professor_id == AUTH["professor_id"],
+                ScheduledClass.start_time >= first, ScheduledClass.start_time < last,
+                ~ScheduledClass.id.in_(fixture_ids)).count() == 0, "fixture weeks are not free"
+            department = occurrences.department_of(db.session.get(ScheduledClass, fixture_ids[0]))
+            for fixture_id in fixture_ids:
+                row = db.session.get(ScheduledClass, fixture_id)
+                assert not occurrences.has_session(row) and not SessionLog.query.filter_by(
+                    class_id=fixture_id).count(), "recycled fixture id carries history"
+            assert not any(occurrences.matching_closures(week + timedelta(days=offset), department)
+                           for offset in (0, 7, 9)), "fixture dates are closed"
+            # The move lands on Wednesday of the second week. Mirror the server's clash
+            # scan there: every other dated row (cancelled ones too, which is stricter)
+            # and every pattern slot of any term covering that day, so no room or
+            # faculty booking can overlap the destination interval.
+            destination = week + timedelta(days=9)
+            dest_start, dest_end = occurrences.period_times(destination, period)
+            day_first, day_last = occurrences.utc_bounds(destination, destination)
+            bookings = [(other.id, other.room, other.professor_id, other.start_time,
+                         other.end_time or other.start_time + timedelta(minutes=50))
+                        for other in ScheduledClass.query.filter(ScheduledClass.start_time >= day_first,
+                            ScheduledClass.start_time < day_last, ~ScheduledClass.id.in_(fixture_ids))]
+            for slot in TimetableSlot.query.join(TermOffering).join(Term).filter(
+                    TimetableSlot.day_of_week == 2, Term.start_date <= destination, Term.end_date >= destination):
+                bookings.append((f"slot {slot.id}", slot.room.name, slot.faculty_id,
+                                 *occurrences.period_times(destination, slot.period)))
+            clashes = [booking for booking in bookings if booking[3] < dest_end and booking[4] > dest_start and (
+                (booking[1] or "").casefold() == room.name.casefold() or booking[2] == AUTH["professor_id"])]
+            assert not clashes, f"move destination is already booked: {clashes}"
+            snapshot = [db.session.get(ScheduledClass, value).to_dict() for value in fixture_ids]
+            audits = OccurrenceAudit.query.count()
+        cancel_id, move_id = fixture_ids
+        # The bodies are otherwise valid, so only the reason gate can refuse.
+        for fixture_id, action, body in ((cancel_id, "cancel", {}), (move_id, "move", moved)):
+            for reason in refused:
+                status, payload = occurrence_api("POST", f"/faculty/occurrences/{fixture_id}/{action}",
+                    token=AUTH["professor_token"], json=body if reason is None else dict(body, reason=reason))
+                assert_directory_error(status, payload, 400, "timetable", "invalid_reason")
+        with APP.app_context():
+            assert [db.session.get(ScheduledClass, value).to_dict() for value in fixture_ids] == snapshot, \
+                "refused cancel/move changed a fixture"
+            assert OccurrenceAudit.query.count() == audits, "refused cancel/move wrote an audit"
+        status, payload = occurrence_api("POST", f"/faculty/occurrences/{cancel_id}/cancel",
+                                        token=AUTH["professor_token"], json={"reason": "  ab c  "})
+        assert status == 200 and payload["occurrence"]["state"] == "CANCELLED", f"fixture cancel: {status}: {payload}"
+        status, payload = occurrence_api("POST", f"/faculty/occurrences/{move_id}/move",
+                                        token=AUTH["professor_token"], json=dict(moved, reason="  ab c  "))
+        assert status == 200 and payload["occurrence"]["dayOfWeek"] == 2, f"fixture move: {status}: {payload}"
+        with APP.app_context():
+            for fixture_id, action in ((cancel_id, "CANCEL"), (move_id, "MOVE")):
+                entry = OccurrenceAudit.query.filter_by(occurrence_id=fixture_id).one()
+                assert (entry.action, entry.actor_id, entry.reason) == (action, AUTH["professor_id"], "ab c"), \
+                    f"{action} audit: {entry.action} {entry.reason!r}"
+            assert db.session.get(ScheduledClass, cancel_id).to_dict() == snapshot[0], "cancel mutated its row"
+            assert db.session.get(ScheduledClass, move_id).day_of_week == 2, "move did not persist"
+            assert OccurrenceAudit.query.count() == audits + 2, "cancel/move wrote extra audits"
+    finally:
+        with APP.app_context():
+            if log_id is not None:
+                SessionLog.query.filter_by(id=log_id).delete(synchronize_session=False)
+            if closure_ids:  # only those an assertion stranded before their DELETE
+                CalendarClosure.query.filter(CalendarClosure.id.in_(closure_ids)).delete(synchronize_session=False)
+            if fixture_ids:
+                OccurrenceAudit.query.filter(OccurrenceAudit.occurrence_id.in_(fixture_ids)).delete(
+                    synchronize_session=False)
+                ScheduledClass.query.filter(ScheduledClass.id.in_(fixture_ids)).delete(synchronize_session=False)
+            db.session.commit()
+
+
 # --------------------------------------------------------------------------
 # Phase 2.6 - read views over the isolated occurrence term's pattern
 # --------------------------------------------------------------------------
@@ -3228,6 +3494,8 @@ STEPS = [
     ("Mapping race: blocked delete/scope update refused after the mapping commits", step_mapping_offering_concurrency),
     ("Attendance scope: HOD own department, foreign HOD 403, faculty own classes", step_attendance_scope_positive),
     ("Attendance verify: clean snapshot, missing mirror discrepancy, no writes", step_attendance_verify),
+    ("Closure reason optional: blank stored as '', short refused; cancel/move still require",
+     step_occurrence_optional_closure_reason),
 ]
 
 

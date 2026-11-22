@@ -143,9 +143,18 @@ def generate_for_term(term_id, window_days=None):
 
 
 def reason_text(value):
-    if not isinstance(value, str) or len(value.strip()) < 3:
-        raise OccurrenceError("invalid_reason", "reason must be at least 3 characters")
+    # Whitespace anywhere (per str.isspace) does not count toward the minimum;
+    # only the edges are trimmed from the stored text.
+    if not isinstance(value, str) or sum(not char.isspace() for char in value) < 3:
+        raise OccurrenceError("invalid_reason", "reason must contain at least 3 non-whitespace characters")
     return value.strip()
+
+
+def closure_reason_text(value):
+    # A closure reason is optional; "" records that none was given.
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    return reason_text(value)
 
 
 def audit(actor_id, action, day_from, day_to, reason, **values):
@@ -158,7 +167,7 @@ def audit(actor_id, action, day_from, day_to, reason, **values):
 def mark_closure(body, actor):
     if actor is None or not actor.is_active or actor.role not in {UserRole.ADMIN, UserRole.HOD}:
         raise OccurrenceError("forbidden", "an active HOD or ADMIN is required", 403)
-    reason = reason_text(body.get("reason"))
+    reason = closure_reason_text(body.get("reason"))
     try:
         first, last = (date.fromisoformat(body[key]) for key in ("date_from", "date_to"))
     except (KeyError, ValueError, TypeError):

@@ -14,6 +14,14 @@ const WARNINGS = {
   lab_room_mismatch: "The room type does not match the course type.",
   lab_group_split: "Only this half of the lab moved. The paired occurrence was not changed.",
 };
+// The backend trims and counts reasons with Python's str.isspace(). JavaScript's
+// \s/trim() differ (U+001C-U+001F, U+0085, U+FEFF) and .length counts UTF-16
+// units, so mirror the backend's whitespace set and count code points.
+const SPACE = "\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const EDGE_SPACE = new RegExp(`^[${SPACE}]+|[${SPACE}]+$`, "g");
+const ANY_SPACE = new RegExp(`[${SPACE}]`, "g");
+function reasonText(value) { return value.replace(EDGE_SPACE, ""); }
+function reasonValid(value) { return [...value.replace(ANY_SPACE, "")].length >= 3; }
 
 export function timetableToday() {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
@@ -98,7 +106,8 @@ export function HolidayTools({ user, onChanged }) {
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   if (!["HOD", "ADMIN"].includes(user.role)) return null;
   const departmentScope = user.role === "HOD" || form.scope === "DEPARTMENT";
-  const valid = form.from && form.to && form.to >= form.from && form.reason.trim().length >= 3
+  const reason = reasonText(form.reason);
+  const valid = form.from && form.to && form.to >= form.from && (reason === "" || reasonValid(reason))
     && (!departmentScope || Boolean((user.role === "HOD" ? user.department : form.department)?.trim()));
   function change(key, value) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -109,7 +118,7 @@ export function HolidayTools({ user, onChanged }) {
     if (!valid || state.result || pending.current) return;
     pending.current = true;
     setState({ busy: true, result: null, error: null });
-    const body = { date_from: form.from, date_to: form.to, reason: form.reason.trim(),
+    const body = { date_from: form.from, date_to: form.to, reason,
       scope: departmentScope ? "DEPARTMENT" : "UNIVERSITY" };
     if (user.role === "ADMIN" && departmentScope) body.department = form.department.trim();
     try {
@@ -148,8 +157,8 @@ export function HolidayTools({ user, onChanged }) {
                 {departmentScope ? <label className={LABEL}>Department<input required maxLength={128} className={INPUT} value={form.department} onChange={(event) => change("department", event.target.value)} /></label> : null}
               </div>
             )}
-            <label className={LABEL}>Reason<input required minLength={3} className={INPUT} value={form.reason} aria-describedby="holiday-reason-help" onChange={(event) => change("reason", event.target.value)} /></label>
-            <p id="holiday-reason-help" className="text-xs text-ink-muted">The current closure API requires a reason of at least 3 non-whitespace characters; a blank optional reason is not accepted.</p>
+            <label className={LABEL}>Reason (optional)<input className={INPUT} value={form.reason} aria-describedby="holiday-reason-help" onChange={(event) => change("reason", event.target.value)} /></label>
+            <p id="holiday-reason-help" className="text-xs text-ink-muted">The reason is optional. If provided, it must have at least 3 non-whitespace characters.</p>
           </fieldset>
           {state.error ? <StatusBanner tone="error" title="Couldn't mark holiday">{state.error.message}</StatusBanner> : null}
           {state.result ? <StatusBanner tone="success" title="Holiday marked">
@@ -236,11 +245,11 @@ function MoveChoices({ row, user, term, periods, snapshot, onSubmit, busy }) {
     return options;
   }, [source.data, room, roomLoading, roomError, roomData, snapshot, row, periods, first, term.startDate, term.endDate]);
   const selected = choices.find((item) => item.key === choice);
-  const valid = selected && room && reason.trim().length >= 3 && !snapshot.capped && !snapshot.unavailable;
+  const valid = selected && room && reasonValid(reason) && !snapshot.capped && !snapshot.unavailable;
   return (
     <form className="mt-4 space-y-4" onSubmit={(event) => {
       event.preventDefault();
-      if (valid && !busy) onSubmit({ day_of_week: selected.day, period_id: selected.period.id, room_id: room.id, reason: reason.trim() });
+      if (valid && !busy) onSubmit({ day_of_week: selected.day, period_id: selected.period.id, room_id: room.id, reason: reasonText(reason) });
     }}>
       <p className="text-sm text-ink-muted">Moves are limited by the existing API to Monday–Friday of this occurrence's week ({first} to {shiftDate(first, 4)}).</p>
       <fieldset disabled={busy} className="space-y-4">
@@ -263,7 +272,7 @@ function MoveChoices({ row, user, term, periods, snapshot, onSubmit, busy }) {
           </p>
           {!source.data.rooms.length || (roomId && !roomLoading && !roomError && !choices.length) ? <StatusBanner tone="info">No move choices are available. You can still cancel this occurrence or close the panel.</StatusBanner> : null}
         </> : null}
-        <label className={LABEL}>Move reason<input className={INPUT} required minLength={3} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+        <label className={LABEL}>Move reason<input className={INPUT} required value={reason} onChange={(event) => setReason(event.target.value)} /></label>
         <p className="text-xs text-ink-muted">At least 3 non-whitespace characters. Only this occurrence changes; the repeating pattern is untouched.</p>
       </fieldset>
       {snapshot.unavailable ? <StatusBanner tone="info">Moving is disabled until the dated data finishes refreshing successfully. If the refresh failed, use Retry occurrences above.</StatusBanner>
@@ -333,10 +342,10 @@ function OccurrenceDetail({ row: initial, user, week, periods, snapshot, onChang
             <Button variant="danger" disabled={state.busy} aria-pressed={action === "cancel"} onClick={() => { setAction("cancel"); setState((prev) => ({ ...prev, error: null, result: null })); }}>Cancel this occurrence</Button>
             <Button variant="secondary" disabled={state.busy} aria-pressed={action === "move"} onClick={() => { setAction("move"); setState((prev) => ({ ...prev, error: null, result: null })); }}>Move this occurrence</Button>
           </div>
-          {action === "cancel" ? <form className="mt-4 space-y-3" onSubmit={(event) => { event.preventDefault(); if (reason.trim().length >= 3) submit("cancel", { reason: reason.trim() }); }}>
-            <label className={LABEL}>Cancellation reason<input className={INPUT} required minLength={3} disabled={state.busy} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+          {action === "cancel" ? <form className="mt-4 space-y-3" onSubmit={(event) => { event.preventDefault(); if (reasonValid(reason)) submit("cancel", { reason: reasonText(reason) }); }}>
+            <label className={LABEL}>Cancellation reason<input className={INPUT} required disabled={state.busy} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
             <p className="text-xs text-ink-muted">At least 3 non-whitespace characters. Only this dated occurrence will be cancelled.</p>
-            <Button type="submit" variant="danger" loading={state.busy} disabled={reason.trim().length < 3}>Confirm cancel this occurrence</Button>
+            <Button type="submit" variant="danger" loading={state.busy} disabled={!reasonValid(reason)}>Confirm cancel this occurrence</Button>
           </form> : null}
           {action === "move" ? <MoveChoices row={row} user={user} term={week.term} periods={periods} snapshot={snapshot} busy={state.busy} onSubmit={(body) => submit("move", body)} /> : null}
         </> : <p className="mt-4 text-sm text-ink-muted">{row.id == null ? "This is a virtual holiday/cancellation record, not an editable occurrence." : "Single-occurrence actions are available only to the owning faculty or the occurrence's department HOD, and not for holiday/cancelled records."}</p>}
